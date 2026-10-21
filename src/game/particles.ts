@@ -107,23 +107,28 @@ class Pool {
     r: number, g: number, b: number, grav = 0, drag = 0
   ) {
     const n = this.ps.length;
-    const scaled = Math.max(1, Math.round(n * 0.001)); // spawn throttling not needed; cap below
-    void scaled;
-    // find a free slot (round-robin for speed)
-    for (let tries = 0; tries < n; tries++) {
+    // find a free slot (round-robin); if the pool is saturated, recycle the
+    // cursor slot immediately so spawn stays O(1) instead of scanning forever
+    let p: P | null = null;
+    for (let tries = 0; tries < 16; tries++) {
       Pool.cursor = (Pool.cursor + 1) % n;
-      const p = this.ps[Pool.cursor];
-      if (!p.active) {
-        p.active = true;
-        p.x = x; p.y = y; p.z = z;
-        p.vx = vx; p.vy = vy; p.vz = vz;
-        p.life = 0; p.maxLife = life;
-        p.size0 = size0; p.size1 = size1;
-        p.r = r; p.g = g; p.b = b;
-        p.grav = grav; p.drag = drag;
-        return;
+      const cand = this.ps[Pool.cursor];
+      if (!cand.active) {
+        p = cand;
+        break;
       }
     }
+    if (!p) {
+      Pool.cursor = (Pool.cursor + 1) % n;
+      p = this.ps[Pool.cursor];
+    }
+    p.active = true;
+    p.x = x; p.y = y; p.z = z;
+    p.vx = vx; p.vy = vy; p.vz = vz;
+    p.life = 0; p.maxLife = life;
+    p.size0 = size0; p.size1 = size1;
+    p.r = r; p.g = g; p.b = b;
+    p.grav = grav; p.drag = drag;
   }
 
   private static cursor = 0;

@@ -8,6 +8,7 @@ import { ParticleSystem } from "./particles";
 import { AudioSystem } from "./audio";
 import { InputManager } from "./input";
 import { gameStore } from "./store";
+import { OPPONENT_GRID_LAT, OPPONENTS, Opponent, opponentInput } from "./ai";
 import {
   DEFAULT_SETTINGS,
   PALETTE,
@@ -17,6 +18,7 @@ import {
   type GamePhase,
   type GameSettings,
   type ResultsData,
+  type StandingEntry,
   type Telemetry,
 } from "./types";
 
@@ -92,11 +94,14 @@ export class GameEngine {
   // sun
   private sun: THREE.DirectionalLight;
 
-  // heat haze
-  private hazeRT: THREE.WebGLRenderTarget | null = null;
-  private hazeScene: THREE.Scene | null = null;
-  private hazeCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  private hazeMat: THREE.ShaderMaterial | null = null;
+  // AI rivals
+  opponents: Opponent[] = [];
+  private playerStartS = 0;
+  private playerFinishMs: number | null = null;
+  private standingsTimer = 0;
+  private playerPos = 1;
+  private lastStandingsKey = "";
+  private lastBumpT = -10;
 
   private telemetryListeners = new Set<(t: Telemetry) => void>();
   private tmpV = new THREE.Vector3();
@@ -125,7 +130,7 @@ export class GameEngine {
       typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 2));
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -165,6 +170,14 @@ export class GameEngine {
     this.ghostCar = new CarVisual(true);
     this.ghostCar.group.visible = false;
     this.scene.add(this.ghostCar.group);
+
+    // AI rivals (identical performance, different paint & skill)
+    for (let i = 0; i < OPPONENTS.length; i++) {
+      const op = new Opponent(OPPONENTS[i], this.track, OPPONENT_GRID_LAT[i]);
+      this.scene.add(op.visual.group);
+      this.opponents.push(op);
+    }
+    this.scatterOpponentsOnTrack();
 
     this.physics = new CarPhysics(this.track, {
       onJump: () => this.audio.jump(),
@@ -211,8 +224,6 @@ export class GameEngine {
     this.physics.place(this.track.N - 10, 0, 0);
     this.syncCarVisual(0.016);
     this.updateSun();
-    // heat haze pass
-    this.buildHaze();
 
     this.resize();
     this.lastT = performance.now();
@@ -259,41 +270,6 @@ export class GameEngine {
     const sky = new THREE.Mesh(geo, mat);
     sky.frustumCulled = false;
     this.scene.add(sky);
-  }
-
-  private buildHaze() {
-    this.hazeRT = new THREE.WebGLRenderTarget(2, 2, {
-      type: THREE.HalfFloatType,
-    });
-    this.hazeMat = new THREE.ShaderMaterial({
-      uniforms: {
-        tDiffuse: { value: this.hazeRT.texture },
-        uTime: { value: 0 },
-        uAmount: { value: 1 },
-      },
-      vertexShader: `
-        varying vec2 vUv;
-        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
-      `,
-      fragmentShader: `
-        uniform sampler2D tDiffuse; uniform float uTime; uniform float uAmount;
-        varying vec2 vUv;
-        void main() {
-          vec2 uv = vUv;
-          float mask = smoothstep(0.85, 0.45, uv.y) * 0.75 + 0.1;
-          uv.x += sin(uv.y * 110.0 + uTime * 3.3) * 0.0026 * mask * uAmount;
-          uv.y += sin(uv.x * 70.0 + uTime * 2.1) * 0.0018 * mask * uAmount;
-          vec3 c = texture2D(tDiffuse, uv).rgb;
-          // subtle warm vignette
-          vec2 q = vUv - 0.5;
-          c *= 1.0 - dot(q, q) * 0.35;
-          gl_FragColor = vec4(c, 1.0);
-        }
-      `,
-    });
-    this.hazeScene = new THREE.Scene();
-    const quadGeo = new THREE.PlaneGeometry(2, 2);
-    this.hazeScene.add(new THREE.Mesh(quadGeo, this.hazeMat));
   }
 
   private loadBest() {
@@ -359,7 +335,7 @@ export class GameEngine {
     this.physics.driftScore = 0;
     this.physics.nearMisses = 0;
     this.physics.topSpeed = 0;
-    this.physics.place(this.track.N - 10, 0, 0);
+    this.placeRaceGrid();
     this.particles.clearSkids(this.time);
     this.ghostRec = [];
     this.ghostRecT = 0;
@@ -370,8 +346,35 @@ export class GameEngine {
     this.lineAbs = this.track.length; // first line crossing = one length from spawn
     this.nextGateK = 0;
     this.nextGateAbs = this.gateAbs(0);
+    this.playerFinishMs = null;
+    this.lastStandingsKey = "";
+    this.pushStandings(true);
     this.setPhase("countdown");
     this.audio.startMusic();
+  }
+
+  /** 2×2 start grid — two rivals on the front row, one alongside the player. */
+  private placeRaceGrid() {
+    const t = this.track;
+    this.physics.place(t.N - 15, 2.6, 0);
+    this.playerStartS = this.physics.progressS;
+    for (let i = 0; i < this.opponents.length; i++) {
+      const idx = i < 2 ? t.N - 8 : t.N - 15;
+      this.opponents[i].place(idx, OPPONENT_GRID_LAT[i], 0);
+    }
+    this.syncCarVisual(0.016);
+  }
+
+  /** Drop the rivals around the loop so the title flyover feels alive. */
+  private scatterOpponentsOnTrack() {
+    const t = this.track;
+    for (let i = 0; i < this.opponents.length; i++) {
+      this.opponents[i].place(
+        wrapI(t.N - 40 - i * 110, t.N),
+        (i % 2 === 0 ? -1 : 1) * 2.2,
+        22
+      );
+    }
   }
 
   restart() {
@@ -384,6 +387,8 @@ export class GameEngine {
     this.setPhase("title");
     this.physics.place(this.track.N - 10, 0, 0);
     this.ghostCar.group.visible = false;
+    this.scatterOpponentsOnTrack();
+    gameStore.getState().setStandings([]);
   }
 
   setPaused(v: boolean) {
@@ -418,9 +423,8 @@ export class GameEngine {
     this.track.dispose();
     this.car.dispose();
     this.ghostCar.dispose();
+    for (const op of this.opponents) op.dispose();
     this.particles.dispose();
-    this.hazeRT?.dispose();
-    this.hazeMat?.dispose();
     this.renderer.dispose();
   }
 
@@ -431,10 +435,6 @@ export class GameEngine {
     this.renderer.setSize(w, h, false);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
-    if (this.hazeRT) {
-      const dpr = this.renderer.getPixelRatio();
-      this.hazeRT.setSize(Math.floor(w * dpr), Math.floor(h * dpr));
-    }
   }
 
   // ============================================================
@@ -501,17 +501,8 @@ export class GameEngine {
       musicIntensity: intensity,
     });
 
-    // render (with optional heat haze pass)
-    if (this.settings.heatHaze && this.hazeRT && this.hazeScene && this.hazeMat) {
-      this.hazeMat.uniforms.uTime.value = this.time;
-      this.renderer.setRenderTarget(this.hazeRT);
-      this.renderer.clear();
-      this.renderer.render(this.scene, this.camera);
-      this.renderer.setRenderTarget(null);
-      this.renderer.render(this.hazeScene, this.hazeCam);
-    } else {
-      this.renderer.render(this.scene, this.camera);
-    }
+    // render directly to the canvas — keeps MSAA + tone mapping crisp
+    this.renderer.render(this.scene, this.camera);
   };
 
   private updateCountdown(dt: number) {
@@ -530,10 +521,18 @@ export class GameEngine {
   }
 
   private updateRacing(dt: number, input: DriveInput) {
-    if (this.recoverT > 0) return;
+    if (this.recoverT > 0) {
+      // player frozen briefly after recovery — the field keeps racing
+      this.updateOpponents(dt, "race");
+      this.resolveCarCollisions();
+      return;
+    }
     const prevS = this.physics.progressS;
     this.physics.update(input, dt);
     this.raceTime += dt * 1000;
+    this.updateOpponents(dt, "race");
+    this.resolveCarCollisions();
+    this.updateStandings(dt);
     this.syncCarVisual(dt);
     this.emitEffects(dt);
     this.recordGhost(dt);
@@ -550,6 +549,10 @@ export class GameEngine {
 
   private updateFinished(dt: number) {
     this.physics.update({ steer: 0, throttle: 0, brake: 0.25, handbrake: false, boost: false }, dt);
+    this.raceTime += dt * 1000; // clock keeps running so the AI field can finish
+    this.updateOpponents(dt, "race");
+    this.resolveCarCollisions();
+    this.updateStandings(dt);
     this.syncCarVisual(dt);
     this.finishOrbitT += dt;
   }
@@ -572,6 +575,7 @@ export class GameEngine {
     this.camera.fov = damp(this.camera.fov, 62, 2, dt);
     this.camera.updateProjectionMatrix();
     this.syncCarVisual(dt);
+    this.updateOpponents(dt, "cruise");
   }
 
   // ============================================================
@@ -649,9 +653,16 @@ export class GameEngine {
         store.pushPopup("newrecord", "NEW RECORD!");
       }
       this.audio.finish(isNewRecord);
+      this.playerFinishMs = totalMs;
+      this.pushStandings(true);
+      const position = this.playerPos;
       this.setPhase("finished");
       this.finishOrbitT = 0;
       this.ghostCar.group.visible = false;
+      // CRITICAL: advance past the finish gate so checkGates' while-loop
+      // terminates instead of re-triggering completeLap forever (tab freeze)
+      this.nextGateK = this.track.gates.length;
+      this.nextGateAbs = Infinity;
       this.cbs.onFinish({
         totalMs,
         bestLapMs: bestLap,
@@ -662,6 +673,8 @@ export class GameEngine {
         laps: this.totalLaps,
         isNewRecord,
         splits: [...this.splits],
+        position,
+        totalCars: 1 + this.opponents.length,
       });
       return;
     }
@@ -696,6 +709,117 @@ export class GameEngine {
     }
     this.syncCarVisual(0.016);
     this.trauma = Math.min(1, this.trauma + 0.3);
+  }
+
+  // ============================================================
+  // opponents & standings
+  // ============================================================
+
+  private updateOpponents(dt: number, mode: "race" | "cruise") {
+    const playerDist = this.physics.progressS - this.playerStartS;
+    const raceLen = this.totalLaps * this.track.length;
+    for (const op of this.opponents) {
+      const inp = opponentInput(op, this.track, playerDist, dt, mode);
+      op.update(inp, dt);
+      if (mode === "race" && op.finishMs == null && op.raceDist >= raceLen) {
+        op.finishMs = this.raceTime;
+      }
+    }
+  }
+
+  /** Soft sphere collisions between all cars (player + rivals). */
+  private resolveCarCollisions() {
+    const cars: CarPhysics[] = [this.physics];
+    for (const op of this.opponents) cars.push(op.physics);
+    const R = 2.55;
+    const R2 = R * R;
+    for (let i = 0; i < cars.length; i++) {
+      for (let j = i + 1; j < cars.length; j++) {
+        const a = cars[i];
+        const b = cars[j];
+        if (Math.abs(a.pos.y - b.pos.y) > 2.2) continue;
+        const dx = b.pos.x - a.pos.x;
+        const dz = b.pos.z - a.pos.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 >= R2 || d2 < 1e-6) continue;
+        const d = Math.sqrt(d2);
+        const nx = dx / d;
+        const nz = dz / d;
+        const pen = (R - d) * 0.5;
+        a.pos.x -= nx * pen;
+        a.pos.z -= nz * pen;
+        b.pos.x += nx * pen;
+        b.pos.z += nz * pen;
+        const rvx = b.vel.x - a.vel.x;
+        const rvz = b.vel.z - a.vel.z;
+        const vn = rvx * nx + rvz * nz;
+        if (vn < 0) {
+          // equal-mass bump with a bit of bounce
+          const imp = -vn * 0.7;
+          a.vel.x -= nx * imp;
+          a.vel.z -= nz * imp;
+          b.vel.x += nx * imp;
+          b.vel.z += nz * imp;
+          if ((a.isPlayer || b.isPlayer) && -vn > 4.5 && this.time - this.lastBumpT > 0.6) {
+            this.lastBumpT = this.time;
+            const impact = -vn;
+            this.audio.crash(clamp(impact / 26, 0.12, 0.45));
+            this.trauma = Math.min(1, this.trauma + 0.1 + impact * 0.012);
+            this.input.rumble(clamp(impact / 20, 0.15, 0.6), 110);
+          }
+        }
+      }
+    }
+  }
+
+  private updateStandings(dt: number) {
+    this.standingsTimer -= dt;
+    if (this.standingsTimer > 0) return;
+    this.standingsTimer = 0.35;
+    this.pushStandings(false);
+  }
+
+  /** Current race order (finished cars first, then track position). */
+  getStandings(): StandingEntry[] {
+    const raw = [
+      {
+        name: "YOU",
+        isPlayer: true,
+        color: "#f0641e",
+        s: this.physics.progressS,
+        finishMs: this.playerFinishMs,
+      },
+      ...this.opponents.map((op) => ({
+        name: op.def.name,
+        isPlayer: false,
+        color: op.def.cssColor,
+        s: op.physics.progressS,
+        finishMs: op.finishMs,
+      })),
+    ];
+    raw.sort((x, y) => {
+      if (x.finishMs != null && y.finishMs != null) return x.finishMs - y.finishMs;
+      if (x.finishMs != null) return -1;
+      if (y.finishMs != null) return 1;
+      return y.s - x.s;
+    });
+    return raw.map((e, i) => ({
+      pos: i + 1,
+      name: e.name,
+      isPlayer: e.isPlayer,
+      color: e.color,
+      timeMs: e.finishMs,
+    }));
+  }
+
+  private pushStandings(force: boolean) {
+    const standings = this.getStandings();
+    this.playerPos = standings.findIndex((s) => s.isPlayer) + 1;
+    const key = standings.map((s) => `${s.pos}${s.name}${s.timeMs ?? "?"}`).join("|");
+    if (force || key !== this.lastStandingsKey) {
+      this.lastStandingsKey = key;
+      gameStore.getState().setStandings(standings);
+    }
   }
 
   // ============================================================
@@ -936,8 +1060,8 @@ export class GameEngine {
       this.camera.position.copy(this.camPos);
       this.camera.up.set(0, 1, 0);
       this.camera.lookAt(this.camLook);
-      // banking roll
-      const targetRoll = clamp(-p.slip * 0.3 - this.lastSteer * 0.05, -0.24, 0.24);
+      // banking roll (positive rotateZ banks right, matching steer > 0)
+      const targetRoll = clamp(-p.slip * 0.3 + this.lastSteer * 0.05, -0.24, 0.24);
       this.camRoll = damp(this.camRoll, targetRoll, 5, dt);
       this.camera.rotateZ(this.camRoll);
     }
@@ -986,6 +1110,13 @@ export class GameEngine {
       driftMult: 1 + Math.min(2, p.driftChain / 6),
       lap: Math.min(this.lapsDone + 1, this.totalLaps),
       totalLaps: this.totalLaps,
+      position: this.playerPos,
+      totalCars: 1 + this.opponents.length,
+      blips: this.opponents.map((op) => ({
+        x: op.physics.pos.x,
+        z: op.physics.pos.z,
+        color: op.def.cssColor,
+      })),
       raceTimeMs: this.raceTime,
       lapTimeMs: this.raceTime - this.lapStart,
       bestLapMs: this.bestLapMs,

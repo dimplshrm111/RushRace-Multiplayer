@@ -6,6 +6,7 @@ import {
   type GamePhase,
   type GameSettings,
   type ResultsData,
+  type StandingEntry,
   type UIEvent,
   type UIEventType,
 } from "./types";
@@ -31,6 +32,7 @@ interface GameStore {
   settings: GameSettings;
   popups: PopupItem[];
   results: ResultsData | null;
+  standings: StandingEntry[];
   tutorialSeen: boolean;
   hint: string | null;
   countdownValue: number; // 3..1, 0 = GO, -1 idle
@@ -43,6 +45,7 @@ interface GameStore {
   pushPopup: (type: UIEventType, text: string, extra?: { amount?: number; deltaMs?: number }) => void;
   prunePopups: (now: number) => void;
   setResults: (r: ResultsData | null) => void;
+  setStandings: (s: StandingEntry[]) => void;
   setCountdown: (v: number) => void;
   setHint: (h: string | null) => void;
   markTutorialSeen: () => void;
@@ -77,6 +80,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   settings: loadSettings(),
   popups: [],
   results: null,
+  standings: [],
   tutorialSeen: (() => {
     try {
       return localStorage.getItem(TUTORIAL_KEY) === "1";
@@ -107,6 +111,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
     }
   },
   setResults: (r) => set({ results: r }),
+  setStandings: (s) => set({ standings: s }),
   setCountdown: (v) => set({ countdownValue: v }),
   setHint: (h) => set({ hint: h }),
   markTutorialSeen: () => {

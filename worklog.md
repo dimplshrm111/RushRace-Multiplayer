@@ -56,3 +56,28 @@ Stage Summary:
 - All validation rules verified via curl (see Work Log); top-8 + timeMs ASC ordering verified with 11 rows in laps=3.
 - DB currently holds 13 test rows (11 @ laps=3, 1 @ laps=1, 1 @ laps=5). Optional cleanup before ship: `sqlite3 /home/z/my-project/db/custom.db "DELETE FROM RaceRecord;"`.
 - Frontend integration hint: POST the race result after finish, then GET (or invalidate a TanStack Query keyed on ['records', laps]) to refresh the leaderboard.
+---
+Task ID: 11
+Agent: main agent (Z.ai Code)
+Task: Fix user-reported issues — inverted arrow-key steering, wavy graphics, missing competitor cars (plus critical gaps found during verification)
+
+Work Log:
+- Diagnosed steering inversion mathematically: physics convention forward=(sin yaw,0,cos yaw), right=(−cos yaw,0,sin yaw) means POSITIVE yaw rate turns the nose toward the car's LEFT; steer=+1 (RIGHT key) produced positive yawRate → car turned LEFT. Fixed by negating steer→yawRate, drift-traction kick (vlat −= steer·2.2), autopilot steer sign, front-wheel visual steer sign, and camera banking roll sign.
+- Removed the heat-haze post-process entirely (engine buildHaze/RT/quad, settings toggle, DEFAULT_SETTINGS.heatHaze): its full-screen 110-cycle sine UV warp was the "wavy" graphics, and the intermediate HalfFloat render target killed MSAA + broke the tone-mapped sRGB output chain. Renderer now draws directly to canvas.
+- Added 3 AI rival cars (src/game/ai.ts): Opponent class wrapping CarPhysics + CarVisual + canvas-sprite name labels (VIPER green, MESA red, HAWK teal), opponentInput() brain with correct steer sign, per-skill corner speeds, preferred racing-line offsets, occasional mistakes, mild rubber-banding (±5.5% at 200 m), boost on straights, respawn recovery.
+- CarVisual extended with body/accent/dark color overrides; CarPhysics gained isPlayer flag (near-miss accounting only for the player).
+- Engine integration: 2×2 start grid (2 rivals front row, 1 alongside player at back — P4 start), opponents updated during racing/finished/title-cruise phases, soft sphere car-to-car collisions with crash sfx/trauma/rumble on player impacts, live standings (finished-by-time then track-position) pushed to store every 0.35 s, race clock keeps running after player finish so AI get exact finish times.
+- HUD: POS chip beside LAP (gold when P1), rival blips + (previously never-rendered) player dot on the minimap using percent-based positioning (works at any CSS size); Results screen: VICTORY!/FINISH! title, P{n}/{total} badge, live RACE STANDINGS table; selftest JSON now reports rival standings.
+- CRITICAL fix found during verification: checkGates' while-loop re-called completeLap() forever on the final lap because the finish branch never advanced nextGateAbs → infinite loop at every race finish (thousands of onFinish/fetch POSTs + tab freeze — 2,292 duplicate RaceRecord rows in the DB). Fixed by setting nextGateK = gates.length, nextGateAbs = Infinity after finish.
+- Fixed particle Pool.spawn full-pool scan (O(n) per emit once saturated during deterministic stepping) — bounded to 16 tries then recycle cursor slot.
+- Fixed CarPhysics.place() not syncing lastIdx (inconsistent −30/−60 m progressS offsets per car after teleports → wrong standings order); fixed PCFSoftShadowMap deprecation warning.
+- Cleaned 2,292 junk RaceRecord rows (all from the finish-loop bug / test runs) → leaderboard fresh at 0.
+- Verification (agent-browser + VLM screenshot analysis + deterministic eval pumping): arrow keys turn correct directions through the real DOM input path (right key → yaw −1.77 rad, left key → +1.32 rad); VLM confirms title/racing/results/countdown scenes render clean with no wavy artifacts; 4 cars on grid with name labels; full 1-lap race completes in 81.85 s with standings YOU 81.85 / VIPER 81.93 / MESA 85.10 / HAWK 87.11; pause menu, settings (heat-haze row removed), mobile landscape 844×390 layout all verified; `bun run lint` clean; dev.log clean.
+
+Stage Summary:
+- Steering: arrow keys + A/D now turn the correct way (verified end-to-end); wheel visuals and camera banking match.
+- Graphics: wavy distortion gone; direct-to-canvas rendering keeps MSAA + ACES tone mapping; shadows use PCFShadowMap.
+- Rivals: 3 AI opponents with identical performance, distinct paint/skill, name labels, minimap blips, live standings, results table; races are close (P2 gap 0.08 s in test race).
+- Race flow: finish-line tab-freeze eliminated (root cause of duplicate leaderboard rows); race clock continues post-finish for exact AI times.
+- Files touched: src/game/physics.ts, car.ts, engine.ts, ai.ts (new), particles.ts, types.ts, store.ts, HUD.tsx, Results.tsx, SettingsPanel.tsx, GameShell.tsx.
+- Note for future agents: headless browser occlusion throttles rAF to ~5 fps and freezes long-running tabs — drive the engine deterministically via engine.debugStep() in eval chunks for race simulation tests.

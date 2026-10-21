@@ -138,6 +138,7 @@ export default function GameShell() {
         }
         eng.debugSelftestActive = false;
         const finished = eng.phase === "finished";
+        const standings = eng.getStandings();
         const res = {
           ok:
             finished &&
@@ -152,6 +153,11 @@ export default function GameShell() {
           driftScore: Math.round(p.driftScore),
           boostMeter: Math.round(p.boostMeter),
           progressPct: +(p.lapProgress.toFixed(3)),
+          rivals: standings.map((s) => ({
+            name: s.name,
+            pos: s.pos,
+            timeMs: s.timeMs == null ? null : Math.round(s.timeMs),
+          })),
           errors,
         };
         console.log("[SELFTEST]", JSON.stringify(res));

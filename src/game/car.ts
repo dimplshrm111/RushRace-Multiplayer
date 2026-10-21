@@ -26,21 +26,27 @@ export class CarVisual {
   private wheelSpin = 0;
   private disposables: (THREE.BufferGeometry | THREE.Material)[] = [];
 
-  constructor(ghost = false) {
+  constructor(
+    ghost = false,
+    colors?: { body?: number; accent?: number; dark?: number }
+  ) {
+    const bodyColor = colors?.body ?? PALETTE.carBody;
+    const accentColor = colors?.accent ?? PALETTE.carAccent;
+    const darkColor = colors?.dark ?? PALETTE.carDark;
     const bodyMat = new THREE.MeshLambertMaterial({
-      color: ghost ? PALETTE.ghost : PALETTE.carBody,
+      color: ghost ? PALETTE.ghost : bodyColor,
       flatShading: true,
       transparent: ghost,
       opacity: ghost ? 0.32 : 1,
     });
     const accentMat = new THREE.MeshLambertMaterial({
-      color: ghost ? PALETTE.ghost : PALETTE.carAccent,
+      color: ghost ? PALETTE.ghost : accentColor,
       flatShading: true,
       transparent: ghost,
       opacity: ghost ? 0.32 : 1,
     });
     const darkMat = new THREE.MeshLambertMaterial({
-      color: ghost ? PALETTE.ghost : PALETTE.carDark,
+      color: ghost ? PALETTE.ghost : darkColor,
       flatShading: true,
       transparent: ghost,
       opacity: ghost ? 0.28 : 1,
@@ -175,7 +181,9 @@ export class CarVisual {
     this.wheelSpin += (s.speed / 0.42) * dt;
     for (const w of this.wheels) w.rotation.x = this.wheelSpin;
     for (const p of this.steerPivots) {
-      p.rotation.y = s.steer * 0.42 + (s.grounded ? 0 : 0);
+      // Car local frame: nose = +Z, right = -X. Turning the wheels toward the
+      // car's right (steer > 0) needs a NEGATIVE local Y rotation.
+      p.rotation.y = -s.steer * 0.42;
     }
     // body lean: acceleration pitch + drift roll + air tilt
     const targetPitch = clamp(-s.pitchRate * 0.02, -0.09, 0.09);

@@ -40,7 +40,6 @@ export interface GameSettings {
   cameraMode: CameraMode;
   musicVol: number; // 0..1
   sfxVol: number; // 0..1
-  heatHaze: boolean;
   highParticles: boolean;
   shadows: boolean;
   laps: number; // 1..5
@@ -52,11 +51,17 @@ export const DEFAULT_SETTINGS: GameSettings = {
   cameraMode: 0,
   musicVol: 0.75,
   sfxVol: 0.9,
-  heatHaze: true,
   highParticles: true,
   shadows: true,
   laps: 3,
 };
+
+/** AI car marker on the minimap. */
+export interface Blip {
+  x: number;
+  z: number;
+  color: string;
+}
 
 /** Per-frame telemetry snapshot for HUD (updated via direct DOM, not React state). */
 export interface Telemetry {
@@ -67,6 +72,9 @@ export interface Telemetry {
   driftMult: number; // 1.0 .. 3.0
   lap: number; // 1-based
   totalLaps: number;
+  position: number; // 1-based race position
+  totalCars: number;
+  blips: Blip[]; // AI cars for the minimap
   raceTimeMs: number;
   lapTimeMs: number;
   bestLapMs: number | null;
@@ -103,6 +111,15 @@ export interface UIEvent {
   at: number;
 }
 
+/** One row of the live race standings. */
+export interface StandingEntry {
+  pos: number;
+  name: string;
+  isPlayer: boolean;
+  color: string;
+  timeMs: number | null; // null = still racing
+}
+
 export interface ResultsData {
   totalMs: number;
   bestLapMs: number;
@@ -113,6 +130,8 @@ export interface ResultsData {
   laps: number;
   isNewRecord: boolean;
   splits: number[];
+  position: number; // 1-based final position
+  totalCars: number;
 }
 
 export interface RaceRecord {

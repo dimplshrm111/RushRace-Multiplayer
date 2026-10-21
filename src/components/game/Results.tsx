@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useGameStore } from "@/game/store";
-import { formatTime, type RaceRecord, type ResultsData } from "@/game/types";
+import { formatTime, type RaceRecord, type ResultsData, type StandingEntry } from "@/game/types";
 
 function Stat({ label, value, big = false }: { label: string; value: string; big?: boolean }) {
   return (
@@ -13,9 +13,27 @@ function Stat({ label, value, big = false }: { label: string; value: string; big
   );
 }
 
+function StandingsRow({ entry }: { entry: StandingEntry }) {
+  return (
+    <div
+      className={`flex items-center gap-2 rounded px-2 py-1 text-xs font-bold ${
+        entry.isPlayer ? "bg-[rgba(240,100,30,0.25)] text-[#fff6e6]" : "text-[#fff6e6]"
+      }`}
+    >
+      <span className="w-4 text-right font-[family-name:var(--font-bungee)] text-[#ffb020]">{entry.pos}</span>
+      <span className="h-3 w-3 shrink-0 rounded-full border border-[#fff6e6]" style={{ backgroundColor: entry.color }} />
+      <span className="flex-1 truncate">{entry.name}</span>
+      <span className="tabular-nums text-[11px]">
+        {entry.timeMs != null ? formatTime(entry.timeMs) : <span className="text-[#c9a06a]">RACING…</span>}
+      </span>
+    </div>
+  );
+}
+
 export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry: () => void; onTitle: () => void }) {
   const [records, setRecords] = useState<RaceRecord[] | null>(null);
   const settings = useGameStore((s) => s.settings);
+  const standings = useGameStore((s) => s.standings);
 
   useEffect(() => {
     let alive = true;
@@ -42,10 +60,26 @@ export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry
             </div>
           )}
           <h2 className="font-[family-name:var(--font-bungee)] text-5xl leading-none text-[#f0641e] [text-shadow:0_3px_0_#2b1c12]">
-            FINISH!
+            {data.position === 1 ? "VICTORY!" : "FINISH!"}
           </h2>
-          <div className="mt-1 text-[10px] font-black tracking-[0.3em] text-[#8a6a4e]">
-            SUNSTONE CANYON · {data.laps} LAP{data.laps > 1 ? "S" : ""}
+          <div className="mt-1 flex items-center justify-center gap-2 text-[10px] font-black tracking-[0.3em] text-[#8a6a4e]">
+            <span
+              className="inline-block rounded bg-[#2b1c12] px-2 py-0.5 font-[family-name:var(--font-bungee)] text-sm tracking-normal text-[#ffb020]"
+              aria-label={`Finished position ${data.position} of ${data.totalCars}`}
+            >
+              P{data.position}/{data.totalCars}
+            </span>
+            <span>SUNSTONE CANYON · {data.laps} LAP{data.laps > 1 ? "S" : ""}</span>
+          </div>
+        </div>
+
+        {/* live race standings */}
+        <div className="mt-3 rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.82)] p-2 text-[#fff6e6]">
+          <div className="mb-1 px-1 text-[10px] font-black tracking-[0.25em] text-[#ffb020]">RACE STANDINGS</div>
+          <div className="flex flex-col gap-0.5">
+            {(standings.length ? standings : []).map((e) => (
+              <StandingsRow key={e.name} entry={e} />
+            ))}
           </div>
         </div>
 

@@ -110,10 +110,6 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
         />
       </Row>
       <div className="h-px bg-[#e5d2b3]" />
-      <Row label="HEAT HAZE" hint="Desert shimmer post-effect">
-        <Switch checked={settings.heatHaze} onCheckedChange={(v) => setSettings({ heatHaze: v })} />
-      </Row>
-      <div className="h-px bg-[#e5d2b3]" />
       <Row label="RICH PARTICLES">
         <Switch checked={settings.highParticles} onCheckedChange={(v) => setSettings({ highParticles: v })} />
       </Row>

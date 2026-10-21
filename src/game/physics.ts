@@ -44,7 +44,9 @@ export function autopilotInput(p: CarPhysics, t: Track): DriveInput {
   const dx = s.x - p.pos.x;
   const dz = s.z - p.pos.z;
   const err = angDiff(Math.atan2(dx, dz), p.yaw);
-  const steer = clamp(err * 2.4, -1, 1);
+  // NOTE: positive yaw turns the car toward its LEFT (forward = (sin,0,cos),
+  // right = (-cos,0,sin)), so a positive heading error needs NEGATIVE steer.
+  const steer = clamp(-err * 2.4, -1, 1);
   // corner speed heuristic from heading change ahead
   const s2 = t.sample(wrapIdxLocal(li + 12, t.N));
   const s3 = t.sample(wrapIdxLocal(li + 26, t.N));
@@ -97,6 +99,8 @@ export class CarPhysics {
   nearMisses = 0;
 
   assist = true;
+  /** Only the player's car counts near-misses / shared-obstacle cooldowns. */
+  isPlayer = true;
 
   private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
   private ev: PhysicsEvents;
@@ -137,6 +141,7 @@ export class CarPhysics {
     this.airTime = 0;
     this.climbRate = 0;
     this.idx = idx;
+    this.lastIdx = idx; // keep the unwrapped-progress delta consistent after teleports
     this.lateral = lat;
     this.prevGroundY = h;
     if (syncProgress) this.progressS = idx * t.step;
@@ -202,8 +207,11 @@ export class CarPhysics {
     }
 
     // ---- steering ----
+    // Convention: forward = (sin yaw, 0, cos yaw), right = (-cos yaw, 0, sin yaw).
+    // Increasing yaw rotates the nose toward +X, which is the car's LEFT side,
+    // so steering RIGHT (input.steer = +1) must produce a NEGATIVE yaw rate.
     const steerAuth = 1 / (1 + Math.pow(Math.abs(vf) * 0.026, 1.5));
-    let targetYawRate = input.steer * 2.5 * steerAuth * (this.drifting ? 1.55 : 1);
+    let targetYawRate = -input.steer * 2.5 * steerAuth * (this.drifting ? 1.55 : 1);
     if (!this.grounded) targetYawRate *= 0.34;
 
     if (this.assist && this.grounded) {
@@ -222,8 +230,9 @@ export class CarPhysics {
     if (!this.drifting && input.handbrake && canDrift && Math.abs(input.steer) > 0.12) {
       this.drifting = true;
       this.driftChain = 0;
-      // small kick to break traction
-      vlat += input.steer * 2.2;
+      // small kick to break traction: shove the chassis sideways, OPPOSITE to
+      // the turn direction, so the velocity lags behind the rotating nose.
+      vlat -= input.steer * 2.2;
     }
     if (this.drifting) {
       if (this.grounded && (input.handbrake || Math.abs(this.slip) > 0.16)) {
@@ -390,7 +399,8 @@ export class CarPhysics {
           d < near &&
           this.speed > 22 &&
           now - ob.lastNear > 5000 &&
-          Math.abs(this.pos.y - (ob.top - 2)) < 6
+          Math.abs(this.pos.y - (ob.top - 2)) < 6 &&
+          this.isPlayer
         ) {
           ob.lastNear = now;
           this.nearMisses++;

@@ -10,6 +10,8 @@ interface MinimapData {
   scale: number;
   ox: number;
   oy: number;
+  w: number;
+  h: number;
 }
 
 export function HUD({
@@ -34,6 +36,9 @@ export function HUD({
   const minimapRef = useRef<HTMLCanvasElement>(null);
   const minimapDataRef = useRef<MinimapData | null>(null);
   const carDotRef = useRef<HTMLDivElement>(null);
+  const aiDotsRef = useRef<Array<HTMLDivElement | null>>([]);
+  const posRef = useRef<HTMLSpanElement>(null);
+  const posChipRef = useRef<HTMLDivElement>(null);
 
   const popups = useGameStore((s) => s.popups);
   const countdownValue = useGameStore((s) => s.countdownValue);
@@ -84,6 +89,11 @@ export function HUD({
         if (mult) mult.textContent = `x${t.driftMult.toFixed(1)}`;
       }
       if (lapRef.current) lapRef.current.textContent = `${t.lap}/${t.totalLaps}`;
+      if (posRef.current) posRef.current.textContent = `${t.position}/${t.totalCars}`;
+      if (posChipRef.current) {
+        posChipRef.current.style.background = t.position === 1 ? "#ffb020" : "rgba(43,28,18,0.72)";
+        posChipRef.current.style.color = t.position === 1 ? "#2b1c12" : "#fff6e6";
+      }
       if (timeRef.current) timeRef.current.textContent = formatTime(t.lapTimeMs);
       if (totalRef.current) totalRef.current.textContent = formatTime(t.raceTimeMs);
       if (bestRef.current && t.bestTotalMs !== lastBestRender) {
@@ -98,14 +108,28 @@ export function HUD({
         cpRef.current.textContent = `${d}m`;
         cpDotRef.current.style.left = `${Math.round(t.progressPct * 100)}%`;
       }
-      // minimap car dot
+      // minimap car dot + rival blips (percent-based so it tracks the CSS size)
       const mm = minimapDataRef.current;
       if (mm && engine) {
         const p = engine.physics.pos;
-        carDotRef.current?.style.setProperty(
-          "transform",
-          `translate(${mm.ox + p.x * mm.scale}px, ${mm.oy + p.z * mm.scale}px)`
-        );
+        if (carDotRef.current) {
+          carDotRef.current.style.left = `${((mm.ox + p.x * mm.scale) / mm.w) * 100}%`;
+          carDotRef.current.style.top = `${((mm.oy + p.z * mm.scale) / mm.h) * 100}%`;
+        }
+        const dots = aiDotsRef.current;
+        for (let i = 0; i < dots.length; i++) {
+          const dot = dots[i];
+          if (!dot) continue;
+          const b = t.blips[i];
+          if (!b) {
+            dot.style.opacity = "0";
+            continue;
+          }
+          dot.style.opacity = "1";
+          dot.style.backgroundColor = b.color;
+          dot.style.left = `${((mm.ox + b.x * mm.scale) / mm.w) * 100}%`;
+          dot.style.top = `${((mm.oy + b.z * mm.scale) / mm.h) * 100}%`;
+        }
       }
     });
     return unsub;
@@ -155,16 +179,22 @@ export function HUD({
       ctx.fillStyle = g.finish ? "#f0641e" : "#2b1c12";
       ctx.fill();
     }
-    minimapDataRef.current = { canvas, scale, ox, oy };
+    minimapDataRef.current = { canvas, scale, ox, oy, w: W, h: H };
   }, [engineRef]);
 
   return (
     <div className="pointer-events-none absolute inset-0 z-10 font-[family-name:var(--font-geist-sans)]">
-      {/* top center: lap + times */}
+      {/* top center: lap + position + times */}
       <div className="absolute left-1/2 top-3 flex -translate-x-1/2 flex-col items-center gap-1">
-        <div className="flex items-center gap-2 rounded-md bg-[rgba(43,28,18,0.72)] px-3 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px]">
-          <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">LAP</span>
-          <span ref={lapRef} className="font-[family-name:var(--font-bungee)] text-lg leading-none">1/3</span>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 rounded-md bg-[rgba(43,28,18,0.72)] px-3 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px]">
+            <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">LAP</span>
+            <span ref={lapRef} className="font-[family-name:var(--font-bungee)] text-lg leading-none">1/3</span>
+          </div>
+          <div ref={posChipRef} className="flex items-center gap-2 rounded-md bg-[rgba(43,28,18,0.72)] px-3 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px] transition-colors">
+            <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">POS</span>
+            <span ref={posRef} className="font-[family-name:var(--font-bungee)] text-lg leading-none">4/4</span>
+          </div>
         </div>
         <div ref={timeRef} className="font-[family-name:var(--font-bungee)] text-2xl leading-none text-[#2b1c12] [text-shadow:0_2px_0_rgba(255,246,230,0.65)] sm:text-3xl">
           0:00.00
@@ -181,8 +211,25 @@ export function HUD({
 
       {/* top left: minimap + next checkpoint */}
       <div className="absolute left-3 top-3 flex flex-col gap-1">
-        <div className="rounded-lg bg-[rgba(255,246,230,0.82)] p-1 shadow-lg backdrop-blur-[2px]">
+        <div className="relative rounded-lg bg-[rgba(255,246,230,0.82)] p-1 shadow-lg backdrop-blur-[2px]">
           <canvas ref={minimapRef} width={148} height={118} className="block h-[86px] w-[108px] sm:h-[118px] sm:w-[148px]" aria-label="Track minimap" />
+          {/* rival blips */}
+          {[0, 1, 2].map((i) => (
+            <div
+              key={i}
+              ref={(el) => {
+                aiDotsRef.current[i] = el;
+              }}
+              className="absolute h-[7px] w-[7px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#fff6e6] opacity-0 shadow"
+              style={{ left: "-20%", top: "-20%" }}
+            />
+          ))}
+          {/* player dot */}
+          <div
+            ref={carDotRef}
+            className="absolute h-[9px] w-[9px] -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#fff6e6] bg-[#f0641e] shadow"
+            style={{ left: "-20%", top: "-20%" }}
+          />
         </div>
         <div className="flex w-fit items-center gap-1.5 self-start rounded bg-[rgba(43,28,18,0.72)] px-2 py-0.5 text-[10px] font-bold tracking-wider text-[#fff6e6]">
           <span className="text-[#ffb020]">NEXT CP</span>
