@@ -1,0 +1,1022 @@
+"use client";
+
+import * as THREE from "three";
+import { Track, SUN_DIR } from "./track";
+import { CarVisual } from "./car";
+import { CarPhysics } from "./physics";
+import { ParticleSystem } from "./particles";
+import { AudioSystem } from "./audio";
+import { InputManager } from "./input";
+import { gameStore } from "./store";
+import {
+  DEFAULT_SETTINGS,
+  PALETTE,
+  clamp,
+  damp,
+  type DriveInput,
+  type GamePhase,
+  type GameSettings,
+  type ResultsData,
+  type Telemetry,
+} from "./types";
+
+export interface EngineCallbacks {
+  onPhaseChange(p: GamePhase): void;
+  onCountdown(v: number): void;
+  onFinish(r: ResultsData): void;
+}
+
+const GHOST_KEY = "canyonrush.ghost.v1";
+
+interface GhostFrame {
+  t: number;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+}
+
+export class GameEngine {
+  renderer: THREE.WebGLRenderer;
+  scene = new THREE.Scene();
+  camera: THREE.PerspectiveCamera;
+  track: Track;
+  car: CarVisual;
+  ghostCar: CarVisual;
+  physics: CarPhysics;
+  particles = new ParticleSystem();
+  private audio: AudioSystem;
+  private input: InputManager;
+  private cbs: EngineCallbacks;
+  private settings: GameSettings = { ...DEFAULT_SETTINGS };
+
+  phase: GamePhase = "title";
+  paused = false;
+  private raf = 0;
+  private lastT = 0;
+  private time = 0;
+
+  // race state
+  private countdownT = 0;
+  private countdownShown = -99;
+  private raceTime = 0;
+  private lapStart = 0;
+  private lapsDone = 0;
+  private totalLaps = 3;
+  private lineAbs = 0; // progressS value of the current lap's start line
+  private nextGateK = 0;
+  private nextGateAbs = 0;
+  private splits: number[] = [];
+  private bestSplits: number[] = [];
+  private bestTotalMs: number | null = null;
+  private bestLapMs: number | null = null;
+  private lapTimes: number[] = [];
+  private bigAirCount = 0;
+  private recoverT = 0;
+  private titleCamS = 0;
+  private finishOrbitT = 0;
+
+  // ghost
+  private ghost: GhostFrame[] = [];
+  private ghostRec: GhostFrame[] = [];
+  private ghostRecT = 0;
+
+  // camera state
+  private camPos = new THREE.Vector3();
+  private camLook = new THREE.Vector3();
+  private camRoll = 0;
+  private trauma = 0;
+  private fov = 66;
+  private wallRideLean = 0;
+
+  // sun
+  private sun: THREE.DirectionalLight;
+
+  // heat haze
+  private hazeRT: THREE.WebGLRenderTarget | null = null;
+  private hazeScene: THREE.Scene | null = null;
+  private hazeCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  private hazeMat: THREE.ShaderMaterial | null = null;
+
+  private telemetryListeners = new Set<(t: Telemetry) => void>();
+  private tmpV = new THREE.Vector3();
+  private tmpV2 = new THREE.Vector3();
+  private disposed = false;
+  private skidTimer = 0;
+  private sparkTimer = 0;
+  private boostTrailTimer = 0;
+
+  constructor(
+    canvas: HTMLCanvasElement,
+    audio: AudioSystem,
+    input: InputManager,
+    cbs: EngineCallbacks
+  ) {
+    this.audio = audio;
+    this.input = input;
+    this.cbs = cbs;
+
+    this.renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      powerPreference: "high-performance",
+    });
+    const isMobile =
+      typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 2));
+    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    this.renderer.toneMappingExposure = 1.05;
+    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    this.camera = new THREE.PerspectiveCamera(66, 16 / 9, 0.3, 4200);
+    this.scene.fog = new THREE.Fog(PALETTE.fog, 240, 1050);
+
+    // sky
+    this.buildSky();
+
+    // lights
+    const hemi = new THREE.HemisphereLight(0xffe9c9, 0xcaa06a, 0.8);
+    this.scene.add(hemi);
+    this.sun = new THREE.DirectionalLight(0xffd9a8, 1.8);
+    this.sun.castShadow = !isMobile;
+    this.sun.shadow.mapSize.set(isMobile ? 1024 : 2048, isMobile ? 1024 : 2048);
+    const sc = this.sun.shadow.camera;
+    sc.left = -95;
+    sc.right = 95;
+    sc.top = 95;
+    sc.bottom = -95;
+    sc.near = 20;
+    sc.far = 420;
+    this.sun.shadow.bias = -0.0006;
+    this.sun.shadow.normalBias = 0.5;
+    this.scene.add(this.sun);
+    this.scene.add(this.sun.target);
+
+    // world
+    this.track = new Track();
+    this.scene.add(this.track.group);
+    this.scene.add(this.particles.group);
+
+    // cars
+    this.car = new CarVisual(false);
+    this.scene.add(this.car.group);
+    this.ghostCar = new CarVisual(true);
+    this.ghostCar.group.visible = false;
+    this.scene.add(this.ghostCar.group);
+
+    this.physics = new CarPhysics(this.track, {
+      onJump: () => this.audio.jump(),
+      onLanding: (i, clean) => {
+        this.audio.landing(clean, i);
+        this.trauma = Math.min(1, this.trauma + 0.18 + i * 0.3);
+        this.input.rumble(0.2 + i * 0.5, 120);
+        this.dustBurst(6 + Math.round(i * 6));
+      },
+      onCleanLand: (at) => {
+        gameStore.getState().pushPopup("cleanland", `CLEAN LANDING +${Math.round(Math.min(30, at * 16))}`);
+      },
+      onBigAir: (at) => {
+        this.bigAirCount++;
+        gameStore.getState().pushPopup("airtime", `BIG AIR ${at.toFixed(1)}s +${Math.round(Math.min(30, at * 16))}`);
+      },
+      onDriftBank: (mult) => {
+        gameStore.getState().pushPopup("driftbank", `DRIFT CHAIN x${mult.toFixed(1)}`);
+        this.audio.driftBank(mult);
+      },
+      onNearMiss: () => {
+        gameStore.getState().pushPopup("nearmiss", "NEAR MISS +9");
+        this.audio.nearMiss();
+        this.trauma = Math.min(1, this.trauma + 0.08);
+      },
+      onWallRideStart: () => {
+        gameStore.getState().pushPopup("wallride", "WALL RIDE +");
+      },
+      onCrash: (i) => {
+        this.audio.crash(i);
+        this.trauma = Math.min(1, this.trauma + 0.25 + i * 0.45);
+        this.input.rumble(0.4 + i * 0.6, 200);
+        const p = this.physics.pos;
+        this.particles.emitSparks(p.x, p.y, p.z, -Math.sin(this.physics.yaw), -Math.cos(this.physics.yaw), 8 + Math.round(i * 10));
+      },
+      onBoostStart: () => {
+        this.audio.boostStart();
+        this.input.rumble(0.25, 90);
+      },
+      requestRecovery: () => this.startRecovery(),
+    });
+
+    this.loadBest();
+    this.physics.place(this.track.N - 10, 0, 0);
+    this.syncCarVisual(0.016);
+    this.updateSun();
+    // heat haze pass
+    this.buildHaze();
+
+    this.resize();
+    this.lastT = performance.now();
+    this.loop();
+  }
+
+  // ============================================================
+  // setup helpers
+  // ============================================================
+
+  private buildSky() {
+    const geo = new THREE.SphereGeometry(3900, 32, 16);
+    const mat = new THREE.ShaderMaterial({
+      side: THREE.BackSide,
+      depthWrite: false,
+      fog: false,
+      uniforms: {
+        uZen: { value: new THREE.Color(PALETTE.skyZenith) },
+        uMid: { value: new THREE.Color(PALETTE.skyMid) },
+        uHor: { value: new THREE.Color(PALETTE.skyHorizon) },
+        uSun: { value: SUN_DIR.clone() },
+      },
+      vertexShader: `
+        varying vec3 vW;
+        void main() {
+          vW = (modelMatrix * vec4(position, 1.0)).xyz;
+          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        }
+      `,
+      fragmentShader: `
+        uniform vec3 uZen; uniform vec3 uMid; uniform vec3 uHor; uniform vec3 uSun;
+        varying vec3 vW;
+        void main() {
+          vec3 d = normalize(vW);
+          float h = d.y;
+          vec3 col = h > 0.16 ? mix(uMid, uZen, smoothstep(0.16, 0.6, h))
+                              : mix(uHor, uMid, smoothstep(-0.06, 0.16, h));
+          float sd = max(dot(d, uSun), 0.0);
+          col += vec3(1.0, 0.88, 0.62) * (pow(sd, 900.0) * 1.2 + pow(sd, 16.0) * 0.3 + pow(sd, 4.0) * 0.1);
+          gl_FragColor = vec4(col, 1.0);
+        }
+      `,
+    });
+    const sky = new THREE.Mesh(geo, mat);
+    sky.frustumCulled = false;
+    this.scene.add(sky);
+  }
+
+  private buildHaze() {
+    this.hazeRT = new THREE.WebGLRenderTarget(2, 2, {
+      type: THREE.HalfFloatType,
+    });
+    this.hazeMat = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: this.hazeRT.texture },
+        uTime: { value: 0 },
+        uAmount: { value: 1 },
+      },
+      vertexShader: `
+        varying vec2 vUv;
+        void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+      `,
+      fragmentShader: `
+        uniform sampler2D tDiffuse; uniform float uTime; uniform float uAmount;
+        varying vec2 vUv;
+        void main() {
+          vec2 uv = vUv;
+          float mask = smoothstep(0.85, 0.45, uv.y) * 0.75 + 0.1;
+          uv.x += sin(uv.y * 110.0 + uTime * 3.3) * 0.0026 * mask * uAmount;
+          uv.y += sin(uv.x * 70.0 + uTime * 2.1) * 0.0018 * mask * uAmount;
+          vec3 c = texture2D(tDiffuse, uv).rgb;
+          // subtle warm vignette
+          vec2 q = vUv - 0.5;
+          c *= 1.0 - dot(q, q) * 0.35;
+          gl_FragColor = vec4(c, 1.0);
+        }
+      `,
+    });
+    this.hazeScene = new THREE.Scene();
+    const quadGeo = new THREE.PlaneGeometry(2, 2);
+    this.hazeScene.add(new THREE.Mesh(quadGeo, this.hazeMat));
+  }
+
+  private loadBest() {
+    try {
+      const raw = localStorage.getItem("canyonrush.best.v1");
+      if (raw) {
+        const d = JSON.parse(raw) as {
+          totalMs: number;
+          bestLapMs: number;
+          splits: number[];
+          laps: number;
+        };
+        this.bestTotalMs = d.totalMs;
+        this.bestLapMs = d.bestLapMs;
+        this.bestSplits = d.splits ?? [];
+      }
+      const graw = localStorage.getItem(GHOST_KEY);
+      if (graw) this.ghost = JSON.parse(graw) as GhostFrame[];
+    } catch {
+      /* ignore */
+    }
+  }
+
+  // ============================================================
+  // public control API
+  // ============================================================
+
+  onTelemetry(fn: (t: Telemetry) => void): () => void {
+    this.telemetryListeners.add(fn);
+    return () => this.telemetryListeners.delete(fn);
+  }
+
+  applySettings(s: GameSettings) {
+    const prevShadows = this.settings.shadows;
+    this.settings = { ...s };
+    this.physics.assist = s.assist;
+    this.particles.setHighDensity(s.highParticles);
+    this.audio.setVolumes(s.musicVol, s.sfxVol);
+    this.input.setMouseSteer(s.mouseSteer);
+    if (prevShadows !== s.shadows) {
+      this.renderer.shadowMap.enabled = s.shadows;
+      this.sun.castShadow = s.shadows;
+      this.scene.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (mesh.isMesh) {
+          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+          for (const m of mats) (m as THREE.Material).needsUpdate = true;
+        }
+      });
+    }
+  }
+
+  startRace(laps: number) {
+    this.totalLaps = laps;
+    this.loadBest();
+    this.lapsDone = 0;
+    this.raceTime = 0;
+    this.lapStart = 0;
+    this.splits = [];
+    this.lapTimes = [];
+    this.bigAirCount = 0;
+    this.physics.boostMeter = 35;
+    this.physics.driftScore = 0;
+    this.physics.nearMisses = 0;
+    this.physics.topSpeed = 0;
+    this.physics.place(this.track.N - 10, 0, 0);
+    this.particles.clearSkids(this.time);
+    this.ghostRec = [];
+    this.ghostRecT = 0;
+    this.ghostCar.group.visible = this.ghost.length > 0;
+    this.countdownT = 3;
+    this.countdownShown = -99;
+    this.recoverT = 0;
+    this.lineAbs = this.track.length; // first line crossing = one length from spawn
+    this.nextGateK = 0;
+    this.nextGateAbs = this.gateAbs(0);
+    this.setPhase("countdown");
+    this.audio.startMusic();
+  }
+
+  restart() {
+    if (this.phase === "countdown" || this.phase === "racing" || this.phase === "finished") {
+      this.startRace(this.totalLaps);
+    }
+  }
+
+  toTitle() {
+    this.setPhase("title");
+    this.physics.place(this.track.N - 10, 0, 0);
+    this.ghostCar.group.visible = false;
+  }
+
+  setPaused(v: boolean) {
+    this.paused = v;
+    this.audio.setDucked(v);
+  }
+
+  /** Self-test helpers: deterministic stepping decoupled from rAF. */
+  debugSelftestActive = false;
+
+  debugSkipCountdown() {
+    this.countdownT = 0;
+    this.countdownShown = 0;
+    this.setPhase("racing");
+    this.raceTime = 0;
+    this.lapStart = 0;
+  }
+
+  debugStep(input: DriveInput, dt = 1 / 60) {
+    this.updateRacing(dt, input);
+    this.syncCarVisual(dt);
+  }
+
+  private setPhase(p: GamePhase) {
+    this.phase = p;
+    this.cbs.onPhaseChange(p);
+  }
+
+  dispose() {
+    this.disposed = true;
+    cancelAnimationFrame(this.raf);
+    this.track.dispose();
+    this.car.dispose();
+    this.ghostCar.dispose();
+    this.particles.dispose();
+    this.hazeRT?.dispose();
+    this.hazeMat?.dispose();
+    this.renderer.dispose();
+  }
+
+  resize() {
+    const canvas = this.renderer.domElement;
+    const w = canvas.clientWidth || window.innerWidth;
+    const h = canvas.clientHeight || window.innerHeight;
+    this.renderer.setSize(w, h, false);
+    this.camera.aspect = w / h;
+    this.camera.updateProjectionMatrix();
+    if (this.hazeRT) {
+      const dpr = this.renderer.getPixelRatio();
+      this.hazeRT.setSize(Math.floor(w * dpr), Math.floor(h * dpr));
+    }
+  }
+
+  // ============================================================
+  // main loop
+  // ============================================================
+
+  private loop = () => {
+    if (this.disposed) return;
+    this.raf = requestAnimationFrame(this.loop);
+    if (this.debugSelftestActive) return; // selftest drives physics deterministically
+    const now = performance.now();
+    let dt = (now - this.lastT) / 1000;
+    this.lastT = now;
+    dt = clamp(dt, 0.0005, 1 / 30);
+    if (this.paused) dt = 0;
+
+    this.time += dt;
+
+    const input = this.input.sample(Math.max(dt, 0.0001));
+    this.curInput = input;
+    // longitudinal accel estimate for body pitch
+    const sp = this.physics.speed;
+    if (dt > 0.0001) {
+      this.lastAccel = damp(this.lastAccel, (sp - this.prevSpeed) / dt, 6, dt);
+    }
+    this.prevSpeed = sp;
+    this.noteInput(input.steer, input.brake, this.lastAccel);
+
+    if (this.phase === "countdown") this.updateCountdown(dt);
+    else if (this.phase === "racing") this.updateRacing(dt, input);
+    else if (this.phase === "finished") this.updateFinished(dt);
+    else this.updateTitle(dt);
+
+    if (this.recoverT > 0) this.recoverT -= dt;
+
+    this.updateCamera(dt);
+    this.updateSun();
+    this.particles.update(dt, this.time);
+    this.updateGateGlow();
+    this.emitTelemetry();
+
+    // audio
+    const { rpm } = this.physics.gearAndRpm();
+    const intensity =
+      this.phase === "title"
+        ? 0
+        : this.phase === "countdown"
+          ? 1
+          : this.phase === "finished"
+            ? 1
+            : clamp(1 + (this.physics.speed > 26 ? 1 : 0) + (this.physics.boosting || this.physics.boostMeter > 82 ? 1 : 0), 0, 3);
+    this.audio.update(dt, {
+      rpm:
+        this.phase === "countdown"
+          ? 0.25 + input.throttle * 0.55
+          : this.phase === "racing" || this.phase === "finished"
+            ? rpm
+            : 0.22,
+      throttle: this.phase === "racing" ? input.throttle : this.phase === "countdown" ? input.throttle * 0.7 : 0,
+      speed: this.physics.speed,
+      driftIntensity: this.physics.drifting ? clamp(Math.abs(this.physics.slip) / 0.5, 0, 1) : 0,
+      boosting: this.physics.boosting && this.phase === "racing",
+      wallRide: this.physics.wallRiding,
+      musicIntensity: intensity,
+    });
+
+    // render (with optional heat haze pass)
+    if (this.settings.heatHaze && this.hazeRT && this.hazeScene && this.hazeMat) {
+      this.hazeMat.uniforms.uTime.value = this.time;
+      this.renderer.setRenderTarget(this.hazeRT);
+      this.renderer.clear();
+      this.renderer.render(this.scene, this.camera);
+      this.renderer.setRenderTarget(null);
+      this.renderer.render(this.hazeScene, this.hazeCam);
+    } else {
+      this.renderer.render(this.scene, this.camera);
+    }
+  };
+
+  private updateCountdown(dt: number) {
+    this.countdownT -= dt;
+    const v = Math.ceil(this.countdownT);
+    if (v !== this.countdownShown && v >= 0) {
+      this.countdownShown = v;
+      this.cbs.onCountdown(v);
+      this.audio.countdownBeep(v === 0);
+    }
+    if (this.countdownT <= 0) {
+      this.setPhase("racing");
+      this.raceTime = 0;
+      this.lapStart = 0;
+    }
+  }
+
+  private updateRacing(dt: number, input: DriveInput) {
+    if (this.recoverT > 0) return;
+    const prevS = this.physics.progressS;
+    this.physics.update(input, dt);
+    this.raceTime += dt * 1000;
+    this.syncCarVisual(dt);
+    this.emitEffects(dt);
+    this.recordGhost(dt);
+    this.playGhost();
+    this.checkGates(prevS);
+    // wrong-way popup (throttled)
+    if (this.physics.wrongWay && this.time - this.lastWrongWayPopup > 2.5) {
+      this.lastWrongWayPopup = this.time;
+      gameStore.getState().pushPopup("wrongway", "WRONG WAY!");
+    }
+  }
+
+  private lastWrongWayPopup = -10;
+
+  private updateFinished(dt: number) {
+    this.physics.update({ steer: 0, throttle: 0, brake: 0.25, handbrake: false, boost: false }, dt);
+    this.syncCarVisual(dt);
+    this.finishOrbitT += dt;
+  }
+
+  private updateTitle(dt: number) {
+    this.titleCamS += dt * 15;
+    const t = this.track;
+    const idx = Math.floor(this.titleCamS / t.step) % t.N;
+    const s = t.sample(idx);
+    const ahead = t.sample(idx + 22);
+    this.camPos.set(
+      s.x + s.rx * Math.sin(this.titleCamS * 0.05) * 6,
+      s.y + 10 + Math.sin(this.titleCamS * 0.03) * 2.5,
+      s.z + s.rz * Math.sin(this.titleCamS * 0.05) * 6
+    );
+    this.camLook.set(ahead.x, ahead.y + 5, ahead.z);
+    this.camera.position.copy(this.camPos);
+    this.camera.up.set(0, 1, 0);
+    this.camera.lookAt(this.camLook);
+    this.camera.fov = damp(this.camera.fov, 62, 2, dt);
+    this.camera.updateProjectionMatrix();
+    this.syncCarVisual(dt);
+  }
+
+  // ============================================================
+  // racing internals
+  // ============================================================
+
+  private gateAbs(k: number): number {
+    const t = this.track;
+    const gate = t.gates[k];
+    if (!gate) return Infinity;
+    return this.lineAbs + (gate.isFinish ? t.length : gate.idx * t.step);
+  }
+
+  private checkGates(prevS: number) {
+    const t = this.track;
+    while (this.physics.progressS >= this.nextGateAbs) {
+      const gate = t.gates[this.nextGateK];
+      if (!gate) break;
+      const latOk = Math.abs(this.physics.lateral) < t.sample(gate.idx).hw + 10;
+      const prevOk = prevS <= this.nextGateAbs + 1;
+      if (!latOk || !prevOk) break;
+      if (gate.isFinish) {
+        this.completeLap();
+      } else {
+        const lapMs = this.raceTime - this.lapStart;
+        this.splits.push(lapMs);
+        const best = this.bestSplits[this.splits.length - 1];
+        const delta = best != null ? lapMs - best : null;
+        gameStore.getState().pushPopup("checkpoint", `CHECKPOINT ${this.splits.length}`, { deltaMs: delta ?? undefined });
+        this.physics.boostMeter = clamp(this.physics.boostMeter + 12, 0, 100);
+        this.audio.checkpoint(delta);
+        this.nextGateK++;
+        this.nextGateAbs = this.gateAbs(this.nextGateK);
+      }
+    }
+  }
+
+  private completeLap() {
+    const lapMs = this.raceTime - this.lapStart;
+    this.lapTimes.push(lapMs);
+    const lapIsBest = this.bestLapMs == null || lapMs < this.bestLapMs;
+    if (lapIsBest) {
+      this.bestLapMs = lapMs;
+      if (this.ghostRec.length > 10) this.ghost = this.ghostRec;
+    }
+    this.lapsDone++;
+    const store = gameStore.getState();
+    if (this.lapsDone >= this.totalLaps) {
+      // ---- finish ----
+      const totalMs = this.raceTime;
+      const bestLap = Math.min(...this.lapTimes);
+      const isNewRecord = this.bestTotalMs == null || totalMs < this.bestTotalMs;
+      if (isNewRecord) {
+        this.bestTotalMs = totalMs;
+        this.bestSplits = [...this.splits];
+      }
+      try {
+        localStorage.setItem(
+          "canyonrush.best.v1",
+          JSON.stringify({
+            totalMs: this.bestTotalMs,
+            bestLapMs: this.bestLapMs,
+            splits: this.bestSplits,
+            laps: this.totalLaps,
+          })
+        );
+        if (this.ghost.length > 10) {
+          localStorage.setItem(GHOST_KEY, JSON.stringify(this.ghost));
+        }
+      } catch {
+        /* ignore */
+      }
+      if (isNewRecord) {
+        store.saveBest({ totalMs, bestLapMs: this.bestLapMs, splits: this.bestSplits, laps: this.totalLaps });
+        store.pushPopup("newrecord", "NEW RECORD!");
+      }
+      this.audio.finish(isNewRecord);
+      this.setPhase("finished");
+      this.finishOrbitT = 0;
+      this.ghostCar.group.visible = false;
+      this.cbs.onFinish({
+        totalMs,
+        bestLapMs: bestLap,
+        topSpeedKmh: Math.round(this.physics.topSpeed),
+        driftScore: Math.round(this.physics.driftScore),
+        nearMisses: this.physics.nearMisses,
+        bigAirCount: this.bigAirCount,
+        laps: this.totalLaps,
+        isNewRecord,
+        splits: [...this.splits],
+      });
+      return;
+    }
+    // lap complete, more to go
+    store.pushPopup("lap", `LAP ${this.lapsDone}/${this.totalLaps} — ${fmt(lapMs)}`);
+    this.audio.checkpoint(-1);
+    this.lapStart = this.raceTime;
+    this.lineAbs += this.track.length;
+    this.nextGateK = 0;
+    this.nextGateAbs = this.gateAbs(0);
+    this.ghostRec = [];
+    this.ghostRecT = 0;
+    this.ghostCar.group.visible = this.ghost.length > 0;
+  }
+
+  private startRecovery() {
+    if (this.recoverT > 0 || this.phase !== "racing") return;
+    this.recoverT = 0.85;
+    this.audio.recovery();
+    gameStore.getState().pushPopup("recovery", "RECOVERED — HOLD YOUR LINE!");
+    const t = this.track;
+    if (this.nextGateK > 0) {
+      const gate = t.gates[this.nextGateK - 1];
+      const idx = wrapI(gate.idx + 4, t.N);
+      const baseS = this.lineAbs + gate.idx * t.step;
+      this.physics.place(idx, 0, 13, false);
+      this.physics.syncProgress(baseS + 4 * t.step);
+    } else {
+      // no gate passed yet this lap → back to the lap start line
+      this.physics.place(t.N - 10, 0, 13, false);
+      this.physics.syncProgress(this.lineAbs - 20);
+    }
+    this.syncCarVisual(0.016);
+    this.trauma = Math.min(1, this.trauma + 0.3);
+  }
+
+  // ============================================================
+  // visuals sync & effects
+  // ============================================================
+
+  private syncCarVisual(dt: number) {
+    const p = this.physics;
+    const g = this.car.group;
+    g.position.copy(p.pos);
+    g.rotation.set(0, p.yaw, 0);
+    // align to ground slope
+    if (p.grounded) {
+      const slopeL = this.track.slopeLatAt(p.idx, p.lateral);
+      const slopeF = this.track.slopeFwdAt(p.idx, p.lateral);
+      g.rotation.order = "YXZ";
+      g.rotation.x = damp(g.rotation.x, clamp(-Math.atan(slopeF), -0.5, 0.5), 8, dt);
+      g.rotation.z = damp(g.rotation.z, clamp(Math.atan(slopeL), -0.9, 0.9), 8, dt);
+      if (p.wallRiding) {
+        const side = this.track.sample(p.idx).wallRideR && p.lateral > 0 ? 1 : -1;
+        g.rotation.z = damp(g.rotation.z, side * clamp(Math.atan(slopeL), -1.15, 1.15), 8, dt);
+      }
+    } else {
+      g.rotation.order = "YXZ";
+      g.rotation.x = damp(g.rotation.x, clamp(-p.vel.y * 0.02, -0.35, 0.35), 3, dt);
+      g.rotation.z = damp(g.rotation.z, 0, 4, dt);
+    }
+    const { gear, rpm } = p.gearAndRpm();
+    void gear;
+    void rpm;
+    this.car.update({
+      speed: p.vel.x * Math.sin(p.yaw) + p.vel.z * Math.cos(p.yaw),
+      steer: this.lastSteer,
+      slip: p.drifting ? p.slip : 0,
+      grounded: p.grounded,
+      boosting: p.boosting,
+      braking: this.lastBrake > 0.05,
+      pitchRate: this.lastAccel,
+      rollRate: p.drifting ? -p.slip * 12 : 0,
+      dt,
+    });
+  }
+
+  private curInput: DriveInput = { steer: 0, throttle: 0, brake: 0, handbrake: false, boost: false };
+  private lastSteer = 0;
+  private lastBrake = 0;
+  private lastAccel = 0;
+  private prevSpeed = 0;
+
+  private emitEffects(dt: number) {
+    const p = this.physics;
+    const fwd = this.tmpV.set(Math.sin(p.yaw), 0, Math.cos(p.yaw));
+    const right = this.tmpV2.set(-Math.cos(p.yaw), 0, Math.sin(p.yaw));
+
+    const speedH = p.speed;
+
+    if (p.grounded) {
+      // drift smoke + skids
+      if (p.drifting && speedH > 8) {
+        const q = clamp(Math.abs(p.slip) / 0.5, 0.2, 1);
+        for (const side of [-1, 1]) {
+          const wx = p.pos.x - fwd.x * 1.25 + right.x * side * 0.85;
+          const wz = p.pos.z - fwd.z * 1.25 + right.z * side * 0.85;
+          const wy = p.pos.y;
+          this.particles.emitSmoke(wx, wy, wz, q);
+        }
+        this.skidTimer -= dt;
+        if (this.skidTimer <= 0) {
+          this.skidTimer = 0.03;
+          const vx = p.vel.x / Math.max(1, speedH);
+          const vz = p.vel.z / Math.max(1, speedH);
+          for (const side of [-1, 1]) {
+            const wx = p.pos.x - fwd.x * 1.25 + right.x * side * 0.85;
+            const wz = p.pos.z - fwd.z * 1.25 + right.z * side * 0.85;
+            this.particles.emitSkid(wx, p.pos.y, wz, vx, vz, clamp(Math.abs(p.slip) * 2, 0.3, 1), this.time);
+          }
+        }
+      }
+      // off-road dust
+      if (p.offRoad && speedH > 9) {
+        this.particles.emitDust(
+          p.pos.x - fwd.x * 1.4, p.pos.y, p.pos.z - fwd.z * 1.4,
+          clamp(speedH / 30, 0.3, 1.2), p.vel.x, p.vel.z
+        );
+      }
+      // wall-ride sparks
+      if (p.wallRiding) {
+        this.sparkTimer -= dt;
+        if (this.sparkTimer <= 0) {
+          this.sparkTimer = 0.06;
+          const side = p.lateral > 0 ? 1 : -1;
+          this.particles.emitSparks(
+            p.pos.x + right.x * side * 1.1, p.pos.y + 0.2, p.pos.z + right.z * side * 1.1,
+            -right.x * side, -right.z * side, 3
+          );
+        }
+      }
+    }
+    // boost trail
+    if (p.boosting) {
+      this.boostTrailTimer -= dt;
+      if (this.boostTrailTimer <= 0) {
+        this.boostTrailTimer = 0.02;
+        this.particles.emitBoost(p.pos.x - fwd.x * 2.0, p.pos.y + 0.45, p.pos.z - fwd.z * 2.0, -fwd.x, -fwd.z);
+      }
+    }
+  }
+
+  private dustBurst(n: number) {
+    const p = this.physics;
+    for (let i = 0; i < n; i++) {
+      this.particles.emitDust(
+        p.pos.x + (Math.random() - 0.5) * 2, p.pos.y + 0.1, p.pos.z + (Math.random() - 0.5) * 2,
+        1.4, p.vel.x, p.vel.z
+      );
+    }
+  }
+
+  private updateGateGlow() {
+    const t = this.track;
+    for (let k = 0; k < t.gates.length; k++) {
+      const g = t.gates[k];
+      if (!g.glow) continue;
+      const isNext = this.phase === "racing" && k === this.nextGateK;
+      const passed = this.phase === "racing" && k < this.nextGateK;
+      if (isNext) {
+        g.glow.emissiveIntensity = 1.6 + Math.sin(this.time * 5) * 0.6;
+      } else {
+        g.glow.emissiveIntensity = passed ? 0.5 : 1.1;
+      }
+    }
+  }
+
+  // ============================================================
+  // ghost
+  // ============================================================
+
+  private recordGhost(dt: number) {
+    this.ghostRecT += dt;
+    if (this.ghostRecT >= 0.05) {
+      this.ghostRecT = 0;
+      const p = this.physics;
+      this.ghostRec.push({ t: this.raceTime, x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: p.yaw });
+      if (this.ghostRec.length > 4000) this.ghostRec.shift();
+    }
+  }
+
+  private playGhost() {
+    if (!this.ghost.length) {
+      this.ghostCar.group.visible = false;
+      return;
+    }
+    this.ghostCar.group.visible = true;
+    const tMs = this.raceTime;
+    const frames = this.ghost;
+    // binary search
+    let lo = 0;
+    let hi = frames.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (frames[mid].t < tMs) lo = mid + 1;
+      else hi = mid;
+    }
+    const i = Math.max(1, lo);
+    const a = frames[i - 1];
+    const b = frames[Math.min(frames.length - 1, i)];
+    const span = Math.max(1e-3, b.t - a.t);
+    const f = clamp((tMs - a.t) / span, 0, 1);
+    const g = this.ghostCar.group;
+    g.position.set(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f);
+    let dy = b.yaw - a.yaw;
+    while (dy > Math.PI) dy -= Math.PI * 2;
+    while (dy < -Math.PI) dy += Math.PI * 2;
+    g.rotation.set(0, a.yaw + dy * f, 0);
+  }
+
+  // ============================================================
+  // camera
+  // ============================================================
+
+  private updateCamera(dt: number) {
+    if (this.phase === "title") return; // handled in updateTitle
+    const p = this.physics;
+    const fwd = this.tmpV.set(Math.sin(p.yaw), 0, Math.cos(p.yaw));
+
+    if (this.phase === "countdown") {
+      // cinematic sweep down to the chase position
+      const t = clamp(1 - this.countdownT / 3, 0, 1);
+      const e = t * t * (3 - 2 * t);
+      const ang = 2.4 - e * 2.4;
+      const dist = 30 - 24 * e;
+      this.camPos.set(
+        p.pos.x + Math.sin(ang) * dist + fwd.x * -4,
+        p.pos.y + 14 - 11.5 * e,
+        p.pos.z + Math.cos(ang) * dist + fwd.z * -4
+      );
+      this.camLook.set(p.pos.x + fwd.x * 6, p.pos.y + 1.2, p.pos.z + fwd.z * 6);
+      this.camera.position.copy(this.camPos);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(this.camLook);
+      this.camera.fov = damp(this.camera.fov, 66, 3, dt);
+      this.camera.updateProjectionMatrix();
+      return;
+    }
+
+    if (this.phase === "finished") {
+      const a = this.finishOrbitT * 0.5;
+      this.camPos.set(p.pos.x + Math.sin(a) * 9, p.pos.y + 3.2, p.pos.z + Math.cos(a) * 9);
+      this.camLook.copy(p.pos).add(new THREE.Vector3(0, 1, 0));
+      this.camera.position.copy(this.camPos);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(this.camLook);
+      return;
+    }
+
+    // chase camera
+    const mode = this.settings.cameraMode;
+    const dist = mode === 1 ? 9.6 : 6.4;
+    const height = mode === 1 ? 3.8 : 2.55;
+    if (mode === 2) {
+      // hood cam
+      this.camPos.set(p.pos.x + fwd.x * 0.5, p.pos.y + 1.35, p.pos.z + fwd.z * 0.5);
+      this.camLook.set(p.pos.x + fwd.x * 12, p.pos.y + 1.6, p.pos.z + fwd.z * 12);
+      this.camera.position.copy(this.camPos);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(this.camLook);
+    } else {
+      const ffX = clamp(p.vel.x * 0.16, -7, 7);
+      const ffZ = clamp(p.vel.z * 0.16, -7, 7);
+      const tx = p.pos.x - fwd.x * dist + ffX;
+      const ty = p.pos.y + height;
+      const tz = p.pos.z - fwd.z * dist + ffZ;
+      const rate = 6.5;
+      this.camPos.x = damp(this.camPos.x, tx, rate, dt);
+      this.camPos.y = damp(this.camPos.y, ty, rate, dt);
+      this.camPos.z = damp(this.camPos.z, tz, rate, dt);
+      this.camLook.set(p.pos.x + fwd.x * 7, p.pos.y + 1.3, p.pos.z + fwd.z * 7);
+      this.camera.position.copy(this.camPos);
+      this.camera.up.set(0, 1, 0);
+      this.camera.lookAt(this.camLook);
+      // banking roll
+      const targetRoll = clamp(-p.slip * 0.3 - this.lastSteer * 0.05, -0.24, 0.24);
+      this.camRoll = damp(this.camRoll, targetRoll, 5, dt);
+      this.camera.rotateZ(this.camRoll);
+    }
+
+    // wall-ride lean
+    this.wallRideLean = damp(this.wallRideLean, p.wallRiding ? clamp(p.lateral / 24, 0, 1) * 0.5 : 0, 4, dt);
+    if (this.wallRideLean > 0.01) this.camera.rotateZ(this.wallRideLean);
+
+    // FOV kick
+    const speedFrac = clamp(p.speed / 55, 0, 1.1);
+    const targetFov = 64 + speedFrac * 10 + (p.boosting ? 9 : 0);
+    this.fov = damp(this.fov, targetFov, 4, dt);
+    this.camera.fov = this.fov;
+    this.camera.updateProjectionMatrix();
+
+    // restrained screen shake
+    this.trauma = Math.max(0, this.trauma - dt * 1.6);
+    const sh = this.trauma * this.trauma;
+    if (sh > 0.001) {
+      this.camera.position.x += (Math.random() - 0.5) * sh * 0.55;
+      this.camera.position.y += (Math.random() - 0.5) * sh * 0.4;
+      this.camera.position.z += (Math.random() - 0.5) * sh * 0.55;
+      this.camera.rotateZ((Math.random() - 0.5) * sh * 0.03);
+    }
+  }
+
+  private updateSun() {
+    const p = this.physics.pos;
+    this.sun.position.set(p.x + SUN_DIR.x * 190, p.y + SUN_DIR.y * 190, p.z + SUN_DIR.z * 190);
+    this.sun.target.position.set(p.x, p.y, p.z);
+    this.sun.target.updateMatrixWorld();
+  }
+
+  // ============================================================
+  // telemetry
+  // ============================================================
+
+  private emitTelemetry() {
+    const p = this.physics;
+    const { gear, rpm } = p.gearAndRpm();
+    const t: Telemetry = {
+      speedKmh: p.speedKmh,
+      boostMeter: p.boostMeter,
+      boosting: p.boosting,
+      drifting: p.drifting,
+      driftMult: 1 + Math.min(2, p.driftChain / 6),
+      lap: Math.min(this.lapsDone + 1, this.totalLaps),
+      totalLaps: this.totalLaps,
+      raceTimeMs: this.raceTime,
+      lapTimeMs: this.raceTime - this.lapStart,
+      bestLapMs: this.bestLapMs,
+      bestTotalMs: this.bestTotalMs,
+      wrongWay: p.wrongWay,
+      airborne: !p.grounded,
+      wallRide: p.wallRiding,
+      offRoad: p.offRoad,
+      nextCpDist: Math.max(0, (this.nextGateAbs - p.progressS) % this.track.length),
+      gear,
+      rpm,
+      progressPct: p.lapProgress,
+    };
+    for (const fn of this.telemetryListeners) fn(t);
+  }
+
+  /** expose a bit of input state for car visuals */
+  noteInput(steer: number, brake: number, accel: number) {
+    this.lastSteer = steer;
+    this.lastBrake = brake;
+    this.lastAccel = accel;
+  }
+}
+
+function wrapI(i: number, n: number): number {
+  return ((i % n) + n) % n;
+}
+
+function fmt(ms: number): string {
+  const m = Math.floor(ms / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const cs = Math.floor((ms % 1000) / 10);
+  return `${m}:${s.toString().padStart(2, "0")}.${cs.toString().padStart(2, "0")}`;
+}
