@@ -1,7 +1,7 @@
 "use client";
 
 import * as THREE from "three";
-import { Track, type GroundInfo } from "./track";
+import { Track, type GroundInfo, type TrackBox } from "./track";
 import { clamp, damp, type DriveInput } from "./types";
 
 export interface PhysicsEvents {
@@ -14,6 +14,7 @@ export interface PhysicsEvents {
   onWallRideStart(): void;
   onCrash(intensity: number): void;
   onBoostStart(): void;
+  onBoxHit(box: TrackBox): void;
   requestRecovery(): void;
 }
 
@@ -76,6 +77,9 @@ export class CarPhysics {
   prevGroundY = 0;
 
   idx = 0;
+  /** Continuous sample coordinate (idx + fractional step) — keeps the driven
+   *  surface smooth instead of popping at every 2 m sample boundary. */
+  groundP = 0;
   lateral = 0;
   progressS = 0; // unwrapped meters along the lap
   lapProgress = 0; // 0..1 through current lap
@@ -142,6 +146,7 @@ export class CarPhysics {
     this.climbRate = 0;
     this.idx = idx;
     this.lastIdx = idx; // keep the unwrapped-progress delta consistent after teleports
+    this.groundP = idx;
     this.lateral = lat;
     this.prevGroundY = h;
     if (syncProgress) this.progressS = idx * t.step;
@@ -158,6 +163,9 @@ export class CarPhysics {
     this.idx = t.nearestIdx(this.pos.x, this.pos.z, this.idx);
     const s = t.sample(this.idx);
     this.lateral = (this.pos.x - s.x) * s.rx + (this.pos.z - s.z) * s.rz;
+    // continuous position along the spline (samples) — smooth ground queries
+    const alongTrack = (this.pos.x - s.x) * s.dx + (this.pos.z - s.z) * s.dz;
+    this.groundP = this.idx + clamp(alongTrack / t.step, -1.5, 1.5);
 
     // unwrapped progress
     let dIdx = this.idx - this.lastIdx;
@@ -168,7 +176,7 @@ export class CarPhysics {
     this.lapProgress = clamp((this.progressS % t.length) / t.length, 0, 1);
     this.lastIdx = this.idx;
 
-    const gi = t.groundAt(this.idx, this.lateral, this.gi);
+    const gi = t.groundAtP(this.groundP, this.lateral, this.gi);
     this.onRoad = gi.onRoad;
     this.offRoad = !gi.onRoad && !gi.inPitZone;
 
@@ -410,6 +418,30 @@ export class CarPhysics {
       }
     }
 
+    // ---- breakable crates ----
+    // Smash through: the crate explodes and the car sheds a little speed,
+    // then accelerates back up naturally. You can also jump clean over them.
+    for (const b of t.boxes) {
+      if (!b.active) continue;
+      const dx = this.pos.x - b.x;
+      const dz = this.pos.z - b.z;
+      if (dx * dx + dz * dz > 3.6) continue; // (1.9 m)² — forgiving arcade radius
+      if (Math.abs(this.pos.y - b.y) > 1.7) continue; // sailed over it
+      b.active = false;
+      b.mesh.visible = false;
+      b.respawnAt = Infinity; // owner schedules the respawn via onBoxHit
+      // little slow-down + a sideways stagger
+      this.vel.x *= 0.78;
+      this.vel.z *= 0.78;
+      this.vel.x += rx * (Math.random() - 0.5) * 1.6;
+      this.vel.z += rz * (Math.random() - 0.5) * 1.6;
+      if (this.drifting) {
+        this.drifting = false;
+        this.driftChain = 0;
+      }
+      this.ev.onBoxHit(b);
+    }
+
     // ---- integrate ----
     this.pos.x += this.vel.x * dt;
     this.pos.z += this.vel.z * dt;
@@ -417,7 +449,10 @@ export class CarPhysics {
 
     // ---- landing ----
     if (!this.grounded) {
-      const gi2 = t.groundAt(this.idx, this.lateral, this.gi);
+      // refresh the continuous coordinate after integration for an accurate surface test
+      const s2 = t.sample(this.idx);
+      const along2 = (this.pos.x - s2.x) * s2.dx + (this.pos.z - s2.z) * s2.dz;
+      const gi2 = t.groundAtP(this.idx + clamp(along2 / t.step, -1.5, 1.5), this.lateral, this.gi);
       if (this.pos.y <= gi2.h && this.vel.y <= 0.01) {
         const impact = -this.vel.y;
         const clean = this.slipAbsAtLanding(vf, vlat) && impact < 21;

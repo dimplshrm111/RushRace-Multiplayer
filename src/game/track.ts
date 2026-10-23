@@ -51,6 +51,21 @@ export interface Obstacle {
   lastNear: number;
 }
 
+/** A breakable wooden crate sitting on the racing line. */
+export interface TrackBox {
+  x: number;
+  z: number;
+  y: number; // center height
+  idx: number;
+  lat: number;
+  /** crates beyond the difficulty limit are parked entirely */
+  enabled: boolean;
+  active: boolean;
+  /** game-time ms when the smashed crate reappears */
+  respawnAt: number;
+  mesh: THREE.Mesh;
+}
+
 export interface GroundInfo {
   h: number;
   onRoad: boolean;
@@ -105,6 +120,7 @@ export class Track {
   samples: TrackSample[] = [];
   gates: Gate[] = [];
   obstacles: Obstacle[] = [];
+  boxes: TrackBox[] = [];
   kickers: Kicker[] = [];
   N = 0;
   step = 2;
@@ -467,6 +483,47 @@ export class Track {
     return this.groundAt(i, lat, TMP_GROUND).h;
   }
 
+  // ---- continuous (interpolated) sampling ----
+  // The physics used to snap to the discrete 2 m sample grid, which made the
+  // car's height (and everything derived from it) pop at every sample boundary
+  // — a visible buzz/jiggle at speed. These queries blend adjacent samples so
+  // the driven surface matches the rendered road exactly and stays smooth.
+
+  /** Ground query at a continuous sample coordinate p (= idx + fraction ahead). */
+  groundAtP(p: number, lat: number, out: GroundInfo): GroundInfo {
+    const i0 = Math.floor(p);
+    const fr = clamp(p - i0, 0, 1);
+    const a = this.groundAt(i0, lat, TMP_GA);
+    const b = this.groundAt(i0 + 1, lat, TMP_GB);
+    if (a.inPitZone !== b.inPitZone) {
+      // cliff lip at the gap — keep the step crisp so launches still fire
+      const use = fr < 0.5 ? a : b;
+      out.h = use.h;
+      out.onRoad = use.onRoad;
+      out.inPitZone = use.inPitZone;
+      return out;
+    }
+    out.h = a.h + (b.h - a.h) * fr;
+    out.onRoad = fr < 0.5 ? a.onRoad : b.onRoad;
+    out.inPitZone = a.inPitZone;
+    return out;
+  }
+
+  heightAtP(p: number, lat: number): number {
+    return this.groundAtP(p, lat, TMP_GROUND).h;
+  }
+
+  /** Lateral slope at a continuous sample coordinate. */
+  slopeLatAtP(p: number, lat: number): number {
+    return (this.heightAtP(p, lat + 0.9) - this.heightAtP(p, lat - 0.9)) / 1.8;
+  }
+
+  /** Forward slope at a continuous sample coordinate. */
+  slopeFwdAtP(p: number, lat: number): number {
+    const d = 0.9 / this.step;
+    return (this.heightAtP(p + d, lat) - this.heightAtP(p - d, lat)) / 1.8;
+  }
+
   slopeLatAt(i: number, lat: number): number {
     const a = this.heightAt(wrapIdx(i, this.N), lat + 0.9);
     const b = this.heightAt(wrapIdx(i, this.N), lat - 0.9);
@@ -517,11 +574,13 @@ export class Track {
   private buildMeshes() {
     this.buildWalls();
     this.buildRoad();
+    this.buildRouteMarks();
     this.buildPit();
     this.buildTunnel();
     this.buildArch();
     this.buildScenery();
     this.buildGates();
+    this.buildBoxes();
   }
 
   private buildWalls() {
@@ -645,6 +704,102 @@ export class Track {
     mesh.receiveShadow = true;
     this.group.add(mesh);
     this.disposables.push(g, m, tex);
+  }
+
+  /** Painted route markings — edge lines + forward chevrons so the line is always readable. */
+  private buildRouteMarks() {
+    const n = this.N;
+    const lineMat = new THREE.MeshBasicMaterial({
+      color: 0xf7e7c3,
+      fog: true,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -3,
+      polygonOffsetUnits: -3,
+    });
+    const chevMat = new THREE.MeshBasicMaterial({
+      color: 0xfffbe8,
+      fog: true,
+      side: THREE.DoubleSide,
+      polygonOffset: true,
+      polygonOffsetFactor: -4,
+      polygonOffsetUnits: -4,
+    });
+
+    // ---- continuous edge lines hugging the road edge ----
+    const pos: number[] = [];
+    const idx: number[] = [];
+    const lineHalf = 0.19;
+    for (const side of [-1, 1] as const) {
+      const start = pos.length / 3;
+      for (let i = 0; i < n; i++) {
+        const s = this.samples[i];
+        const latE = (s.hw - 0.85) * side;
+        const y = this.heightAt(i, latE) + 0.05;
+        pos.push(
+          s.x + s.rx * (latE - lineHalf), y, s.z + s.rz * (latE - lineHalf),
+          s.x + s.rx * (latE + lineHalf), y, s.z + s.rz * (latE + lineHalf)
+        );
+      }
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        if (this.samples[i].gap || this.samples[j].gap) continue;
+        const a = start + i * 2;
+        const b = start + j * 2;
+        idx.push(a, a + 1, b, a + 1, b + 1, b);
+      }
+    }
+    const lineGeo = new THREE.BufferGeometry();
+    lineGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+    lineGeo.setIndex(idx);
+    const lineMesh = new THREE.Mesh(lineGeo, lineMat);
+    lineMesh.frustumCulled = false; // spans the whole loop
+    this.group.add(lineMesh);
+    this.disposables.push(lineGeo, lineMat);
+
+    // ---- forward-pointing chevrons along the centerline ----
+    const gateBlocked = new Set<number>();
+    for (const g of this.gates) {
+      for (let k = -4; k <= 4; k++) gateBlocked.add(wrapIdx(g.idx + k, n));
+    }
+    const cpos: number[] = [];
+    const cidx: number[] = [];
+    const arm = (f0: number, l0: number, f1: number, l1: number, w: number, i: number) => {
+      const df = f1 - f0;
+      const dl = l1 - l0;
+      const len = Math.hypot(df, dl);
+      if (len < 1e-4) return;
+      const px = (-dl / len) * (w * 0.5);
+      const pl = (df / len) * (w * 0.5);
+      const corners: [number, number][] = [
+        [f0 + px, l0 + pl],
+        [f1 + px, l1 + pl],
+        [f1 - px, l1 - pl],
+        [f0 - px, l0 - pl],
+      ];
+      const base = cpos.length / 3;
+      const s = this.samples[i];
+      for (const [f, l] of corners) {
+        const x = s.x + s.dx * f + s.rx * l;
+        const z = s.z + s.dz * f + s.rz * l;
+        const y = this.heightAtP(i + f / this.step, l) + 0.07;
+        cpos.push(x, y, z);
+      }
+      cidx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    };
+    for (let i = 6; i < n; i += 14) {
+      const s = this.samples[i];
+      if (s.gap || gateBlocked.has(i)) continue;
+      arm(1.15, 0, -0.45, 1.35, 0.46, i);
+      arm(1.15, 0, -0.45, -1.35, 0.46, i);
+    }
+    const chevGeo = new THREE.BufferGeometry();
+    chevGeo.setAttribute("position", new THREE.Float32BufferAttribute(cpos, 3));
+    chevGeo.setIndex(cidx);
+    const chevMesh = new THREE.Mesh(chevGeo, chevMat);
+    chevMesh.frustumCulled = false;
+    this.group.add(chevMesh);
+    this.disposables.push(chevGeo, chevMat);
   }
 
   private buildPit() {
@@ -1013,12 +1168,117 @@ export class Track {
     this.disposables.push(pylonGeo, pylonMat, stripeTex, capGeo, chevGeo, beamGeo);
   }
 
+  /** Activate the first `count` crates (difficulty setting) and park the rest. */
+  setActiveBoxes(count: number) {
+    for (let i = 0; i < this.boxes.length; i++) {
+      const b = this.boxes[i];
+      b.enabled = i < count;
+      b.active = b.enabled;
+      b.respawnAt = 0;
+      b.mesh.visible = b.enabled;
+    }
+  }
+
+  /** Bring every enabled crate back for a new race. */
+  resetBoxes() {
+    for (const b of this.boxes) {
+      if (!b.enabled) continue;
+      b.active = true;
+      b.respawnAt = 0;
+      b.mesh.visible = true;
+    }
+  }
+
+  /** Respawn smashed crates whose timeout has elapsed (game-time ms). */
+  updateBoxes(nowMs: number) {
+    for (const b of this.boxes) {
+      if (b.enabled && !b.active && b.respawnAt <= nowMs) {
+        b.active = true;
+        b.mesh.visible = true;
+      }
+    }
+  }
+
+  /**
+   * Breakable wooden crates scattered on the racing line. Full candidate set
+   * is generated once (max count); difficulty decides how many go live.
+   */
+  private buildBoxes() {
+    const n = this.N;
+    const MAX = 48;
+    const rnd = mulberry32(9155);
+
+    // zones to keep clear: gates, ramps, the gap, the tunnel, the start grid
+    const blocked = new Uint8Array(n);
+    for (const g of this.gates) {
+      for (let k = -8; k <= 8; k++) blocked[wrapIdx(g.idx + k, n)] = 1;
+    }
+    for (let i = 0; i < n; i++) {
+      if (this.samples[i].gap || this.samples[i].tunnel || this.samples[i].rampP >= 0) {
+        for (let k = -7; k <= 7; k++) blocked[wrapIdx(i + k, n)] = 1;
+      }
+    }
+    for (let k = -60; k <= 60; k++) blocked[wrapIdx(k, n)] = 1; // start/finish + grid
+
+    const crateTex = makeCrateTexture();
+    const crateGeo = new THREE.BoxGeometry(1.24, 1.24, 1.24);
+    const crateMat = new THREE.MeshLambertMaterial({ map: crateTex });
+    this.disposables.push(crateGeo, crateMat, crateTex);
+
+    const used: number[] = [];
+    let placed = 0;
+    let guard = 0;
+    while (placed < MAX && guard++ < 6000) {
+      const idx = 60 + Math.floor(rnd() * (n - 120));
+      if (blocked[idx]) continue;
+      // spacing — no two crates close together
+      let tooClose = false;
+      for (const u of used) {
+        let d = Math.abs(idx - u);
+        d = Math.min(d, n - d);
+        if (d < 12) {
+          tooClose = true;
+          break;
+        }
+      }
+      if (tooClose) continue;
+      const s = this.samples[idx];
+      // bias positions toward the middle of the road
+      const u = rnd() * 2 - 1;
+      const lat = Math.sign(u) * Math.pow(Math.abs(u), 1.5) * Math.max(1.5, s.hw - 3);
+      const x = s.x + s.rx * lat;
+      const z = s.z + s.rz * lat;
+      // keep clear of registered boulders / pillars
+      let clash = false;
+      for (const ob of this.obstacles) {
+        const dx = ob.x - x;
+        const dz = ob.z - z;
+        if (dx * dx + dz * dz < 16) {
+          clash = true;
+          break;
+        }
+      }
+      if (clash) continue;
+      const y = this.heightAt(idx, lat) + 0.62;
+      const mesh = new THREE.Mesh(crateGeo, crateMat);
+      mesh.position.set(x, y, z);
+      mesh.rotation.y = rnd() * Math.PI;
+      mesh.castShadow = true;
+      this.group.add(mesh);
+      this.boxes.push({ x, z, y, idx, lat, enabled: false, active: false, respawnAt: 0, mesh });
+      used.push(idx);
+      placed++;
+    }
+  }
+
   dispose() {
     for (const d of this.disposables) d.dispose();
   }
 }
 
 const TMP_GROUND: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+const TMP_GA: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+const TMP_GB: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
 
 // ---------------- helpers & textures ----------------
 
@@ -1110,6 +1370,54 @@ function makeCheckerTexture(): THREE.Texture {
   }
   const tex = new THREE.CanvasTexture(c);
   tex.wrapS = THREE.RepeatWrapping;
+  return tex;
+}
+
+function makeCrateTexture(): THREE.Texture {
+  const c = document.createElement("canvas");
+  c.width = c.height = 128;
+  const ctx = c.getContext("2d")!;
+  // base weathered wood
+  ctx.fillStyle = "#a9713d";
+  ctx.fillRect(0, 0, 128, 128);
+  // plank seams (horizontal boards)
+  ctx.fillStyle = "#7c4e26";
+  for (const y of [31, 63, 95]) ctx.fillRect(0, y, 128, 3);
+  // grain streaks
+  const rnd = mulberry32(313);
+  for (let i = 0; i < 90; i++) {
+    ctx.fillStyle = `rgba(${90 + rnd() * 60},${50 + rnd() * 35},${20 + rnd() * 20},${0.12 + rnd() * 0.18})`;
+    ctx.fillRect(rnd() * 128, rnd() * 128, 8 + rnd() * 34, 1 + rnd() * 2);
+  }
+  // frame border
+  ctx.strokeStyle = "#8a5a2e";
+  ctx.lineWidth = 7;
+  ctx.strokeRect(3.5, 3.5, 121, 121);
+  // diagonal cross plank
+  ctx.save();
+  ctx.strokeStyle = "#93602f";
+  ctx.lineWidth = 10;
+  ctx.beginPath();
+  ctx.moveTo(8, 8);
+  ctx.lineTo(120, 120);
+  ctx.moveTo(120, 8);
+  ctx.lineTo(8, 120);
+  ctx.stroke();
+  ctx.restore();
+  // corner nails
+  ctx.fillStyle = "#4c2f16";
+  for (const [x, y] of [
+    [14, 14],
+    [114, 14],
+    [14, 114],
+    [114, 114],
+  ]) {
+    ctx.beginPath();
+    ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
 }
 

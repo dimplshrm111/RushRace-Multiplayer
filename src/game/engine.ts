@@ -10,7 +10,9 @@ import { InputManager } from "./input";
 import { gameStore } from "./store";
 import { OPPONENT_GRID_LAT, OPPONENTS, Opponent, opponentInput } from "./ai";
 import {
+  BOX_RESPAWN_MS,
   DEFAULT_SETTINGS,
+  DIFFICULTIES,
   PALETTE,
   clamp,
   damp,
@@ -136,7 +138,8 @@ export class GameEngine {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
     this.camera = new THREE.PerspectiveCamera(66, 16 / 9, 0.3, 4200);
-    this.scene.fog = new THREE.Fog(PALETTE.fog, 240, 1050);
+    // generous fog band — the road ahead must stay readable at racing speed
+    this.scene.fog = new THREE.Fog(PALETTE.fog, 430, 1500);
 
     // sky
     this.buildSky();
@@ -174,6 +177,14 @@ export class GameEngine {
     // AI rivals (identical performance, different paint & skill)
     for (let i = 0; i < OPPONENTS.length; i++) {
       const op = new Opponent(OPPONENTS[i], this.track, OPPONENT_GRID_LAT[i]);
+      // rival crate smashes shatter too (debris + a soft distant crack)
+      op.boxHitHook = (box) => {
+        box.respawnAt = this.time * 1000 + BOX_RESPAWN_MS;
+        this.particles.emitShards(box.x, box.y, box.z, 9);
+        const d = box.x - this.physics.pos.x;
+        const dz = box.z - this.physics.pos.z;
+        if (d * d + dz * dz < 70 * 70) this.audio.boxHit();
+      };
       this.scene.add(op.visual.group);
       this.opponents.push(op);
     }
@@ -217,6 +228,14 @@ export class GameEngine {
         this.audio.boostStart();
         this.input.rumble(0.25, 90);
       },
+      onBoxHit: (box) => {
+        // crate shattered under the player — schedule respawn, breakables FX
+        box.respawnAt = this.time * 1000 + BOX_RESPAWN_MS;
+        this.audio.boxHit();
+        this.particles.emitShards(box.x, box.y, box.z, 14);
+        this.trauma = Math.min(1, this.trauma + 0.16);
+        this.input.rumble(0.3, 130);
+      },
       requestRecovery: () => this.startRecovery(),
     });
 
@@ -226,6 +245,9 @@ export class GameEngine {
     this.updateSun();
 
     this.resize();
+    // prewarm every shader while the loading overlay is still up — the first
+    // real frame then paints instantly instead of hitching on compilation
+    this.renderer.compile(this.scene, this.camera);
     this.lastT = performance.now();
     this.loop();
   }
@@ -309,6 +331,10 @@ export class GameEngine {
     this.particles.setHighDensity(s.highParticles);
     this.audio.setVolumes(s.musicVol, s.sfxVol);
     this.input.setMouseSteer(s.mouseSteer);
+    // difficulty: crate traffic + rival pace
+    const diff = DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
+    this.track.setActiveBoxes(diff.boxes);
+    for (const op of this.opponents) op.skillScale = diff.aiSkill;
     if (prevShadows !== s.shadows) {
       this.renderer.shadowMap.enabled = s.shadows;
       this.sun.castShadow = s.shadows;
@@ -336,6 +362,8 @@ export class GameEngine {
     this.physics.nearMisses = 0;
     this.physics.topSpeed = 0;
     this.placeRaceGrid();
+    // fresh crates for the new race (respecting the difficulty limit)
+    this.track.setActiveBoxes((DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium).boxes);
     this.particles.clearSkids(this.time);
     this.ghostRec = [];
     this.ghostRecT = 0;
@@ -474,6 +502,7 @@ export class GameEngine {
     this.updateSun();
     this.particles.update(dt, this.time);
     this.updateGateGlow();
+    this.track.updateBoxes(this.time * 1000); // smashed crates come back
     this.emitTelemetry();
 
     // audio
@@ -831,10 +860,10 @@ export class GameEngine {
     const g = this.car.group;
     g.position.copy(p.pos);
     g.rotation.set(0, p.yaw, 0);
-    // align to ground slope
+    // align to ground slope (continuous queries — no per-sample stepping)
     if (p.grounded) {
-      const slopeL = this.track.slopeLatAt(p.idx, p.lateral);
-      const slopeF = this.track.slopeFwdAt(p.idx, p.lateral);
+      const slopeL = this.track.slopeLatAtP(p.groundP, p.lateral);
+      const slopeF = this.track.slopeFwdAtP(p.groundP, p.lateral);
       g.rotation.order = "YXZ";
       g.rotation.x = damp(g.rotation.x, clamp(-Math.atan(slopeF), -0.5, 0.5), 8, dt);
       g.rotation.z = damp(g.rotation.z, clamp(Math.atan(slopeL), -0.9, 0.9), 8, dt);

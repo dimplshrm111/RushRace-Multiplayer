@@ -1,7 +1,7 @@
 "use client";
 
 import * as THREE from "three";
-import { Track } from "./track";
+import { Track, type TrackBox } from "./track";
 import { CarPhysics } from "./physics";
 import { CarVisual } from "./car";
 import { clamp, damp, type DriveInput } from "./types";
@@ -49,6 +49,10 @@ export class Opponent {
   startS = 0;
   finishMs: number | null = null;
   avgSpeed = 26;
+  /** difficulty pace multiplier (easy < 1, hard > 1) */
+  skillScale = 1;
+  /** engine hook so rival crate smashes also spawn debris */
+  boxHitHook?: (box: TrackBox) => void;
 
   private mistakeT = 9;
   private mistakeLeft = 0;
@@ -73,6 +77,7 @@ export class Opponent {
       onWallRideStart: () => {},
       onCrash: () => {},
       onBoostStart: () => {},
+      onBoxHit: (box) => this.boxHitHook?.(box),
       requestRecovery: () => this.respawn(),
     });
     this.physics.isPlayer = false;
@@ -136,8 +141,9 @@ export class Opponent {
     g.rotation.set(0, p.yaw, 0);
     g.rotation.order = "YXZ";
     if (p.grounded) {
-      const slopeL = this.track.slopeLatAt(p.idx, p.lateral);
-      const slopeF = this.track.slopeFwdAt(p.idx, p.lateral);
+      // continuous slope queries — smooth roll/pitch at speed (no sample stepping)
+      const slopeL = this.track.slopeLatAtP(p.groundP, p.lateral);
+      const slopeF = this.track.slopeFwdAtP(p.groundP, p.lateral);
       g.rotation.x = damp(g.rotation.x, clamp(-Math.atan(slopeF), -0.5, 0.5), 8, dt);
       g.rotation.z = damp(g.rotation.z, clamp(Math.atan(slopeL), -0.9, 0.9), 8, dt);
       if (p.wallRiding) {
@@ -207,7 +213,22 @@ export function opponentInput(
   const look = 11 + clamp(p.speed * 0.62, 7, 30) * (0.9 + 0.25 * op.def.skill);
   const li = wrapIdxLocal(p.idx + Math.round(look / track.step), track.N);
   const s = track.sample(li);
-  const lat = clamp(op.baseLat * 0.6 + Math.sin(t * 0.14) * 1.3, -4.5, 4.5);
+  let lat = clamp(op.baseLat * 0.6 + Math.sin(t * 0.14) * 1.3, -4.5, 4.5);
+  // dodge active crates near the intended line — sharper minds dodge better
+  if (op.mistakeLeft <= 0) {
+    let dodge = 0;
+    for (const b of track.boxes) {
+      if (!b.active) continue;
+      let d = b.idx - p.idx;
+      if (d < -track.N / 2) d += track.N;
+      else if (d > track.N / 2) d -= track.N;
+      if (d < 0 || d > 14) continue;
+      const dl = b.lat - lat;
+      const adl = Math.abs(dl);
+      if (adl < 2.7) dodge += (dl >= 0 ? -1 : 1) * (2.7 - adl + 1.1) * (1 - d / 14);
+    }
+    lat = clamp(lat + dodge * (0.35 + 0.65 * op.def.skill), -(s.hw - 2.2), s.hw - 2.2);
+  }
   const aimX = s.x + s.rx * lat;
   const aimZ = s.z + s.rz * lat;
   const err = angDiff(Math.atan2(aimX - p.pos.x, aimZ - p.pos.z), p.yaw);
@@ -220,8 +241,8 @@ export function opponentInput(
   const dTheta = Math.abs(angDiff(Math.atan2(s3.dx, s3.dz), Math.atan2(s2.dx, s2.dz)));
   const fullSend = s.rampP >= 0 || s.gap || s2.rampP >= 0 || s2.gap || s3.rampP >= 0 || s3.gap;
 
-  // speed target: skill, gentle rubber-band toward the player, mistakes
-  let speedFactor = op.def.skill;
+  // speed target: skill, difficulty pace, gentle rubber-band, mistakes
+  let speedFactor = op.def.skill * op.skillScale;
   if (mode === "race") {
     const band = clamp((playerDist - op.raceDist) / 200, -1, 1);
     speedFactor *= 1 + 0.055 * band;
@@ -229,7 +250,7 @@ export function opponentInput(
   } else {
     speedFactor *= 0.6; // relaxed title-screen cruise
   }
-  speedFactor = clamp(speedFactor, 0.5, 1.02);
+  speedFactor = clamp(speedFactor, 0.5, 1.08);
 
   const target = fullSend ? 55 : clamp(52 / (1 + dTheta * 9), 15, 52) * speedFactor;
 

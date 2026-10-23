@@ -33,6 +33,22 @@ export const PALETTE = {
 
 export type GamePhase = "title" | "countdown" | "racing" | "finished";
 export type CameraMode = 0 | 1 | 2; // 0 chase near, 1 chase far, 2 hood
+export type Difficulty = "easy" | "medium" | "hard";
+
+/** Difficulty presets — crate traffic on the track + rival pace. */
+export const DIFFICULTIES: Record<
+  Difficulty,
+  { label: string; short: string; boxes: number; aiSkill: number; hint: string }
+> = {
+  easy: { label: "EASY", short: "EASY", boxes: 16, aiSkill: 0.88, hint: "Light crate traffic · relaxed rivals" },
+  medium: { label: "MEDIUM", short: "MED", boxes: 32, aiSkill: 1.0, hint: "The standard canyon challenge" },
+  hard: { label: "HARD", short: "HARD", boxes: 48, aiSkill: 1.07, hint: "Crate-strewn racing line · hungry rivals" },
+};
+
+export const DIFFICULTY_ORDER: Difficulty[] = ["easy", "medium", "hard"];
+
+/** How long a smashed crate stays gone before respawning (ms). */
+export const BOX_RESPAWN_MS = 15000;
 
 export interface GameSettings {
   assist: boolean;
@@ -43,6 +59,7 @@ export interface GameSettings {
   highParticles: boolean;
   shadows: boolean;
   laps: number; // 1..5
+  difficulty: Difficulty;
 }
 
 export const DEFAULT_SETTINGS: GameSettings = {
@@ -54,6 +71,7 @@ export const DEFAULT_SETTINGS: GameSettings = {
   highParticles: true,
   shadows: true,
   laps: 3,
+  difficulty: "medium",
 };
 
 /** AI car marker on the minimap. */

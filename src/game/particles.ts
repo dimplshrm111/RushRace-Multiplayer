@@ -291,6 +291,30 @@ export class ParticleSystem {
     );
   }
 
+  /** Wooden crate shatter — chunky debris that arcs down with gravity. */
+  emitShards(x: number, y: number, z: number, count: number) {
+    const n = this.highDensity ? count : Math.ceil(count * 0.6);
+    for (let i = 0; i < n; i++) {
+      const t = Math.random(); // wood tone variation
+      this.dust.spawn(
+        x + (Math.random() - 0.5) * 0.7, y + (Math.random() - 0.5) * 0.5, z + (Math.random() - 0.5) * 0.7,
+        (Math.random() - 0.5) * 9, 2 + Math.random() * 5.5, (Math.random() - 0.5) * 9,
+        0.55 + Math.random() * 0.45, 0.46, 0.1,
+        0.64 + t * 0.16, 0.42 + t * 0.1, 0.22 + t * 0.07,
+        17, 0.7
+      );
+    }
+    // a puff of sawdust so the break reads at distance
+    for (let i = 0; i < 3; i++) {
+      this.dust.spawn(
+        x, y + 0.3, z,
+        (Math.random() - 0.5) * 3, 1.4 + Math.random() * 1.6, (Math.random() - 0.5) * 3,
+        0.7 + Math.random() * 0.4, 0.9, 3.6,
+        0.85, 0.72, 0.5, -0.2, 1.4
+      );
+    }
+  }
+
   emitSkid(x: number, y: number, z: number, dx: number, dz: number, strength: number, time: number) {
     // quad oriented across the movement direction
     const px = -dz;

@@ -534,6 +534,16 @@ export class AudioSystem {
     this.tone(140, 0.4, 0.16, "sawtooth", 0, 420);
   }
 
+  /** Wooden crate shatter — bright crack + hollow body thump. */
+  boxHit() {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.noiseBurst(this.sfxBus!, t, 0.14, 2400, "bandpass", 0.42, 700);
+    this.noiseBurst(this.sfxBus!, t + 0.03, 0.16, 520, "lowpass", 0.3);
+    this.tone(150, 0.14, 0.22, "square", 0, 62);
+    this.tone(98, 0.2, 0.14, "sine", 0.02, 44);
+  }
+
   driftBank(mult: number) {
     this.tone(660 + mult * 60, 0.08, 0.16, "square");
     this.tone(990 + mult * 90, 0.1, 0.16, "square", 0.07);

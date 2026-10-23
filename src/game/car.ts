@@ -190,8 +190,10 @@ export class CarVisual {
     const targetRoll = clamp(s.rollRate * 0.016 + s.slip * 0.22, -0.22, 0.22);
     this.body.rotation.x += (targetPitch - this.body.rotation.x) * Math.min(1, dt * 9);
     this.body.rotation.z += (targetRoll - this.body.rotation.z) * Math.min(1, dt * 9);
-    // suspension bounce
-    const bounce = s.grounded ? Math.sin(performance.now() * 0.02) * Math.min(0.02, Math.abs(s.speed) * 0.0006) : 0.04;
+    // suspension: faint engine shiver at standstill only. (The old wall-clock
+    // sinusoid scaled with speed and read as a constant fast jiggle.)
+    const idle = 1 - clamp(Math.abs(s.speed) / 6, 0, 1);
+    const bounce = s.grounded ? Math.sin(performance.now() * 0.03) * 0.006 * idle : 0.05;
     this.body.position.y = bounce;
     // flame
     this.flame.visible = s.boosting;

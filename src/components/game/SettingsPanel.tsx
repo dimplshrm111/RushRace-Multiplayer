@@ -3,7 +3,7 @@
 import { Switch } from "@/components/ui/switch";
 import { Slider } from "@/components/ui/slider";
 import { useGameStore } from "@/game/store";
-import { PALETTE } from "@/game/types";
+import { DIFFICULTIES, DIFFICULTY_ORDER, PALETTE, type Difficulty } from "@/game/types";
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
@@ -65,6 +65,14 @@ export function SettingsPanel({ compact = false }: { compact?: boolean }) {
             setSettings({ laps: v });
             loadBest(v);
           }}
+        />
+      </Row>
+      <div className="h-px bg-[#e5d2b3]" />
+      <Row label="DIFFICULTY" hint={DIFFICULTIES[settings.difficulty].hint}>
+        <Seg
+          value={settings.difficulty}
+          options={DIFFICULTY_ORDER.map((d) => ({ v: d, label: DIFFICULTIES[d].short }))}
+          onChange={(v: Difficulty) => setSettings({ difficulty: v })}
         />
       </Row>
       <div className="h-px bg-[#e5d2b3]" />

@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronsRight } from "lucide-react";
 import { useGameStore } from "@/game/store";
 import { AudioSystem } from "@/game/audio";
 import { InputManager, type InputAction } from "@/game/input";
@@ -20,6 +21,8 @@ export default function GameShell() {
   const engineRef = useRef<GameEngine | null>(null);
   const audioRef = useRef<AudioSystem | null>(null);
   const inputRef = useRef<InputManager | null>(null);
+  /** false until the world is built + shaders prewarmed — drives the loading overlay */
+  const [ready, setReady] = useState(false);
 
   const phase = useGameStore((s) => s.phase);
   const paused = useGameStore((s) => s.paused);
@@ -33,62 +36,43 @@ export default function GameShell() {
   const setSettings = useGameStore((s) => s.setSettings);
   const loadBest = useGameStore((s) => s.loadBest);
 
-  // stable refs for callbacks
-
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    let cancelled = false;
+    let buildTimer: ReturnType<typeof setTimeout> | undefined;
 
     const audio = new AudioSystem();
     const input = new InputManager();
     audioRef.current = audio;
     inputRef.current = input;
-
-    const engine = new GameEngine(canvas, audio, input, {
-      onPhaseChange: (p) => setPhase(p),
-      onCountdown: (v) => setCountdown(v),
-      onFinish: (r: ResultsData) => {
-        setResults(r);
-        // persist to the local leaderboard backend
-        void fetch("/api/records", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            laps: r.laps,
-            timeMs: Math.round(r.totalMs),
-            bestLapMs: Math.round(r.bestLapMs),
-            topSpeedKmh: r.topSpeedKmh,
-            driftScore: r.driftScore,
-          }),
-        }).catch(() => undefined);
-      },
-    });
-    engineRef.current = engine;
-    (window as unknown as { __canyonRush?: unknown }).__canyonRush = { engine, audio, input };
     input.attach();
 
-    input.onAction = (a: InputAction) => {
-      const st = useGameStore.getState();
-      if (a === "camera") {
-        const next = ((st.settings.cameraMode + 1) % 3) as 0 | 1 | 2;
-        st.setSettings({ cameraMode: next });
-      } else if (a === "restart") {
-        if (st.phase === "racing" || st.phase === "countdown" || st.phase === "finished") {
-          if (st.paused) st.setPaused(false);
-          engine.restart();
+    const attachEngine = (engine: GameEngine) => {
+      engineRef.current = engine;
+      (window as unknown as { __canyonRush?: unknown }).__canyonRush = { engine, audio, input };
+      input.onAction = (a: InputAction) => {
+        const st = useGameStore.getState();
+        if (a === "camera") {
+          const next = ((st.settings.cameraMode + 1) % 3) as 0 | 1 | 2;
+          st.setSettings({ cameraMode: next });
+        } else if (a === "restart") {
+          if (st.phase === "racing" || st.phase === "countdown" || st.phase === "finished") {
+            if (st.paused) st.setPaused(false);
+            engine.restart();
+          }
+        } else if (a === "pause") {
+          if (st.phase === "racing" || st.phase === "countdown") {
+            st.setPaused(!st.paused);
+          }
+        } else if (a === "mute") {
+          const muted = st.settings.musicVol === 0 && st.settings.sfxVol === 0;
+          st.setSettings(muted ? { musicVol: 0.75, sfxVol: 0.9 } : { musicVol: 0, sfxVol: 0 });
         }
-      } else if (a === "pause") {
-        if (st.phase === "racing" || st.phase === "countdown") {
-          st.setPaused(!st.paused);
-        }
-      } else if (a === "mute") {
-        const muted = st.settings.musicVol === 0 && st.settings.sfxVol === 0;
-        st.setSettings(muted ? { musicVol: 0.75, sfxVol: 0.9 } : { musicVol: 0, sfxVol: 0 });
-      }
+      };
+      engine.applySettings(useGameStore.getState().settings);
+      loadBest(useGameStore.getState().settings.laps);
     };
-
-    engine.applySettings(useGameStore.getState().settings);
-    loadBest(useGameStore.getState().settings.laps);
 
     // audio unlock on first gesture
     const unlock = () => {
@@ -104,14 +88,48 @@ export default function GameShell() {
     };
     window.addEventListener("blur", onBlur);
 
-    const onResize = () => engine.resize();
+    const onResize = () => engineRef.current?.resize();
     window.addEventListener("resize", onResize);
-    const ro = new ResizeObserver(() => engine.resize());
+    const ro = new ResizeObserver(() => engineRef.current?.resize());
     ro.observe(canvas);
 
     // prevent context menu / scrolling on the canvas
     const noMenu = (e: Event) => e.preventDefault();
     canvas.addEventListener("contextmenu", noMenu);
+
+    // Build the world only after the loading overlay has painted: the scene
+    // build + shader prewarm is one heavy synchronous block, and without this
+    // the first seconds look like a frozen screen "still loading".
+    const raf = requestAnimationFrame(() => {
+      buildTimer = setTimeout(() => {
+        if (cancelled) return;
+        const engine = new GameEngine(canvas, audio, input, {
+          onPhaseChange: (p) => setPhase(p),
+          onCountdown: (v) => setCountdown(v),
+          onFinish: (r: ResultsData) => {
+            setResults(r);
+            // persist to the local leaderboard backend
+            void fetch("/api/records", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                laps: r.laps,
+                timeMs: Math.round(r.totalMs),
+                bestLapMs: Math.round(r.bestLapMs),
+                topSpeedKmh: r.topSpeedKmh,
+                driftScore: r.driftScore,
+              }),
+            }).catch(() => undefined);
+          },
+        });
+        if (cancelled) {
+          engine.dispose();
+          return;
+        }
+        attachEngine(engine);
+        setReady(true);
+      }, 40);
+    });
 
     // ---------- self-test mode (?selftest=1) ----------
     let selftestCleanup: (() => void) | undefined;
@@ -121,7 +139,7 @@ export default function GameShell() {
       window.addEventListener("error", onErr);
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
       void (async () => {
-        await sleep(1500); // let first frames render
+        await sleep(1800); // let first frames render (engine builds behind the loading overlay)
         const eng = engineRef.current;
         if (!eng) return;
         eng.debugSelftestActive = true;
@@ -168,6 +186,9 @@ export default function GameShell() {
     }
 
     return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
+      if (buildTimer) clearTimeout(buildTimer);
       selftestCleanup?.();
       window.removeEventListener("pointerdown", unlock);
       window.removeEventListener("keydown", unlock);
@@ -176,7 +197,7 @@ export default function GameShell() {
       canvas.removeEventListener("contextmenu", noMenu);
       ro.disconnect();
       input.detach();
-      engine.dispose();
+      engineRef.current?.dispose();
       engineRef.current = null;
     };
   }, []);
@@ -204,53 +225,88 @@ export default function GameShell() {
     <div className="fixed inset-0 overflow-hidden bg-[#f3c98f] select-none" style={{ touchAction: "none" }}>
       <canvas ref={canvasRef} className="absolute inset-0 h-full w-full" aria-label="Canyon Rush 3D game viewport" />
 
-      {/* HUD during countdown/racing */}
-      {(phase === "countdown" || phase === "racing") && (
-        <HUD engineRef={engineRef} countdownActive={phase === "countdown"} />
+      {/* Loading overlay — visible while the canyon is built & shaders prewarm */}
+      {!ready && (
+        <div
+          className="absolute inset-0 z-50 flex flex-col items-center justify-center gap-7 bg-gradient-to-b from-[#ffd9a0] via-[#f3c98f] to-[#e8a86b]"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="text-center">
+            <h1 className="text-4xl font-black tracking-[0.18em] text-[#2b1c12] sm:text-6xl">
+              CANYON RUSH
+            </h1>
+            <p className="mt-3 text-xs font-bold tracking-[0.42em] text-[#7a4526] sm:text-sm">
+              SUNSTONE CIRCUIT
+            </p>
+          </div>
+          <div className="flex items-center text-[#f0641e]" aria-hidden="true">
+            <ChevronsRight className="h-7 w-7 animate-pulse" style={{ animationDelay: "0ms" }} />
+            <ChevronsRight className="h-7 w-7 animate-pulse" style={{ animationDelay: "220ms" }} />
+            <ChevronsRight className="h-7 w-7 animate-pulse" style={{ animationDelay: "440ms" }} />
+          </div>
+          <div className="h-1.5 w-56 overflow-hidden rounded-full bg-[#2b1c12]/15">
+            <div className="loading-bar-anim h-full w-1/3 rounded-full bg-[#f0641e]" />
+          </div>
+          <p className="text-[11px] font-bold tracking-[0.32em] text-[#7a4526]">
+            CARVING THE CANYON&hellip;
+          </p>
+        </div>
       )}
 
-      {/* Touch controls while racing on touch devices */}
-      {phase === "racing" && <TouchControls inputRef={inputRef} onPause={() => setPaused(true)} />}
+      {ready && (
+        <>
+          {/* HUD during countdown/racing */}
+          {(phase === "countdown" || phase === "racing") && (
+            <HUD engineRef={engineRef} countdownActive={phase === "countdown"} />
+          )}
 
-      {/* Title */}
-      {phase === "title" && !paused && (
-        <TitleScreen
-          onRace={beginFromTitle}
-          onHowToPlay={() => useGameStore.getState().setHint("tutorial")}
-          engineRef={engineRef}
-        />
-      )}
+          {/* Touch controls while racing on touch devices */}
+          {phase === "racing" && <TouchControls inputRef={inputRef} onPause={() => setPaused(true)} />}
 
-      {/* Tutorial (shown when hint === 'tutorial') */}
-      <Tutorial onComplete={() => {
-        useGameStore.getState().markTutorialSeen();
-        useGameStore.getState().setHint(null);
-        startRace();
-      }} />
+          {/* Title */}
+          {phase === "title" && !paused && (
+            <TitleScreen
+              onRace={beginFromTitle}
+              onHowToPlay={() => useGameStore.getState().setHint("tutorial")}
+              engineRef={engineRef}
+            />
+          )}
 
-      {/* Pause */}
-      {paused && (phase === "racing" || phase === "countdown") && (
-        <PauseMenu
-          onResume={() => setPaused(false)}
-          onRestart={() => {
-            setPaused(false);
-            engineRef.current?.restart();
-          }}
-          onQuit={() => {
-            setPaused(false);
-            engineRef.current?.toTitle();
-          }}
-          engineRef={engineRef}
-        />
-      )}
+          {/* Tutorial (shown when hint === 'tutorial') */}
+          <Tutorial
+            onComplete={() => {
+              useGameStore.getState().markTutorialSeen();
+              useGameStore.getState().setHint(null);
+              startRace();
+            }}
+          />
 
-      {/* Results */}
-      {phase === "finished" && results && (
-        <Results
-          data={results}
-          onRetry={() => engineRef.current?.restart()}
-          onTitle={() => engineRef.current?.toTitle()}
-        />
+          {/* Pause */}
+          {paused && (phase === "racing" || phase === "countdown") && (
+            <PauseMenu
+              onResume={() => setPaused(false)}
+              onRestart={() => {
+                setPaused(false);
+                engineRef.current?.restart();
+              }}
+              onQuit={() => {
+                setPaused(false);
+                engineRef.current?.toTitle();
+              }}
+              engineRef={engineRef}
+            />
+          )}
+
+          {/* Results */}
+          {phase === "finished" && results && (
+            <Results
+              data={results}
+              onRetry={() => engineRef.current?.restart()}
+              onTitle={() => engineRef.current?.toTitle()}
+            />
+          )}
+        </>
       )}
 
       <RotatePrompt />

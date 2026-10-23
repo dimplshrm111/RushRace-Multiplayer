@@ -250,3 +250,17 @@ html,
 body {
   overscroll-behavior: none;
 }
+
+/* loading overlay progress bar sweep */
+@keyframes loading-bar {
+  0% {
+    transform: translateX(-130%);
+  }
+  100% {
+    transform: translateX(360%);
+  }
+}
+
+.loading-bar-anim {
+  animation: loading-bar 1.15s ease-in-out infinite;
+}
