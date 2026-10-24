@@ -40,13 +40,15 @@ export type Difficulty = "easy" | "medium" | "hard";
  * - stacks: how many crate-stack clusters are live
  * - aiSkill: rival corner-speed / pace multiplier
  * - aiSpeedCap: rival straight-line speed cap multiplier (>1 = they out-run
- *   the player's non-boost top speed — on HARD you must drift + boost to win)
+ *   the player's non-boost top speed — on HARD they cruise ~63 u/s vs the
+ *   player's 52, so only a full nitro + drift-bank burn can match them)
  * - boostGain: player boost-economy scale (hard punishes wasteful boosting)
  * - startBoost: player's boost meter when the lights go out
  * - aiMistakeEvery: seconds between rival unforced errors (0 = flawless)
  * - rubberAhead / rubberBehind: asymmetric catch-up — how much the rivals
  *   speed up when the PLAYER leads, vs. how much mercy they show when behind
- * - aiBoostAggro: 0..1 — how eagerly rivals spend boost on straights
+ * - aiBoostAggro: 0..1 — how eagerly rivals spend NITRO on straights
+ *   (engagement point, tank drain depth, wheel-to-wheel defense)
  * - blocking: rivals actively defend their line when just ahead of the player
  */
 export interface DifficultyPreset {
@@ -100,16 +102,16 @@ export const DIFFICULTIES: Record<Difficulty, DifficultyPreset> = {
     label: "HARD",
     short: "HARD",
     stacks: 14,
-    aiSkill: 1.22,
-    aiSpeedCap: 1.17,
+    aiSkill: 1.26,
+    aiSpeedCap: 1.21,
     boostGain: 0.6,
     startBoost: 22,
     aiMistakeEvery: 0,
-    rubberAhead: 0.14,
-    rubberBehind: 0.02,
+    rubberAhead: 0.16,
+    rubberBehind: 0.01,
     aiBoostAggro: 1.0,
     blocking: true,
-    hint: "Flawless rivals block & out-run you · 40% weaker boost · assists off",
+    hint: "Flawless nitro-burning rivals block & out-run you · assists off",
   },
 };
 

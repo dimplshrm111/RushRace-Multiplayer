@@ -302,3 +302,29 @@ Stage Summary:
 - Lag/slow feel fixed: the rear-view mirror's per-frame GPU readback stall is gone (scissored on-canvas pass, ~1.85ms); steering turn-in is snappier (attack 9); physics is frame-rate-independent (bit-identical 30↔60fps).
 - All cars identical (physics has zero car-model references — unchanged), nitro/surfaces/recovery/cameras/MP sync untouched and verified working; selftest determinism preserved.
 - Files: src/game/physics.ts (suspension rewrite + substepping + place() ride height), src/game/engine.ts (scissored rear-view, dead fields removed), src/components/game/HUD.tsx (transparent rear slot), src/game/input.ts (STEER_ATTACK).
+
+---
+Task ID: 19
+Agent: main agent (Z.ai Code)
+Task: Make HARD mode almost impossible to win — rival cars also use Nitro and get a little speed advantage
+
+Work Log:
+- Read worklog.md (Tasks 1-18 context) + src/game/ai.ts, physics.ts, engine.ts, types.ts to map the rival AI, difficulty presets, and nitro system.
+- Diagnosed core gap: the AI boost decision only read the DRIFT BANK (`p.boostMeter > threshold`) — the nitro bar (100 start, 33/s drain, 10/s recharge) was never part of AI decision-making, and `Opponent.syncVisual` passed only `p.boosting` so rivals never showed nitro flames.
+- physics.ts: exported `BOOST_SPEED` (66) for the AI brain.
+- ai.ts (nitro brain): new energy model `energy = nitro + boostMeter*0.55` with hysteresis latch (`op.boostHold`): fires at `fireFrom = 100 - 31*(1-aggro)` (hard 100 / med 84 / easy 77), releases at `fireFloor = 8 + 12*(1-aggro)` (hard 8 / med 13 / easy 17). Fires only on straights (`dTheta < 0.042+0.03*aggro`), grounded, speed>16. HARD-only wheel-to-wheel defense: when player within ±7m, burn tank down to floor+22 instead of waiting for refill.
+- ai.ts (critical fix found by testing): rivals held throttle only to their TARGET speed, so `BOOST_ACCEL` (throttle-gated) never applied while boosting — nitro burned for nothing, max speed stuck at 58. Now `throttle` holds open to `BOOST_SPEED` (66) while boosting. Rival max speed 58 → 61.8.
+- ai.ts: `Opponent.place()` now resets `nitro = 100`, `boostMeter = 40`, `boostHold = false` (fresh tanks every race, same rule as the player); `syncVisual` shows flames for `boosting || nitroActive`; speedFactor clamp 1.32 → 1.42 so the hard rubber-band (skill 1.26 + rubberAhead 0.16) can fully express.
+- engine.ts `updateOpponents`: rivals now emit boost-trail particles (same `emitBoost` emitter as the player) while burning nitro — visible streaks.
+- types.ts HARD preset: aiSkill 1.22→1.26, aiSpeedCap 1.17→1.21 (cruise ~63 vs player 52 — "little speed advantage"), rubberAhead 0.14→0.16, rubberBehind 0.02→0.01, hint updated to "Flawless nitro-burning rivals block & out-run you · assists off". Easy/medium presets untouched (their rivals now also use nitro moderately via aggro scaling).
+- Verified via agent-browser deterministic debugStep sim (60Hz, near-optimal autopilot player that burns full nitro tanks with hysteresis):
+  - HARD 1-lap: VIPER 66.7s / MESA 69.0s / HAWK 70.0s vs PLAYER 78.6s — P4 all race, ~12s behind. All rivals drained tanks (minNitro 3.5-6.9), flames rendered on 100% of boosting frames, rival top speed 61.8 vs player 59.3.
+  - MEDIUM regression (same player): wheel-to-wheel, player P2 +10m at 36s, rivals drain to the medium floor (~12.4) — fair & winnable. Difficulty curve contrasts correctly.
+- Visual: VLM-verified screenshot shows rival nitro flame in the rear-view mirror + boost particles; title screen HARD hint text renders correctly; no console/page errors.
+- MP smoke test through :81 gateway: room create → ghost join → ready → countdown → racing → ghost timeout quit → remote roster cleanup → ESC DNF → leave room → solo title restored (AI rivals visible). MP code paths untouched (medium-forced, AI hidden).
+- Cleanup: deleted the 1 test leaderboard row (RACER 78600ms), reset difficulty to MEDIUM, removed .testtmp, lint clean, dev.log clean.
+
+Stage Summary:
+- Rivals now run the SAME nitro system as the player: fire on straights, dump the tank to the difficulty floor, lift to recharge (10s refill), defend with nitro in wheel-to-wheel battles (HARD only), flames + exhaust trails visible.
+- HARD = almost unwinnable: flawless rivals with +21% cruise cap, +26% corner pace, near-zero mercy rubber-band, line blocking, and aggressive nitro burns — a near-optimal bot loses by ~12s/lap-race; MEDIUM/EASY unchanged in spirit (aggro-scaled nitro only).
+- Key files: src/game/ai.ts (nitro brain), src/game/engine.ts (rival trails), src/game/types.ts (HARD preset), src/game/physics.ts (exported BOOST_SPEED).

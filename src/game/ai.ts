@@ -2,7 +2,7 @@
 
 import * as THREE from "three";
 import { Track, type TrackBox } from "./track";
-import { CarPhysics } from "./physics";
+import { CarPhysics, BOOST_SPEED } from "./physics";
 import { CarVisual } from "./car";
 import type { CarModelId } from "./cars";
 import { clamp, damp, type DriveInput } from "./types";
@@ -46,7 +46,8 @@ export interface AiBrain {
   rubberAhead: number;
   /** mercy slowdown when the player trails (per 200 m of gap) */
   rubberBehind: number;
-  /** 0..1 — how low the boost threshold sits on straights */
+  /** 0..1 — how eagerly rivals spend NITRO on straights (fire point,
+   *  tank drain depth, wheel-to-wheel defense) */
   boostAggro: number;
   /** actively sit on the player's line when just ahead */
   blocking: boolean;
@@ -89,6 +90,12 @@ export class Opponent {
   brain: AiBrain = { ...DEFAULT_BRAIN };
   /** engine hook so rival crate smashes also spawn debris */
   boxHitHook?: (box: TrackBox) => void;
+
+  /** nitro-brain latching: once lit, keep burning until the tank hits the
+   *  difficulty floor (hysteresis — no per-frame boost flicker). */
+  boostHold = false;
+  /** exhaust-trail emit timer (engine drives the shared particle pool). */
+  trailT = 0;
 
   private mistakeT = 9;
   private mistakeLeft = 0;
@@ -158,6 +165,10 @@ export class Opponent {
   /** Drop onto the grid / scatter point facing forward. */
   place(idx: number, lat: number, speed: number) {
     this.physics.place(idx, lat, speed);
+    // fresh energy every race — same rule as the player ("nitro starts full")
+    this.physics.nitro = 100;
+    this.physics.boostMeter = 40;
+    this.boostHold = false;
     this.startS = this.physics.progressS;
     this.finishMs = null;
     this.syncVisual(0.016);
@@ -195,7 +206,7 @@ export class Opponent {
       steer: input ? input.steer : 0,
       slip: p.drifting ? p.slip : 0,
       grounded: p.grounded,
-      boosting: p.boosting,
+      boosting: p.boosting || p.nitroActive,
       braking: input ? input.brake > 0.05 : false,
       pitchRate: 0,
       rollRate: p.drifting ? -p.slip * 12 : 0,
@@ -300,20 +311,46 @@ export function opponentInput(
   } else {
     speedFactor *= 0.6; // relaxed title-screen cruise
   }
-  speedFactor = clamp(speedFactor, 0.5, 1.32);
+  speedFactor = clamp(speedFactor, 0.5, 1.42);
 
   const target = fullSend
     ? 55 * speedFactor
     : clamp(clamp(52 / (1 + dTheta * 9), 15, 52) * speedFactor, 15, 58);
 
-  // boost eagerness scales with difficulty — HARD rivals fire it early & often
-  const boostThreshold = 74 - 36 * brain.boostAggro;
+  // --- nitro brain ---
+  // Rivals run the SAME nitro system as the player (CarPhysics drains the
+  // tank at 33/s while boost is held, refills 10/s when released). The brain
+  // fires it on straights, holds while the tank lasts, then lifts to
+  // recharge. boostAggro sets the engagement point and the drain floor, so
+  // HARD rivals dump whole tanks on every straight while EASY ones only tap
+  // a near-full bar. The drift/near-miss bank rides along underneath (both
+  // drain while the button is held) — exactly like the player's controls.
+  const energy = p.nitro + p.boostMeter * 0.55;
+  const fireFrom = 100 - 31 * (1 - brain.boostAggro); // aggro 1→100 · .55→84 · .25→77
+  const fireFloor = 8 + 12 * (1 - brain.boostAggro); // aggro 1→8 · .55→13 · .25→17
+  if (op.boostHold && energy < fireFloor) op.boostHold = false;
+  else if (!op.boostHold && energy >= fireFrom) op.boostHold = true;
+  // HARD only: wheel-to-wheel defense — when the player is alongside, burn
+  // whatever is left in the tank instead of waiting for a refill.
+  if (brain.blocking && mode === "race" && !op.boostHold) {
+    const battle = op.raceDist - ctx.playerDist;
+    if (battle > -7 && battle < 7 && energy > fireFloor + 22) op.boostHold = true;
+  }
+  const straightEnough = dTheta < 0.042 + 0.03 * brain.boostAggro;
+  const wantsBoost =
+    mode === "race" &&
+    op.boostHold &&
+    straightEnough &&
+    p.grounded &&
+    p.speed > 16;
 
   return {
     steer,
-    throttle: p.speed < target ? 1 : 0,
+    // while burning nitro the rival holds the throttle open to the BOOST
+    // cap — boosting at target speed with a closed throttle wastes the tank
+    throttle: p.speed < (wantsBoost ? BOOST_SPEED : target) ? 1 : 0,
     brake: p.speed > target * 1.3 ? 0.55 : 0,
     handbrake: Math.abs(err) > 0.62 && p.speed > 21,
-    boost: mode === "race" && p.boostMeter > boostThreshold && dTheta < 0.05 && p.grounded,
+    boost: wantsBoost,
   };
 }

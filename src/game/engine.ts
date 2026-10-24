@@ -1132,6 +1132,20 @@ export class GameEngine {
     for (const op of this.opponents) {
       const inp = opponentInput(op, this.track, ctx, dt, mode);
       op.update(inp, dt);
+      // rival nitro/boost exhaust trail — same emitter the player's car uses,
+      // so a rival dumping its tank reads instantly in the mirror
+      const q = op.physics;
+      if (mode === "race" && (q.boosting || q.nitroActive)) {
+        op.trailT -= dt;
+        if (op.trailT <= 0) {
+          op.trailT = 0.03;
+          const fx = Math.sin(q.yaw);
+          const fz = Math.cos(q.yaw);
+          this.particles.emitBoost(q.pos.x - fx * 2.0, q.pos.y + 0.45, q.pos.z - fz * 2.0, -fx, -fz);
+        }
+      } else {
+        op.trailT = 0;
+      }
       if (mode === "race" && op.finishMs == null && op.raceDist >= raceLen) {
         op.finishMs = this.raceTime;
       }

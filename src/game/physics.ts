@@ -175,7 +175,7 @@ export const SURFACE_PROPS: Record<Surface, SurfaceProps> = {
 // ============================================================
 const GRAV = 27;
 const MAX_SPEED = 52;
-const BOOST_SPEED = 66;
+export const BOOST_SPEED = 66; // nitro top speed — exported for the AI brain
 const ACCEL = 25;
 const BOOST_ACCEL = 21;
 const BRAKE_DECEL = 36;
