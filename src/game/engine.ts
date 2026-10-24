@@ -10,6 +10,8 @@ import { AudioSystem } from "./audio";
 import { InputManager } from "./input";
 import { gameStore } from "./store";
 import { OPPONENT_GRID_LAT, OPPONENTS, Opponent, opponentInput } from "./ai";
+import { RemotePlayer } from "./remote";
+import type { MPRemoteState } from "./net-types";
 import {
   BOX_RESPAWN_MS,
   DEFAULT_SETTINGS,
@@ -68,7 +70,7 @@ export class GameEngine {
   private countdownShown = -99;
   private raceTime = 0;
   private lapStart = 0;
-  private lapsDone = 0;
+  lapsDone = 0;
   private totalLaps = 3;
   private lineAbs = 0; // progressS value of the current lap's start line
   private nextGateK = 0;
@@ -107,6 +109,15 @@ export class GameEngine {
   private playerPos = 1;
   private lastStandingsKey = "";
   private lastBumpT = -10;
+
+  // multiplayer (driven by net.ts — hidden AI rivals, network cars)
+  remotes: RemotePlayer[] = [];
+  mpActive = false;
+  mpSpectating = false;
+  mpMyName = "YOU";
+  mpMyColor = "#f0641e";
+  /** net layer hook — reports each completed lap to the server */
+  onMpLap: ((lap: number, lapMs: number) => void) | null = null;
 
   private telemetryListeners = new Set<(t: Telemetry) => void>();
   private tmpV = new THREE.Vector3();
@@ -369,13 +380,21 @@ export class GameEngine {
     const prevShadows = this.settings.shadows;
     this.settings = { ...s };
     // HARD strips the safety net — no auto-correct, no anti-spin
-    this.physics.assist = s.difficulty === "hard" ? false : s.assist;
+    // (multiplayer always uses the player's own assist preference)
+    this.physics.assist = this.mpActive
+      ? s.assist
+      : s.difficulty === "hard"
+        ? false
+        : s.assist;
     this.particles.setHighDensity(s.highParticles);
     this.debris.setHighDensity(s.highParticles);
     this.audio.setVolumes(s.musicVol, s.sfxVol);
     this.input.setMouseSteer(s.mouseSteer);
     // difficulty: crate traffic, rival pace/brain, boost economy
-    const diff = DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
+    // (multiplayer races use fixed MEDIUM handling so every car is equal)
+    const diff = this.mpActive
+      ? DIFFICULTIES.medium
+      : DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
     this.track.setActiveStacks(diff.stacks);
     this.physics.boostScale = diff.boostGain;
     for (const op of this.opponents) {
@@ -471,6 +490,7 @@ export class GameEngine {
     this.setPhase("title");
     this.physics.place(this.track.N - 10, 0, 0);
     this.ghostCar.group.visible = false;
+    this.car.group.visible = !this.mpSpectating;
     this.scatterOpponentsOnTrack();
     gameStore.getState().setStandings([]);
   }
@@ -478,6 +498,144 @@ export class GameEngine {
   setPaused(v: boolean) {
     this.paused = v;
     this.audio.setDucked(v);
+  }
+
+  // ============================================================
+  // multiplayer session management (called from net.ts)
+  // ============================================================
+
+  /** Enter/leave a multiplayer session: AI rivals are hidden and network
+   *  cars take their place. Single-player flow is untouched when inactive. */
+  setMultiplayerSession(active: boolean) {
+    if (this.mpActive === active) return;
+    this.mpActive = active;
+    if (!active) {
+      for (const rp of this.remotes) {
+        this.scene.remove(rp.visual.group);
+        rp.dispose();
+      }
+      this.remotes = [];
+      this.mpSpectating = false;
+      this.car.group.visible = true;
+    }
+    for (const op of this.opponents) op.visual.group.visible = !active;
+    // re-apply difficulty handling for the new mode (fair medium in MP)
+    this.applySettings(this.settings);
+  }
+
+  /** Late joiners / quitters watch the canyon flythrough instead of racing. */
+  setSpectating(v: boolean) {
+    if (this.mpSpectating === v) return;
+    this.mpSpectating = v;
+    this.car.group.visible = !v;
+    if (v) this.ghostCar.group.visible = false;
+  }
+
+  getRemote(id: string): RemotePlayer | undefined {
+    return this.remotes.find((r) => r.id === id);
+  }
+
+  /** Match the rendered remote-car roster to the room's player list. */
+  syncRemotes(roster: { id: string; name: string; color: string }[]) {
+    const keep = new Set(roster.map((r) => r.id));
+    this.remotes = this.remotes.filter((rp) => {
+      if (keep.has(rp.id)) return true;
+      this.scene.remove(rp.visual.group);
+      rp.dispose();
+      return false;
+    });
+    for (const r of roster) {
+      const existing = this.getRemote(r.id);
+      if (existing) {
+        existing.setName(r.name);
+        continue;
+      }
+      const rp = new RemotePlayer(r.id, r.name, r.color);
+      this.scene.add(rp.visual.group);
+      this.remotes.push(rp);
+    }
+  }
+
+  applyRemoteSnapshot(id: string, st: MPRemoteState) {
+    const rp = this.getRemote(id);
+    if (!rp) return; // roster sync arrives with the next room state
+    rp.push({
+      x: st.x,
+      y: st.y,
+      z: st.z,
+      yaw: st.yaw,
+      steer: st.steer,
+      spd: st.spd,
+      boost: st.boost,
+      drift: st.drift,
+      ground: st.ground,
+      prog: st.prog,
+    });
+  }
+
+  setRemoteFinish(id: string, finishMs: number, pos: number | null) {
+    const rp = this.getRemote(id);
+    if (!rp) return;
+    rp.finishMs = finishMs;
+    rp.finishPos = pos;
+    this.pushStandings(true);
+  }
+
+  resetRemoteRace() {
+    for (const rp of this.remotes) {
+      rp.finishMs = null;
+      rp.finishPos = null;
+      rp.progressS = 0;
+    }
+  }
+
+  get steerInput(): number {
+    return this.lastSteer;
+  }
+
+  /** Begin a multiplayer race: server-aligned countdown + shared grid slot. */
+  startMultiplayerRace(laps: number, gridIndex: number, goInMs: number) {
+    this.totalLaps = laps;
+    this.loadBest();
+    this.lapsDone = 0;
+    this.raceTime = 0;
+    this.lapStart = 0;
+    this.splits = [];
+    this.lapTimes = [];
+    this.bigAirCount = 0;
+    this.mpSpectating = false;
+    this.car.group.visible = true;
+    // fair fixed handling for every car (MEDIUM-equivalent economy)
+    this.physics.assist = this.settings.assist;
+    this.physics.boostScale = 1.0;
+    this.physics.speedCapScale = 1.0;
+    this.physics.boostMeter = DIFFICULTIES.medium.startBoost;
+    this.physics.driftScore = 0;
+    this.physics.nearMisses = 0;
+    this.physics.topSpeed = 0;
+    this.track.setActiveStacks(DIFFICULTIES.medium.stacks);
+    // grid slot: two-wide rows behind the line, join order = pole outward
+    const t = this.track;
+    const row = Math.floor(gridIndex / 2);
+    const col = gridIndex % 2;
+    this.physics.place(wrapI(t.N - 15 - row * 6, t.N), col === 0 ? -2.6 : 2.6, 0);
+    this.playerStartS = this.physics.progressS;
+    this.particles.clearSkids(this.time);
+    this.ghostRec = [];
+    this.ghostRecT = 0;
+    this.ghostCar.group.visible = false;
+    this.countdownT = clamp(goInMs / 1000, 0.05, 6);
+    this.countdownShown = -99;
+    this.recoverT = 0;
+    this.wallWarned.clear();
+    this.lineAbs = this.track.length;
+    this.nextGateK = 0;
+    this.nextGateAbs = this.gateAbs(0);
+    this.playerFinishMs = null;
+    this.lastStandingsKey = "";
+    this.pushStandings(true);
+    this.setPhase("countdown");
+    this.audio.startMusic();
   }
 
   /** Self-test helpers: deterministic stepping decoupled from rAF. */
@@ -508,6 +666,7 @@ export class GameEngine {
     this.car.dispose();
     this.ghostCar.dispose();
     for (const op of this.opponents) op.dispose();
+    for (const rp of this.remotes) rp.dispose();
     this.particles.dispose();
     this.debris.dispose();
     this.renderer.dispose();
@@ -557,6 +716,7 @@ export class GameEngine {
 
     this.updateCamera(dt);
     this.updateSun();
+    this.updateRemotes(dt);
     this.particles.update(dt, this.time);
     this.debris.update(dt);
     this.updateGateGlow();
@@ -598,8 +758,10 @@ export class GameEngine {
     const v = Math.ceil(this.countdownT);
     if (v !== this.countdownShown && v >= 0) {
       this.countdownShown = v;
-      this.cbs.onCountdown(v);
-      this.audio.countdownBeep(v === 0);
+      // multiplayer races pre-roll up to ~4s before GO — keep the classic
+      // 3·2·1 display and only beep inside the final three
+      this.cbs.onCountdown(Math.min(v, 3));
+      if (v <= 3) this.audio.countdownBeep(v === 0);
     }
     if (this.countdownT <= 0) {
       this.setPhase("racing");
@@ -715,6 +877,8 @@ export class GameEngine {
       if (this.ghostRec.length > 10) this.ghost = this.ghostRec;
     }
     this.lapsDone++;
+    // multiplayer: report the lap for server-side validation
+    this.onMpLap?.(this.lapsDone, lapMs);
     const store = gameStore.getState();
     if (this.lapsDone >= this.totalLaps) {
       // ---- finish ----
@@ -767,7 +931,7 @@ export class GameEngine {
         isNewRecord,
         splits: [...this.splits],
         position,
-        totalCars: 1 + this.opponents.length,
+        totalCars: this.mpActive ? 1 + this.remotes.length : 1 + this.opponents.length,
       });
       return;
     }
@@ -809,6 +973,7 @@ export class GameEngine {
   // ============================================================
 
   private updateOpponents(dt: number, mode: "race" | "cruise") {
+    if (this.mpActive) return; // network cars replace the AI rivals in MP
     const ctx = {
       playerDist: this.physics.progressS - this.playerStartS,
       playerLat: this.physics.lateral,
@@ -821,6 +986,13 @@ export class GameEngine {
         op.finishMs = this.raceTime;
       }
     }
+  }
+
+  /** Interpolate every network car (any phase — lobby flythrough included). */
+  private updateRemotes(dt: number) {
+    if (!this.remotes.length) return;
+    const nowMs = performance.now();
+    for (const rp of this.remotes) rp.update(nowMs, dt);
   }
 
   /** Soft sphere collisions between all cars (player + rivals). */
@@ -866,6 +1038,44 @@ export class GameEngine {
         }
       }
     }
+    if (this.mpActive && !this.mpSpectating) this.resolveRemoteCollisions();
+  }
+
+  /** Player vs network cars: the local car reacts (owner stays authoritative
+   *  on their own client — both sides feel the bump locally). */
+  private resolveRemoteCollisions() {
+    const a = this.physics;
+    const R = 2.55;
+    const R2 = R * R;
+    for (const rp of this.remotes) {
+      if (!rp.active) continue;
+      if (Math.abs(a.pos.y - rp.ry) > 2.2) continue;
+      const dx = rp.rx - a.pos.x;
+      const dz = rp.rz - a.pos.z;
+      const d2 = dx * dx + dz * dz;
+      if (d2 >= R2 || d2 < 1e-6) continue;
+      const d = Math.sqrt(d2);
+      const nx = dx / d;
+      const nz = dz / d;
+      const pen = R - d;
+      a.pos.x -= nx * pen;
+      a.pos.z -= nz * pen;
+      const rvx = rp.vel.x - a.vel.x;
+      const rvz = rp.vel.z - a.vel.z;
+      const vn = rvx * nx + rvz * nz;
+      if (vn < 0) {
+        const imp = -vn * 0.7;
+        a.vel.x -= nx * imp;
+        a.vel.z -= nz * imp;
+        if (-vn > 4.5 && this.time - this.lastBumpT > 0.6) {
+          this.lastBumpT = this.time;
+          const impact = -vn;
+          this.audio.crash(clamp(impact / 26, 0.12, 0.45));
+          this.trauma = Math.min(1, this.trauma + 0.1 + impact * 0.012);
+          this.input.rumble(clamp(impact / 20, 0.15, 0.6), 110);
+        }
+      }
+    }
   }
 
   private updateStandings(dt: number) {
@@ -877,6 +1087,37 @@ export class GameEngine {
 
   /** Current race order (finished cars first, then track position). */
   getStandings(): StandingEntry[] {
+    if (this.mpActive) {
+      const raw = [
+        {
+          name: this.mpMyName,
+          isPlayer: true,
+          color: this.mpMyColor,
+          s: this.physics.progressS,
+          finishMs: this.playerFinishMs,
+        },
+        ...this.remotes.map((rp) => ({
+          name: rp.name,
+          isPlayer: false,
+          color: rp.colorCss,
+          s: rp.progressS,
+          finishMs: rp.finishMs,
+        })),
+      ];
+      raw.sort((x, y) => {
+        if (x.finishMs != null && y.finishMs != null) return x.finishMs - y.finishMs;
+        if (x.finishMs != null) return -1;
+        if (y.finishMs != null) return 1;
+        return y.s - x.s;
+      });
+      return raw.map((e, i) => ({
+        pos: i + 1,
+        name: e.name,
+        isPlayer: e.isPlayer,
+        color: e.color,
+        timeMs: e.finishMs,
+      }));
+    }
     const raw = [
       {
         name: "YOU",
@@ -1102,6 +1343,7 @@ export class GameEngine {
   // ============================================================
 
   private recordGhost(dt: number) {
+    if (this.mpActive) return; // ghost replays are a solo feature
     this.ghostRecT += dt;
     if (this.ghostRecT >= 0.05) {
       this.ghostRecT = 0;
@@ -1112,6 +1354,10 @@ export class GameEngine {
   }
 
   private playGhost() {
+    if (this.mpActive) {
+      this.ghostCar.group.visible = false;
+      return;
+    }
     if (!this.ghost.length) {
       this.ghostCar.group.visible = false;
       return;
@@ -1255,12 +1501,18 @@ export class GameEngine {
       lap: Math.min(this.lapsDone + 1, this.totalLaps),
       totalLaps: this.totalLaps,
       position: this.playerPos,
-      totalCars: 1 + this.opponents.length,
-      blips: this.opponents.map((op) => ({
-        x: op.physics.pos.x,
-        z: op.physics.pos.z,
-        color: op.def.cssColor,
-      })),
+      totalCars: this.mpActive ? 1 + this.remotes.length : 1 + this.opponents.length,
+      blips: this.mpActive
+        ? this.remotes.map((rp) => ({
+            x: rp.rx,
+            z: rp.rz,
+            color: rp.colorCss,
+          }))
+        : this.opponents.map((op) => ({
+            x: op.physics.pos.x,
+            z: op.physics.pos.z,
+            color: op.def.cssColor,
+          })),
       raceTimeMs: this.raceTime,
       lapTimeMs: this.raceTime - this.lapStart,
       bestLapMs: this.bestLapMs,

@@ -1,0 +1,1041 @@
+/**
+ * CANYON RUSH — real-time multiplayer racing service.
+ *
+ * Socket.IO server (port 3003) providing:
+ *  - room-based lobbies with 4-char codes, multiple independent rooms
+ *  - hard 10-player limit enforced server-side
+ *  - host/admin authority + safe host transfer on disconnect
+ *  - custom names, live renaming, ready system
+ *  - room-isolated real-time chat (validation + anti-spam)
+ *  - server-authorized synchronized race countdown (3-2-1-GO)
+ *  - 10Hz aggregated car-state relay with pre-GO movement lock
+ *  - server-validated laps / finishes / final results + rematch
+ *  - reconnection tokens, disconnect grace, abandoned-room cleanup
+ *
+ * All game physics run on each client; the server is authoritative for
+ * everything social + race lifecycle + result ordering, and validates
+ * lap/finish plausibility (distance + minimum-time gates) so results
+ * cannot be manipulated with plain client-side requests.
+ */
+import { createServer } from "http";
+import { Server, type Socket } from "socket.io";
+import { randomUUID } from "node:crypto";
+
+// ---------------------------------------------------------------------------
+// configuration
+// ---------------------------------------------------------------------------
+const PORT = 3003;
+const MAX_PLAYERS = 10;
+const COUNTDOWN_MS = 4200; // server-authorized GO moment
+const MIN_LAP_MS = 20000; // plausible minimum lap time
+const RECONNECT_GRACE_MS =
+  Number.parseInt(process.env.RACING_GRACE_MS ?? "", 10) || 45000;
+const CHAT_MAX_LEN = 200;
+const CHAT_WINDOW_MS = 10000;
+const CHAT_MAX_IN_WINDOW = 8;
+const STATE_MIN_INTERVAL_MS = 40; // accept max 25 state updates / second
+const RELAY_INTERVAL_MS = 100; // 10 Hz aggregated broadcast
+const RESULTS_COMPILE_DELAY_MS = 10000; // wait for reconnectors after last finish
+const RESULTS_TO_LOBBY_MS = 15000; // auto return-to-lobby after results
+const RACE_TIMEOUT_PER_LAP_MS = 4 * 60 * 1000;
+const ROOM_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const NAME_MAX = 14;
+
+const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PLAYER_COLORS = [
+  "#f0641e",
+  "#2f9e63",
+  "#d64530",
+  "#1f8a70",
+  "#ffb020",
+  "#8a5a2b",
+  "#c94277",
+  "#6a994e",
+  "#a3593a",
+  "#4a7c6f",
+];
+
+/** Mild profanity mask list (chat is masked, names are rejected). */
+const BAD_WORDS = ["fuck", "shit", "bitch", "asshole", "cunt", "nigger", "retard", "bastard"];
+
+// ---------------------------------------------------------------------------
+// types
+// ---------------------------------------------------------------------------
+interface RaceState {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  steer: number;
+  spd: number;
+  boost: boolean;
+  drift: boolean;
+  ground: boolean;
+  lap: number;
+  prog: number;
+}
+
+interface Player {
+  id: string;
+  token: string;
+  name: string;
+  color: string;
+  ready: boolean;
+  connected: boolean;
+  socketId: string | null;
+  grid: number;
+  racing: boolean;
+  lap: number;
+  finishPos: number | null;
+  finishMs: number | null;
+  bestLapMs: number | null;
+  topSpeedKmh: number | null;
+  driftScore: number | null;
+  lastProgress: number;
+  lapProgBase: number | null;
+  anchor: RaceState | null; // grid position captured during countdown
+  lastState: RaceState | null;
+  lastStateAt: number;
+  chatTimes: number[];
+  disconnectAt: number | null;
+  removeTimer: ReturnType<typeof setTimeout> | null;
+}
+
+type Phase = "lobby" | "countdown" | "racing" | "results";
+
+interface Room {
+  code: string;
+  hostId: string;
+  phase: Phase;
+  players: Map<string, Player>;
+  order: string[]; // join order (stable pids)
+  nextPid: number;
+  laps: number;
+  trackLength: number;
+  startAt: number;
+  raceStartedAt: number;
+  finishCounter: number;
+  goTimer: ReturnType<typeof setTimeout> | null;
+  raceTimer: ReturnType<typeof setTimeout> | null;
+  compileTimer: ReturnType<typeof setTimeout> | null;
+  lobbyTimer: ReturnType<typeof setTimeout> | null;
+  relayOn: boolean;
+  createdAt: number;
+}
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+const rooms = new Map<string, Room>();
+
+function sanitizeText(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  // strip control chars, collapse whitespace
+  return raw
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function maskProfanity(text: string): string {
+  let out = text;
+  for (const w of BAD_WORDS) {
+    out = out.replace(new RegExp(w, "gi"), (m) => m[0] + "*".repeat(Math.max(1, m.length - 1)));
+  }
+  return out;
+}
+
+function hasProfanity(text: string): boolean {
+  const lower = text.toLowerCase();
+  return BAD_WORDS.some((w) => lower.includes(w));
+}
+
+/** Valid display name or null. */
+function validName(raw: unknown): string | null {
+  const name = sanitizeText(raw);
+  if (name.length < 1 || name.length > NAME_MAX) return null;
+  if (hasProfanity(name)) return null;
+  return name;
+}
+
+function genCode(): string {
+  let code = "";
+  for (let i = 0; i < 4; i++) {
+    code += CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+  }
+  return code;
+}
+
+function genRoomCode(): string {
+  for (let tries = 0; tries < 50; tries++) {
+    const code = genCode();
+    if (!rooms.has(code)) return code;
+  }
+  // astronomically unlikely fallback
+  return genCode() + Date.now().toString(36).slice(-2).toUpperCase();
+}
+
+function num(v: unknown, fallback = 0): number {
+  const n = typeof v === "number" ? v : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function sanitizeState(raw: unknown): RaceState | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const r = raw as Record<string, unknown>;
+  let yaw = num(r.yaw);
+  while (yaw > Math.PI) yaw -= Math.PI * 2;
+  while (yaw < -Math.PI) yaw += Math.PI * 2;
+  return {
+    x: clampAbs(num(r.x), 6000),
+    y: clampRange(num(r.y), -60, 400),
+    z: clampAbs(num(r.z), 6000),
+    yaw,
+    steer: clampRange(num(r.steer), -1, 1),
+    spd: clampRange(num(r.spd), 0, 250),
+    boost: !!r.boost,
+    drift: !!r.drift,
+    ground: !!r.ground,
+    lap: Math.min(50, Math.max(0, Math.round(num(r.lap)))),
+    prog: clampAbs(num(r.prog), 1e7),
+  };
+}
+
+function clampAbs(v: number, lim: number): number {
+  return Math.max(-lim, Math.min(lim, v));
+}
+
+function clampRange(v: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function roomState(r: Room) {
+  return {
+    code: r.code,
+    hostId: r.hostId,
+    phase: r.phase,
+    laps: r.laps,
+    maxPlayers: MAX_PLAYERS,
+    startAt: r.phase === "countdown" ? r.startAt : null,
+    players: r.order
+      .map((pid) => r.players.get(pid))
+      .filter((p): p is Player => !!p)
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        color: p.color,
+        ready: p.ready,
+        connected: p.connected,
+        grid: p.grid,
+        racing: p.racing,
+        lap: p.lap,
+        finishPos: p.finishPos,
+        finishMs: p.finishMs,
+      })),
+  };
+}
+
+function sysMsg(text: string) {
+  return { id: randomUUID(), pid: null, name: "SYSTEM", text, at: Date.now(), sys: true };
+}
+
+function chatMsg(p: Player, text: string) {
+  return { id: randomUUID(), pid: p.id, name: p.name, text, at: Date.now(), sys: false };
+}
+
+function broadcastRoom(r: Room) {
+  io.to(r.code).emit("mp:room", { room: roomState(r) });
+}
+
+function systemChat(r: Room, text: string) {
+  io.to(r.code).emit("mp:chat", { msg: sysMsg(text) });
+}
+
+function pickColor(r: Room): string {
+  const used = new Set([...r.players.values()].map((p) => p.color));
+  for (const c of PLAYER_COLORS) if (!used.has(c)) return c;
+  return PLAYER_COLORS[r.players.size % PLAYER_COLORS.length];
+}
+
+function clearTimer(t: ReturnType<typeof setTimeout> | null): ReturnType<typeof setTimeout> | null {
+  if (t) clearTimeout(t);
+  return null;
+}
+
+function stopRelayIfIdle(r: Room) {
+  if (r.phase === "lobby") r.relayOn = false;
+}
+
+/** Remove a player entirely (grace expired or explicit leave). */
+function removePlayer(r: Room, p: Player, reason: "left" | "timeout") {
+  if (!r.players.has(p.id)) return;
+  if (p.removeTimer) clearTimeout(p.removeTimer);
+  r.players.delete(p.id);
+  r.order = r.order.filter((pid) => pid !== p.id);
+  io.to(r.code).emit("mp:chat", {
+    msg: sysMsg(reason === "left" ? `${p.name} left the room` : `${p.name} timed out`),
+  });
+
+  if (r.players.size === 0) {
+    deleteRoom(r);
+    return;
+  }
+  // host transfer
+  if (r.hostId === p.id) {
+    const next = r.order
+      .map((pid) => r.players.get(pid)!)
+      .find((pl) => pl.connected);
+    if (next) {
+      r.hostId = next.id;
+      systemChat(r, `${next.name} is now the host`);
+    }
+  }
+  broadcastRoom(r);
+}
+
+function deleteRoom(r: Room) {
+  r.goTimer = clearTimer(r.goTimer);
+  r.raceTimer = clearTimer(r.raceTimer);
+  r.compileTimer = clearTimer(r.compileTimer);
+  r.lobbyTimer = clearTimer(r.lobbyTimer);
+  for (const p of r.players.values()) {
+    if (p.removeTimer) clearTimeout(p.removeTimer);
+  }
+  r.relayOn = false;
+  rooms.delete(r.code);
+  console.log(`[room ${r.code}] deleted`);
+}
+
+/** Assign fresh grid slots: connected racers in `order` sequence. */
+function assignGrid(r: Room) {
+  let g = 0;
+  for (const pid of r.order) {
+    const p = r.players.get(pid);
+    if (!p) continue;
+    p.grid = g++;
+  }
+}
+
+/** Begin the server-authorized countdown. */
+function beginCountdown(r: Room) {
+  r.phase = "countdown";
+  r.startAt = Date.now() + COUNTDOWN_MS;
+  r.finishCounter = 0;
+  for (const p of r.players.values()) {
+    // everyone present at start time races (even currently-disconnected
+    // players keep their slot so they can rejoin in progress)
+    p.racing = true;
+    p.lap = 0;
+    p.finishPos = null;
+    p.finishMs = null;
+    p.bestLapMs = null;
+    p.topSpeedKmh = null;
+    p.driftScore = null;
+    p.lastProgress = 0;
+    p.lapProgBase = null;
+    p.anchor = null;
+    p.lastState = null;
+    p.ready = false;
+  }
+  assignGrid(r);
+  r.relayOn = true;
+  broadcastRoom(r);
+  io.to(r.code).emit("mp:countdown", { startAt: r.startAt, laps: r.laps });
+  console.log(`[room ${r.code}] countdown → GO at ${r.startAt}`);
+
+  r.goTimer = clearTimer(r.goTimer);
+  r.goTimer = setTimeout(() => {
+    r.phase = "racing";
+    r.raceStartedAt = r.startAt;
+    io.to(r.code).emit("mp:go", { startAt: r.startAt });
+    broadcastRoom(r);
+    // hard race timeout — force results so a room can never hang
+    r.raceTimer = clearTimer(r.raceTimer);
+    r.raceTimer = setTimeout(
+      () => {
+        if (r.phase === "racing") {
+          console.log(`[room ${r.code}] race timeout → results`);
+          compileResults(r, true);
+        }
+      },
+      r.laps * RACE_TIMEOUT_PER_LAP_MS + 60000
+    );
+  }, COUNTDOWN_MS);
+}
+
+/** Build + broadcast final results and move to the results phase. */
+function compileResults(r: Room, fromTimeout = false) {
+  if (r.phase !== "racing") return;
+  r.compileTimer = clearTimer(r.compileTimer);
+  r.raceTimer = clearTimer(r.raceTimer);
+  const racers = r.order
+    .map((pid) => r.players.get(pid)!)
+    .filter((p) => p && p.racing);
+  const finished = racers
+    .filter((p) => p.finishPos != null)
+    .sort((a, b) => (a.finishPos ?? 0) - (b.finishPos ?? 0));
+  const dnf = racers
+    .filter((p) => p.finishPos == null)
+    .sort((a, b) => b.lastProgress - a.lastProgress);
+  const results = [...finished, ...dnf].map((p) => ({
+    pid: p.id,
+    name: p.name,
+    color: p.color,
+    pos: p.finishPos,
+    totalMs: p.finishMs,
+    bestLapMs: p.bestLapMs,
+    topSpeedKmh: p.topSpeedKmh,
+    driftScore: p.driftScore,
+    finished: p.finishPos != null,
+  }));
+  r.phase = "results";
+  io.to(r.code).emit("mp:results", { results });
+  broadcastRoom(r);
+  console.log(
+    `[room ${r.code}] results compiled (${finished.length} finished, ${dnf.length} DNF${fromTimeout ? ", timeout" : ""})`
+  );
+  // auto return to lobby so the room never gets stuck in results
+  r.lobbyTimer = clearTimer(r.lobbyTimer);
+  r.lobbyTimer = setTimeout(() => returnToLobby(r), RESULTS_TO_LOBBY_MS);
+}
+
+function returnToLobby(r: Room) {
+  if (r.phase !== "results") return;
+  r.lobbyTimer = clearTimer(r.lobbyTimer);
+  r.phase = "lobby";
+  for (const p of r.players.values()) {
+    p.ready = false;
+    p.racing = false;
+    p.lap = 0;
+    p.finishPos = null;
+    p.finishMs = null;
+  }
+  r.relayOn = false;
+  io.to(r.code).emit("mp:phase", { phase: "lobby" });
+  broadcastRoom(r);
+}
+
+/** Schedule result compilation once every connected racer has finished. */
+function maybeScheduleCompile(r: Room) {
+  if (r.phase !== "racing") return;
+  const racers = [...r.players.values()].filter((p) => p.racing);
+  const connectedRacers = racers.filter((p) => p.connected);
+  if (connectedRacers.length === 0) {
+    // everyone dropped — compile after the reconnect grace window
+    if (!r.compileTimer) {
+      r.compileTimer = setTimeout(() => compileResults(r), RECONNECT_GRACE_MS);
+    }
+    return;
+  }
+  const allDone = connectedRacers.every((p) => p.finishPos != null);
+  if (allDone) {
+    r.compileTimer = clearTimer(r.compileTimer);
+    r.compileTimer = setTimeout(() => compileResults(r), RESULTS_COMPILE_DELAY_MS);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// socket server
+// ---------------------------------------------------------------------------
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  // DO NOT change the path — the gateway (Caddy) forwards /?XTransformPort=3003
+  path: "/",
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e5,
+});
+
+interface SocketData {
+  roomCode?: string;
+  pid?: string;
+}
+
+function ctxOf(socket: Socket): { r: Room; p: Player } | null {
+  const code = (socket.data as SocketData).roomCode;
+  const pid = (socket.data as SocketData).pid;
+  if (!code || !pid) return null;
+  const r = rooms.get(code);
+  if (!r) return null;
+  const p = r.players.get(pid);
+  if (!p) return null;
+  return { r, p };
+}
+
+/** Detach a socket from its current room (explicit leave / room switch). */
+function detachSocket(socket: Socket, reason: "left" | "timeout") {
+  const ctx = ctxOf(socket);
+  if (!ctx) return;
+  const { r, p } = ctx;
+  (socket.data as SocketData) = {};
+  socket.leave(r.code);
+  removePlayer(r, p, reason);
+}
+
+io.on("connection", (socket) => {
+  console.log(`socket connected: ${socket.id}`);
+
+  socket.on("mp:ping", (payload: unknown) => {
+    const t0 = (payload as { t0?: number })?.t0;
+    socket.emit("mp:pong", { t0: typeof t0 === "number" ? t0 : 0, serverNow: Date.now() });
+  });
+
+  // ----- create ------------------------------------------------------------
+  socket.on("mp:create", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const body = (payload ?? {}) as { name?: unknown };
+      const name = validName(body.name);
+      if (!name) {
+        ack?.({ ok: false, error: "Enter a name (1-14 characters)" });
+        return;
+      }
+      detachSocket(socket, "left");
+      const code = genRoomCode();
+      const room: Room = {
+        code,
+        hostId: "p1",
+        phase: "lobby",
+        players: new Map(),
+        order: [],
+        nextPid: 1,
+        laps: 3,
+        trackLength: 2600,
+        startAt: 0,
+        raceStartedAt: 0,
+        finishCounter: 0,
+        goTimer: null,
+        raceTimer: null,
+        compileTimer: null,
+        lobbyTimer: null,
+        relayOn: false,
+        createdAt: Date.now(),
+      };
+      const pid = "p" + room.nextPid++;
+      const player: Player = {
+        id: pid,
+        token: randomUUID(),
+        name,
+        color: pickColor(room),
+        ready: false,
+        connected: true,
+        socketId: socket.id,
+        grid: 0,
+        racing: false,
+        lap: 0,
+        finishPos: null,
+        finishMs: null,
+        bestLapMs: null,
+        topSpeedKmh: null,
+        driftScore: null,
+        lastProgress: 0,
+        lapProgBase: null,
+        anchor: null,
+        lastState: null,
+        lastStateAt: 0,
+        chatTimes: [],
+        disconnectAt: null,
+        removeTimer: null,
+      };
+      room.players.set(pid, player);
+      room.order.push(pid);
+      room.hostId = pid;
+      rooms.set(code, room);
+      (socket.data as SocketData) = { roomCode: code, pid };
+      socket.join(code);
+      console.log(`[room ${code}] created by ${name}`);
+      ack?.({ ok: true, code, token: player.token, pid });
+      socket.emit("mp:room", { room: roomState(room) });
+      systemChat(room, `${name} created the room`);
+    } catch (err) {
+      console.error("mp:create error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- join --------------------------------------------------------------
+  socket.on("mp:join", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const body = (payload ?? {}) as { code?: unknown; name?: unknown; token?: unknown };
+      const code = sanitizeText(body.code).toUpperCase();
+      if (code.length !== 4) {
+        ack?.({ ok: false, error: "Room code must be 4 characters" });
+        return;
+      }
+      const room = rooms.get(code);
+      if (!room) {
+        ack?.({ ok: false, error: "Room not found — check the code" });
+        return;
+      }
+      const token = typeof body.token === "string" ? body.token : "";
+
+      // --- reconnection path (token match, currently disconnected) ---
+      if (token) {
+        for (const p of room.players.values()) {
+          if (p.token === token) {
+            if (p.connected) {
+              ack?.({ ok: false, error: "This player is already active in the room" });
+              return;
+            }
+            detachSocket(socket, "left");
+            p.connected = true;
+            p.socketId = socket.id;
+            p.disconnectAt = null;
+            if (p.removeTimer) {
+              clearTimeout(p.removeTimer);
+              p.removeTimer = null;
+            }
+            (socket.data as SocketData) = { roomCode: code, pid: p.id };
+            socket.join(code);
+            console.log(`[room ${code}] ${p.name} reconnected`);
+            ack?.({ ok: true, code, token: p.token, pid: p.id });
+            socket.emit("mp:room", { room: roomState(room) });
+            systemChat(room, `${p.name} reconnected`);
+            broadcastRoom(room);
+            return;
+          }
+        }
+      }
+
+      // --- fresh join ---
+      if (room.players.size >= MAX_PLAYERS) {
+        ack?.({ ok: false, error: `Room is full (${room.players.size}/${MAX_PLAYERS})` });
+        return;
+      }
+      const name = validName(body.name);
+      if (!name) {
+        ack?.({ ok: false, error: "Enter a name (1-14 characters)" });
+        return;
+      }
+      detachSocket(socket, "left");
+      const pid = "p" + room.nextPid++;
+      const color = pickColor(room);
+      const player: Player = {
+        id: pid,
+        token: randomUUID(),
+        name,
+        color,
+        ready: false,
+        connected: true,
+        socketId: socket.id,
+        grid: room.players.size,
+        racing: false,
+        lap: 0,
+        finishPos: null,
+        finishMs: null,
+        bestLapMs: null,
+        topSpeedKmh: null,
+        driftScore: null,
+        lastProgress: 0,
+        lapProgBase: null,
+        anchor: null,
+        lastState: null,
+        lastStateAt: 0,
+        chatTimes: [],
+        disconnectAt: null,
+        removeTimer: null,
+      };
+      room.players.set(pid, player);
+      room.order.push(pid);
+      (socket.data as SocketData) = { roomCode: code, pid };
+      socket.join(code);
+      console.log(`[room ${code}] ${name} joined (${room.players.size}/${MAX_PLAYERS})`);
+      ack?.({ ok: true, code, token: player.token, pid });
+      socket.emit("mp:room", { room: roomState(room) });
+      systemChat(room, `${name} joined the room`);
+      broadcastRoom(room);
+    } catch (err) {
+      console.error("mp:join error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- leave -------------------------------------------------------------
+  socket.on("mp:leave", (_payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      detachSocket(socket, "left");
+      ack?.({ ok: true });
+    } catch (err) {
+      console.error("mp:leave error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- rename ------------------------------------------------------------
+  socket.on("mp:rename", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      const body = (payload ?? {}) as { name?: unknown };
+      const name = validName(body.name);
+      if (!name) {
+        ack?.({ ok: false, error: "Name must be 1-14 characters (no bad words)" });
+        return;
+      }
+      if (name === p.name) {
+        ack?.({ ok: true });
+        return;
+      }
+      const old = p.name;
+      p.name = name;
+      ack?.({ ok: true });
+      systemChat(r, `${old} is now known as ${name}`);
+      broadcastRoom(r);
+    } catch (err) {
+      console.error("mp:rename error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- ready -------------------------------------------------------------
+  socket.on("mp:ready", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      if (r.phase !== "lobby") {
+        ack?.({ ok: false, error: "Can't change ready during a race" });
+        return;
+      }
+      p.ready = !!((payload as { ready?: unknown })?.ready);
+      ack?.({ ok: true });
+      broadcastRoom(r);
+    } catch (err) {
+      console.error("mp:ready error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- host lobby settings (laps) ----------------------------------------
+  socket.on("mp:settings", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      if (r.hostId !== p.id) {
+        ack?.({ ok: false, error: "Only the host can change settings" });
+        return;
+      }
+      if (r.phase !== "lobby") {
+        ack?.({ ok: false, error: "Settings are locked outside the lobby" });
+        return;
+      }
+      const laps = Math.round(num((payload as { laps?: unknown })?.laps, 3));
+      if (laps < 1 || laps > 5) {
+        ack?.({ ok: false, error: "Laps must be 1-5" });
+        return;
+      }
+      r.laps = laps;
+      ack?.({ ok: true });
+      broadcastRoom(r);
+    } catch (err) {
+      console.error("mp:settings error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- chat --------------------------------------------------------------
+  socket.on("mp:chat", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      const raw = (payload as { text?: unknown })?.text;
+      if (typeof raw !== "string") {
+        ack?.({ ok: false, error: "Invalid message" });
+        return;
+      }
+      const text = sanitizeText(raw).slice(0, CHAT_MAX_LEN);
+      if (!text) {
+        ack?.({ ok: false, error: "Message is empty" });
+        return;
+      }
+      // anti-spam: max CHAT_MAX_IN_WINDOW messages per window
+      const now = Date.now();
+      p.chatTimes = p.chatTimes.filter((t) => now - t < CHAT_WINDOW_MS);
+      if (p.chatTimes.length >= CHAT_MAX_IN_WINDOW) {
+        ack?.({ ok: false, error: "Slow down — too many messages" });
+        return;
+      }
+      p.chatTimes.push(now);
+      ack?.({ ok: true });
+      io.to(r.code).emit("mp:chat", { msg: chatMsg(p, maskProfanity(text)) });
+    } catch (err) {
+      console.error("mp:chat error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- host: start race ----------------------------------------------------
+  socket.on("mp:start", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      if (r.hostId !== p.id) {
+        ack?.({ ok: false, error: "Only the host can start the race" });
+        return;
+      }
+      if (r.phase !== "lobby") {
+        ack?.({ ok: false, error: "Race already running" });
+        return;
+      }
+      const connected = [...r.players.values()].filter((pl) => pl.connected);
+      if (connected.length < 1) {
+        ack?.({ ok: false, error: "Not enough players" });
+        return;
+      }
+      const notReady = connected.filter((pl) => !pl.ready);
+      if (notReady.length > 0) {
+        ack?.({ ok: false, error: `Waiting for ${notReady.length} player(s) to ready up` });
+        return;
+      }
+      const body = (payload ?? {}) as { laps?: unknown; trackLength?: unknown };
+      const laps = Math.round(num(body.laps, r.laps));
+      if (laps < 1 || laps > 5) {
+        ack?.({ ok: false, error: "Laps must be 1-5" });
+        return;
+      }
+      const trackLength = num(body.trackLength, 2600);
+      r.laps = laps;
+      r.trackLength = clampRange(trackLength, 500, 20000);
+      ack?.({ ok: true });
+      beginCountdown(r);
+    } catch (err) {
+      console.error("mp:start error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- host: rematch -------------------------------------------------------
+  socket.on("mp:rematch", (_payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      if (r.hostId !== p.id) {
+        ack?.({ ok: false, error: "Only the host can start a rematch" });
+        return;
+      }
+      if (r.phase !== "results") {
+        ack?.({ ok: false, error: "Rematch is available on the results screen" });
+        return;
+      }
+      // new grid: finish order first (winner on pole), DNFs by progress
+      r.order = r.order
+        .map((pid) => r.players.get(pid)!)
+        .filter(Boolean)
+        .sort((a, b) => {
+          const fa = a.finishPos ?? Infinity;
+          const fb = b.finishPos ?? Infinity;
+          if (fa !== fb) return fa - fb;
+          if (fa === Infinity) return b.lastProgress - a.lastProgress;
+          return 0;
+        })
+        .map((pl) => pl.id);
+      ack?.({ ok: true });
+      beginCountdown(r);
+    } catch (err) {
+      console.error("mp:rematch error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
+  // ----- race state (throttled, sanitized, relayed) --------------------------
+  socket.on("mp:state", (payload: unknown) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) return;
+      const { r, p } = ctx;
+      if (r.phase !== "countdown" && r.phase !== "racing" && r.phase !== "results") return;
+      if (!p.racing || !p.connected) return;
+      const now = Date.now();
+      if (now - p.lastStateAt < STATE_MIN_INTERVAL_MS) return; // drop, don't queue
+      const st = sanitizeState(payload);
+      if (!st) return;
+      p.lastStateAt = now;
+      p.lastState = st;
+      p.lastProgress = st.prog;
+      if (r.phase === "racing" && p.lapProgBase == null) p.lapProgBase = st.prog;
+      // pre-GO lock: the first state during countdown becomes the grid anchor
+      // and every relayed state until GO uses the anchor (no early movement)
+      if (r.phase === "countdown") {
+        if (!p.anchor) p.anchor = st;
+        p.lastState = { ...p.anchor, lap: 0, prog: p.anchor.prog };
+      }
+    } catch (err) {
+      console.error("mp:state error", err);
+    }
+  });
+
+  // ----- lap report (validated) ----------------------------------------------
+  socket.on("mp:lap", (payload: unknown) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) return;
+      const { r, p } = ctx;
+      if (r.phase !== "racing" || !p.racing) return;
+      const body = (payload ?? {}) as { lap?: unknown; lapMs?: unknown; prog?: unknown };
+      const lap = Math.round(num(body.lap, -1));
+      const lapMs = num(body.lapMs, 0);
+      if (lap !== p.lap + 1) return; // out of order / duplicate
+      if (lapMs < MIN_LAP_MS) return; // impossible lap time
+      if (lapMs > Date.now() - r.raceStartedAt + 3000) return; // faster than wall clock
+      if (p.lapProgBase == null) return;
+      // distance travelled this lap — the lap payload's own progress is merged
+      // with the state stream so a just-missed state tick can't reject a lap
+      const progNow = Math.max(p.lastProgress, clampAbs(num(body.prog, p.lastProgress), 1e7));
+      if (progNow - p.lapProgBase < r.trackLength * 0.75) return; // not enough distance
+      p.lastProgress = progNow;
+      p.lap++;
+      p.lapProgBase = p.lastProgress;
+      if (p.bestLapMs == null || lapMs < p.bestLapMs) p.bestLapMs = lapMs;
+      io.to(r.code).emit("mp:lap", { pid: p.id, lap: p.lap, lapMs, name: p.name });
+    } catch (err) {
+      console.error("mp:lap error", err);
+    }
+  });
+
+  // ----- finish report (validated, position assigned server-side) -------------
+  socket.on("mp:finish", (payload: unknown) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) return;
+      const { r, p } = ctx;
+      if (r.phase !== "racing" || !p.racing) return;
+      if (p.finishPos != null) return; // already finished
+      const body = (payload ?? {}) as Record<string, unknown>;
+      const totalMs = num(body.totalMs, -1);
+      if (totalMs < r.laps * MIN_LAP_MS * 0.5) return; // impossible total
+      const serverElapsed = Date.now() - r.raceStartedAt;
+      if (totalMs > serverElapsed + 3000) return; // future time = reject
+      if (p.lap < r.laps) return; // laps not validated yet
+      p.finishMs = totalMs;
+      p.bestLapMs = clampRange(num(body.bestLapMs, 0), 0, 36e5);
+      p.topSpeedKmh = clampRange(num(body.topSpeedKmh, 0), 0, 500);
+      p.driftScore = clampRange(num(body.driftScore, 0), 0, 1e7);
+      p.finishPos = ++r.finishCounter;
+      io.to(r.code).emit("mp:finish", {
+        pid: p.id,
+        totalMs: p.finishMs,
+        pos: p.finishPos,
+        name: p.name,
+      });
+      broadcastRoom(r);
+      maybeScheduleCompile(r);
+    } catch (err) {
+      console.error("mp:finish error", err);
+    }
+  });
+
+  // ----- disconnect / graceful removal ----------------------------------------
+  socket.on("disconnect", () => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) return;
+      const { r, p } = ctx;
+      console.log(`[room ${r.code}] ${p.name} disconnected`);
+      p.connected = false;
+      p.socketId = null;
+      p.disconnectAt = Date.now();
+      systemChat(r, `${p.name} disconnected — reconnecting…`);
+      broadcastRoom(r);
+      maybeScheduleCompile(r);
+      p.removeTimer = clearTimer(p.removeTimer);
+      p.removeTimer = setTimeout(() => {
+        // room may have been deleted meanwhile
+        const room = rooms.get(r.code);
+        if (!room) return;
+        const pl = room.players.get(p.id);
+        if (!pl || pl.connected) return;
+        removePlayer(room, pl, "timeout");
+      }, RECONNECT_GRACE_MS);
+    } catch (err) {
+      console.error("disconnect handler error", err);
+    }
+  });
+
+  socket.on("error", (err) => {
+    console.error(`socket error (${socket.id}):`, err);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// aggregated 10 Hz relay: one broadcast per room with every racer's state
+// ---------------------------------------------------------------------------
+setInterval(() => {
+  const now = Date.now();
+  for (const r of rooms.values()) {
+    if (!r.relayOn) continue;
+    const players: unknown[] = [];
+    for (const pid of r.order) {
+      const p = r.players.get(pid);
+      if (!p || !p.racing || !p.lastState) continue;
+      const st = r.phase === "countdown" && p.anchor ? p.anchor : p.lastState;
+      players.push({ pid, ...st });
+    }
+    if (players.length) {
+      io.to(r.code).emit("mp:update", { t: now, players });
+    }
+  }
+}, RELAY_INTERVAL_MS);
+
+// ---------------------------------------------------------------------------
+// housekeeping: abandoned rooms / stale rooms
+// ---------------------------------------------------------------------------
+setInterval(() => {
+  const now = Date.now();
+  for (const r of [...rooms.values()]) {
+    if (now - r.createdAt > ROOM_MAX_AGE_MS) {
+      console.log(`[room ${r.code}] expired (max age)`);
+      deleteRoom(r);
+      continue;
+    }
+    const anyConnected = [...r.players.values()].some((p) => p.connected);
+    if (!anyConnected) {
+      // all sockets gone (crash / mass drop) — remove once every grace expired
+      const earliest = [...r.players.values()].reduce(
+        (min, p) => Math.min(min, p.disconnectAt ?? now),
+        Infinity
+      );
+      if (r.players.size === 0 || now - earliest > RECONNECT_GRACE_MS + 10000) {
+        console.log(`[room ${r.code}] abandoned — cleaning up`);
+        deleteRoom(r);
+      }
+    }
+  }
+}, 30000);
+
+// ---------------------------------------------------------------------------
+httpServer.listen(PORT, () => {
+  console.log(`Canyon Rush multiplayer service listening on port ${PORT}`);
+  console.log(`  max players/room: ${MAX_PLAYERS} · reconnect grace: ${RECONNECT_GRACE_MS}ms`);
+});
+
+process.on("SIGTERM", () => {
+  console.log("SIGTERM — shutting down");
+  httpServer.close(() => process.exit(0));
+});
+process.on("SIGINT", () => {
+  console.log("SIGINT — shutting down");
+  httpServer.close(() => process.exit(0));
+});

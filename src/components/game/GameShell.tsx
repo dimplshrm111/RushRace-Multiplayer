@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronsRight } from "lucide-react";
+import { ChevronsRight, Radio, Users } from "lucide-react";
 import { useGameStore } from "@/game/store";
+import { useMPStore } from "@/game/net-store";
+import { net } from "@/game/net";
 import { AudioSystem } from "@/game/audio";
 import { InputManager, type InputAction } from "@/game/input";
 import { GameEngine } from "@/game/engine";
@@ -15,6 +17,9 @@ import { PauseMenu } from "./PauseMenu";
 import { Results } from "./Results";
 import { TouchControls } from "./TouchControls";
 import { RotatePrompt } from "./RotatePrompt";
+import { MPHome } from "../multiplayer/MPHome";
+import { Lobby } from "../multiplayer/Lobby";
+import { ChatPanel } from "../multiplayer/ChatPanel";
 
 export default function GameShell() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -35,6 +40,20 @@ export default function GameShell() {
   const setResults = useGameStore((s) => s.setResults);
   const setSettings = useGameStore((s) => s.setSettings);
   const loadBest = useGameStore((s) => s.loadBest);
+
+  // multiplayer UI state
+  const mpScreen = useMPStore((s) => s.screen);
+  const mpRoom = useMPStore((s) => s.room);
+  const myId = useMPStore((s) => s.myId);
+  const mpConnection = useMPStore((s) => s.connection);
+  const mpPing = useMPStore((s) => s.ping);
+  const mpToast = useMPStore((s) => s.toast);
+  const setMPScreen = useMPStore((s) => s.setScreen);
+  const clearMPChatOpen = useMPStore((s) => s.setChatOpen);
+
+  const inMPRoom = mpScreen === "room" && mpRoom != null;
+  const inMPRace =
+    inMPRoom && (phase === "countdown" || phase === "racing" || phase === "finished");
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -57,6 +76,8 @@ export default function GameShell() {
           const next = ((st.settings.cameraMode + 1) % 3) as 0 | 1 | 2;
           st.setSettings({ cameraMode: next });
         } else if (a === "restart") {
+          // no local restarts in a shared race — it would desync the room
+          if (net.inRoom) return;
           if (st.phase === "racing" || st.phase === "countdown" || st.phase === "finished") {
             if (st.paused) st.setPaused(false);
             engine.restart();
@@ -72,6 +93,8 @@ export default function GameShell() {
       };
       engine.applySettings(useGameStore.getState().settings);
       loadBest(useGameStore.getState().settings.laps);
+      // hand the engine to the multiplayer layer (lap reporting + state sync)
+      net.attachEngine(engine);
     };
 
     // audio unlock on first gesture
@@ -108,7 +131,12 @@ export default function GameShell() {
           onCountdown: (v) => setCountdown(v),
           onFinish: (r: ResultsData) => {
             setResults(r);
-            // persist to the local leaderboard backend
+            // multiplayer: report the validated finish to the room server
+            net.sendFinish(r);
+            // persist to the local leaderboard backend (use the MP name when racing online)
+            const mpName = useMPStore.getState().room?.players.find(
+              (p) => p.id === useMPStore.getState().myId
+            )?.name;
             void fetch("/api/records", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -118,6 +146,7 @@ export default function GameShell() {
                 bestLapMs: Math.round(r.bestLapMs),
                 topSpeedKmh: r.topSpeedKmh,
                 driftScore: r.driftScore,
+                racerName: net.inRoom && mpName ? mpName : undefined,
               }),
             }).catch(() => undefined);
           },
@@ -196,7 +225,7 @@ export default function GameShell() {
       window.removeEventListener("resize", onResize);
       canvas.removeEventListener("contextmenu", noMenu);
       ro.disconnect();
-      input.detach();
+      net.detachEngine();
       engineRef.current?.dispose();
       engineRef.current = null;
     };
@@ -206,6 +235,27 @@ export default function GameShell() {
   useEffect(() => {
     engineRef.current?.applySettings(settings);
   }, [settings]);
+
+  // hide MP overlays whenever the game screen changes away from them
+  useEffect(() => {
+    if (mpScreen === "none") clearMPChatOpen(false);
+  }, [mpScreen, clearMPChatOpen]);
+
+  // leaving a race back to the title while in a room → back to the lobby view
+  useEffect(() => {
+    if (phase === "title" && net.inRoom) {
+      clearMPChatOpen(false);
+    }
+  }, [phase, clearMPChatOpen]);
+
+  // auto-dismiss multiplayer toasts
+  useEffect(() => {
+    if (!mpToast) return;
+    const t = setTimeout(() => {
+      useMPStore.setState({ toast: null });
+    }, 4200);
+    return () => clearTimeout(t);
+  }, [mpToast]);
 
   const startRace = () => {
     audioRef.current?.unlock();
@@ -220,6 +270,9 @@ export default function GameShell() {
       startRace();
     }
   };
+
+  const isHost = !!mpRoom && mpRoom.hostId === myId;
+  const connectedCount = mpRoom?.players.filter((p) => p.connected).length ?? 0;
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-[#f3c98f] select-none" style={{ touchAction: "none" }}>
@@ -264,14 +317,38 @@ export default function GameShell() {
           {/* Touch controls while racing on touch devices */}
           {phase === "racing" && <TouchControls inputRef={inputRef} onPause={() => setPaused(true)} />}
 
+          {/* multiplayer: connection chip + in-race chat */}
+          {inMPRace && !paused && (
+            <>
+              <div className="pointer-events-none absolute bottom-[60px] right-3 z-20 flex items-center gap-2 rounded-full border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.72)] px-3 py-1 text-[10px] font-black tracking-wider text-[#fff6e6] shadow-lg">
+                <span className="flex items-center gap-1 text-[#ffb020]">
+                  <Radio className="h-3 w-3" aria-hidden />
+                  {mpConnection === "online" ? "LIVE" : "…"}
+                </span>
+                <span className="flex items-center gap-1">
+                  <Users className="h-3 w-3" aria-hidden />
+                  {connectedCount}/{mpRoom?.maxPlayers ?? 10}
+                </span>
+                <span className="text-[#c9a06a]">{mpPing}ms</span>
+              </div>
+              <ChatPanel variant="race" />
+            </>
+          )}
+
           {/* Title */}
-          {phase === "title" && !paused && (
+          {phase === "title" && !paused && mpScreen === "none" && (
             <TitleScreen
               onRace={beginFromTitle}
               onHowToPlay={() => useGameStore.getState().setHint("tutorial")}
               engineRef={engineRef}
             />
           )}
+
+          {/* Multiplayer entry screen */}
+          {phase === "title" && mpScreen === "home" && <MPHome />}
+
+          {/* Multiplayer room lobby (also the spectate view during races) */}
+          {phase === "title" && inMPRoom && !paused && <Lobby engineRef={engineRef} />}
 
           {/* Tutorial (shown when hint === 'tutorial') */}
           <Tutorial
@@ -294,6 +371,8 @@ export default function GameShell() {
                 setPaused(false);
                 engineRef.current?.toTitle();
               }}
+              canRestart={!inMPRoom}
+              quitLabel={inMPRoom ? "BACK TO LOBBY (DNF)" : "QUIT TO TITLE"}
               engineRef={engineRef}
             />
           )}
@@ -304,9 +383,36 @@ export default function GameShell() {
               data={results}
               onRetry={() => engineRef.current?.restart()}
               onTitle={() => engineRef.current?.toTitle()}
+              mp={
+                inMPRoom
+                  ? {
+                      isMultiplayer: true,
+                      isHost,
+                      roomPhase: mpRoom?.phase ?? "lobby",
+                      onRematch: () => void net.rematch(),
+                      onLobby: () => engineRef.current?.toTitle(),
+                    }
+                  : undefined
+              }
             />
           )}
         </>
+      )}
+
+      {/* MP toast (errors / notices) */}
+      {mpToast && Date.now() - mpToast.at < 4200 && (
+        <div
+          role="status"
+          className={`absolute left-1/2 top-16 z-50 -translate-x-1/2 rounded-md border-2 px-4 py-2 text-xs font-black tracking-wider shadow-xl ${
+            mpToast.kind === "error"
+              ? "border-[#2b1c12] bg-[#d64530] text-[#fff6e6]"
+              : mpToast.kind === "success"
+                ? "border-[#2b1c12] bg-[#2f9e63] text-[#fff6e6]"
+                : "border-[#2b1c12] bg-[#fff6e6] text-[#2b1c12]"
+          }`}
+        >
+          {mpToast.text}
+        </div>
       )}
 
       <RotatePrompt />

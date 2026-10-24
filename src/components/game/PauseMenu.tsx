@@ -9,10 +9,15 @@ export function PauseMenu({
   onResume,
   onRestart,
   onQuit,
+  canRestart = true,
+  quitLabel = "QUIT TO TITLE",
 }: {
   onResume: () => void;
   onRestart: () => void;
   onQuit: () => void;
+  /** false in multiplayer — a local restart would desync the shared race */
+  canRestart?: boolean;
+  quitLabel?: string;
   engineRef: React.RefObject<GameEngine | null>;
 }) {
   const [showSettings, setShowSettings] = useState(false);
@@ -45,13 +50,15 @@ export function PauseMenu({
             >
               <span className="block skew-x-6">RESUME</span>
             </button>
-            <button
-              type="button"
-              onClick={onRestart}
-              className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#ffb020] px-6 py-2.5 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
-            >
-              <span className="block skew-x-6">RESTART RACE</span>
-            </button>
+            {canRestart && (
+              <button
+                type="button"
+                onClick={onRestart}
+                className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#ffb020] px-6 py-2.5 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+              >
+                <span className="block skew-x-6">RESTART RACE</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setShowSettings(true)}
@@ -64,7 +71,7 @@ export function PauseMenu({
               onClick={onQuit}
               className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#e5d2b3] px-6 py-2.5 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
             >
-              <span className="block skew-x-6">QUIT TO TITLE</span>
+              <span className="block skew-x-6">{quitLabel}</span>
             </button>
           </div>
         )}

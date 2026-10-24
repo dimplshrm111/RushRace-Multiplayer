@@ -34,7 +34,17 @@ export class InputManager {
   gamepadActive = false;
   usingGamepad = false;
 
+  /** True when a key event originates from a text field (chat, inputs) —
+   *  the game must ignore those so typing never drives the car. */
+  private editableTarget(e: Event): boolean {
+    const t = e.target as HTMLElement | null;
+    if (!t) return false;
+    const tag = t.tagName;
+    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || t.isContentEditable;
+  }
+
   private handleKeyDown = (e: KeyboardEvent) => {
+    if (this.editableTarget(e)) return; // typing in chat — hands off
     const code = e.code;
     if (
       ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "ShiftLeft", "Tab"].includes(code)

@@ -1,0 +1,1298 @@
+     1→"use client";
+     2→
+     3→import * as THREE from "three";
+     4→import { Track, SUN_DIR, type TrackBox } from "./track";
+     5→import { CarVisual } from "./car";
+     6→import { CarPhysics } from "./physics";
+     7→import { ParticleSystem } from "./particles";
+     8→import { DebrisSystem } from "./debris";
+     9→import { AudioSystem } from "./audio";
+    10→import { InputManager } from "./input";
+    11→import { gameStore } from "./store";
+    12→import { OPPONENT_GRID_LAT, OPPONENTS, Opponent, opponentInput } from "./ai";
+    13→import {
+    14→  BOX_RESPAWN_MS,
+    15→  DEFAULT_SETTINGS,
+    16→  DIFFICULTIES,
+    17→  PALETTE,
+    18→  WALL_RESPAWN_MS,
+    19→  clamp,
+    20→  damp,
+    21→  type DriveInput,
+    22→  type GamePhase,
+    23→  type GameSettings,
+    24→  type ResultsData,
+    25→  type StandingEntry,
+    26→  type Telemetry,
+    27→} from "./types";
+    28→
+    29→export interface EngineCallbacks {
+    30→  onPhaseChange(p: GamePhase): void;
+    31→  onCountdown(v: number): void;
+    32→  onFinish(r: ResultsData): void;
+    33→}
+    34→
+    35→const GHOST_KEY = "canyonrush.ghost.v1";
+    36→
+    37→interface GhostFrame {
+    38→  t: number;
+    39→  x: number;
+    40→  y: number;
+    41→  z: number;
+    42→  yaw: number;
+    43→}
+    44→
+    45→export class GameEngine {
+    46→  renderer: THREE.WebGLRenderer;
+    47→  scene = new THREE.Scene();
+    48→  camera: THREE.PerspectiveCamera;
+    49→  track: Track;
+    50→  car: CarVisual;
+    51→  ghostCar: CarVisual;
+    52→  physics: CarPhysics;
+    53→  particles = new ParticleSystem();
+    54→  debris: DebrisSystem;
+    55→  private audio: AudioSystem;
+    56→  private input: InputManager;
+    57→  private cbs: EngineCallbacks;
+    58→  private settings: GameSettings = { ...DEFAULT_SETTINGS };
+    59→
+    60→  phase: GamePhase = "title";
+    61→  paused = false;
+    62→  private raf = 0;
+    63→  private lastT = 0;
+    64→  private time = 0;
+    65→
+    66→  // race state
+    67→  private countdownT = 0;
+    68→  private countdownShown = -99;
+    69→  private raceTime = 0;
+    70→  private lapStart = 0;
+    71→  private lapsDone = 0;
+    72→  private totalLaps = 3;
+    73→  private lineAbs = 0; // progressS value of the current lap's start line
+    74→  private nextGateK = 0;
+    75→  private nextGateAbs = 0;
+    76→  private splits: number[] = [];
+    77→  private bestSplits: number[] = [];
+    78→  private bestTotalMs: number | null = null;
+    79→  private bestLapMs: number | null = null;
+    80→  private lapTimes: number[] = [];
+    81→  private bigAirCount = 0;
+    82→  private recoverT = 0;
+    83→  private titleCamS = 0;
+    84→  private finishOrbitT = 0;
+    85→
+    86→  // ghost
+    87→  private ghost: GhostFrame[] = [];
+    88→  private ghostRec: GhostFrame[] = [];
+    89→  private ghostRecT = 0;
+    90→
+    91→  // camera state
+    92→  private camPos = new THREE.Vector3();
+    93→  private camLook = new THREE.Vector3();
+    94→  private camRoll = 0;
+    95→  private trauma = 0;
+    96→  private fov = 66;
+    97→  private wallRideLean = 0;
+    98→
+    99→  // sun
+   100→  private sun: THREE.DirectionalLight;
+   101→
+   102→  // AI rivals
+   103→  opponents: Opponent[] = [];
+   104→  private playerStartS = 0;
+   105→  private playerFinishMs: number | null = null;
+   106→  private standingsTimer = 0;
+   107→  private playerPos = 1;
+   108→  private lastStandingsKey = "";
+   109→  private lastBumpT = -10;
+   110→
+   111→  private telemetryListeners = new Set<(t: Telemetry) => void>();
+   112→  private tmpV = new THREE.Vector3();
+   113→  private tmpV2 = new THREE.Vector3();
+   114→  private disposed = false;
+   115→  private skidTimer = 0;
+   116→  private sparkTimer = 0;
+   117→  private boostTrailTimer = 0;
+   118→
+   119→  constructor(
+   120→    canvas: HTMLCanvasElement,
+   121→    audio: AudioSystem,
+   122→    input: InputManager,
+   123→    cbs: EngineCallbacks
+   124→  ) {
+   125→    this.audio = audio;
+   126→    this.input = input;
+   127→    this.cbs = cbs;
+   128→
+   129→    this.renderer = new THREE.WebGLRenderer({
+   130→      canvas,
+   131→      antialias: true,
+   132→      powerPreference: "high-performance",
+   133→    });
+   134→    const isMobile =
+   135→      typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches;
+   136→    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1.5 : 2));
+   137→    this.renderer.shadowMap.enabled = true;
+   138→    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+   139→    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+   140→    this.renderer.toneMappingExposure = 1.05;
+   141→    this.renderer.outputColorSpace = THREE.SRGBColorSpace;
+   142→
+   143→    this.camera = new THREE.PerspectiveCamera(66, 16 / 9, 0.3, 4200);
+   144→    // generous fog band — the road ahead must stay readable at racing speed
+   145→    this.scene.fog = new THREE.Fog(PALETTE.fog, 430, 1500);
+   146→
+   147→    // sky
+   148→    this.buildSky();
+   149→
+   150→    // lights
+   151→    const hemi = new THREE.HemisphereLight(0xffe9c9, 0xcaa06a, 0.8);
+   152→    this.scene.add(hemi);
+   153→    this.sun = new THREE.DirectionalLight(0xffd9a8, 1.8);
+   154→    this.sun.castShadow = !isMobile;
+   155→    this.sun.shadow.mapSize.set(isMobile ? 1024 : 2048, isMobile ? 1024 : 2048);
+   156→    const sc = this.sun.shadow.camera;
+   157→    sc.left = -95;
+   158→    sc.right = 95;
+   159→    sc.top = 95;
+   160→    sc.bottom = -95;
+   161→    sc.near = 20;
+   162→    sc.far = 420;
+   163→    this.sun.shadow.bias = -0.0006;
+   164→    this.sun.shadow.normalBias = 0.5;
+   165→    this.scene.add(this.sun);
+   166→    this.scene.add(this.sun.target);
+   167→
+   168→    // world
+   169→    this.track = new Track();
+   170→    this.scene.add(this.track.group);
+   171→    this.scene.add(this.particles.group);
+   172→    this.debris = new DebrisSystem(isMobile);
+   173→    this.scene.add(this.debris.group);
+   174→
+   175→    // cars
+   176→    this.car = new CarVisual(false);
+   177→    this.scene.add(this.car.group);
+   178→    this.ghostCar = new CarVisual(true);
+   179→    this.ghostCar.group.visible = false;
+   180→    this.scene.add(this.ghostCar.group);
+   181→
+   182→    // AI rivals (identical performance, different paint & skill)
+   183→    for (let i = 0; i < OPPONENTS.length; i++) {
+   184→      const op = new Opponent(OPPONENTS[i], this.track, OPPONENT_GRID_LAT[i]);
+   185→      // rival crate smashes shatter too (debris + a soft distant crack)
+   186→      op.boxHitHook = (box) => {
+   187→        const v = op.physics.vel;
+   188→        const sp = Math.hypot(v.x, v.z);
+   189→        const dirX = sp > 2 ? v.x / sp : 0;
+   190→        const dirZ = sp > 2 ? v.z / sp : 1;
+   191→        const power = clamp(6 + sp * 0.5, 7, 20);
+   192→        let n = 0;
+   193→        for (const b of this.track.boxes) {
+   194→          if (b.cluster !== box.cluster || (!b.active && b !== box)) continue;
+   195→          this.smashBox(b, dirX, dirZ, power, n * 0.045);
+   196→          n++;
+   197→        }
+   198→        const d = box.x - this.physics.pos.x;
+   199→        const dz = box.z - this.physics.pos.z;
+   200→        if (d * d + dz * dz < 70 * 70) {
+   201→          if (box.wall) this.audio.wallSmash();
+   202→          else this.audio.boxHit();
+   203→        }
+   204→      };
+   205→      this.scene.add(op.visual.group);
+   206→      this.opponents.push(op);
+   207→    }
+   208→    this.scatterOpponentsOnTrack();
+   209→
+   210→    this.physics = new CarPhysics(this.track, {
+   211→      onJump: () => this.audio.jump(),
+   212→      onLanding: (i, clean) => {
+   213→        this.audio.landing(clean, i);
+   214→        this.trauma = Math.min(1, this.trauma + 0.18 + i * 0.3);
+   215→        this.input.rumble(0.2 + i * 0.5, 120);
+   216→        this.dustBurst(6 + Math.round(i * 6));
+   217→      },
+   218→      onCleanLand: (at) => {
+   219→        gameStore.getState().pushPopup("cleanland", `CLEAN LANDING +${Math.round(Math.min(30, at * 16))}`);
+   220→      },
+   221→      onBigAir: (at) => {
+   222→        this.bigAirCount++;
+   223→        gameStore.getState().pushPopup("airtime", `BIG AIR ${at.toFixed(1)}s +${Math.round(Math.min(30, at * 16))}`);
+   224→      },
+   225→      onDriftBank: (mult) => {
+   226→        gameStore.getState().pushPopup("driftbank", `DRIFT CHAIN x${mult.toFixed(1)}`);
+   227→        this.audio.driftBank(mult);
+   228→      },
+   229→      onNearMiss: () => {
+   230→        gameStore.getState().pushPopup("nearmiss", "NEAR MISS +9");
+   231→        this.audio.nearMiss();
+   232→        this.trauma = Math.min(1, this.trauma + 0.08);
+   233→      },
+   234→      onWallRideStart: () => {
+   235→        gameStore.getState().pushPopup("wallride", "WALL RIDE +");
+   236→      },
+   237→      onCrash: (i) => {
+   238→        this.audio.crash(i);
+   239→        this.trauma = Math.min(1, this.trauma + 0.25 + i * 0.45);
+   240→        this.input.rumble(0.4 + i * 0.6, 200);
+   241→        const p = this.physics.pos;
+   242→        this.particles.emitSparks(p.x, p.y, p.z, -Math.sin(this.physics.yaw), -Math.cos(this.physics.yaw), 8 + Math.round(i * 10));
+   243→      },
+   244→      onBoostStart: () => {
+   245→        this.audio.boostStart();
+   246→        this.input.rumble(0.25, 90);
+   247→      },
+   248→      onBoxHit: (box) => {
+   249→        // the whole stack / barricade shatters — chain-break every piece of
+   250→        // the cluster, with a tiny stagger so the break ripples outward
+   251→        const v = this.physics.vel;
+   252→        const sp = Math.hypot(v.x, v.z);
+   253→        const dirX = sp > 2 ? v.x / sp : Math.sin(this.physics.yaw);
+   254→        const dirZ = sp > 2 ? v.z / sp : Math.cos(this.physics.yaw);
+   255→        const power = clamp(6 + sp * 0.55, 7, 24);
+   256→        let n = 0;
+   257→        for (const b of this.track.boxes) {
+   258→          if (b.cluster !== box.cluster || (!b.active && b !== box)) continue;
+   259→          this.smashBox(b, dirX, dirZ, power, n * 0.045);
+   260→          n++;
+   261→        }
+   262→        if (box.wall) {
+   263→          this.audio.wallSmash();
+   264→          this.trauma = Math.min(1, this.trauma + 0.38);
+   265→          this.input.rumble(0.55, 240);
+   266→          const add = Math.round(15 * this.physics.boostScale);
+   267→          this.physics.boostMeter = clamp(this.physics.boostMeter + add, 0, 100);
+   268→          gameStore.getState().pushPopup("smash", `BREAK THROUGH! +${add}`);
+   269→        } else {
+   270→          this.audio.boxHit();
+   271→          this.trauma = Math.min(1, this.trauma + 0.16);
+   272→          this.input.rumble(0.3, 130);
+   273→          if (n > 1) {
+   274→            const add = Math.round(6 * this.physics.boostScale);
+   275→            this.physics.boostMeter = clamp(this.physics.boostMeter + add, 0, 100);
+   276→            gameStore.getState().pushPopup("smash", `CRATES SMASHED +${add}`);
+   277→          }
+   278→        }
+   279→      },
+   280→      requestRecovery: () => this.startRecovery(),
+   281→    });
+   282→
+   283→    this.loadBest();
+   284→    this.physics.place(this.track.N - 10, 0, 0);
+   285→    this.syncCarVisual(0.016);
+   286→    this.updateSun();
+   287→
+   288→    this.resize();
+   289→    // prewarm every shader while the loading overlay is still up — the first
+   290→    // real frame then paints instantly instead of hitching on compilation
+   291→    this.renderer.compile(this.scene, this.camera);
+   292→    this.lastT = performance.now();
+   293→    this.loop();
+   294→  }
+   295→
+   296→  // ============================================================
+   297→  // setup helpers
+   298→  // ============================================================
+   299→
+   300→  private buildSky() {
+   301→    const geo = new THREE.SphereGeometry(3900, 32, 16);
+   302→    const mat = new THREE.ShaderMaterial({
+   303→      side: THREE.BackSide,
+   304→      depthWrite: false,
+   305→      fog: false,
+   306→      uniforms: {
+   307→        uZen: { value: new THREE.Color(PALETTE.skyZenith) },
+   308→        uMid: { value: new THREE.Color(PALETTE.skyMid) },
+   309→        uHor: { value: new THREE.Color(PALETTE.skyHorizon) },
+   310→        uSun: { value: SUN_DIR.clone() },
+   311→      },
+   312→      vertexShader: `
+   313→        varying vec3 vW;
+   314→        void main() {
+   315→          vW = (modelMatrix * vec4(position, 1.0)).xyz;
+   316→          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+   317→        }
+   318→      `,
+   319→      fragmentShader: `
+   320→        uniform vec3 uZen; uniform vec3 uMid; uniform vec3 uHor; uniform vec3 uSun;
+   321→        varying vec3 vW;
+   322→        void main() {
+   323→          vec3 d = normalize(vW);
+   324→          float h = d.y;
+   325→          vec3 col = h > 0.16 ? mix(uMid, uZen, smoothstep(0.16, 0.6, h))
+   326→                              : mix(uHor, uMid, smoothstep(-0.06, 0.16, h));
+   327→          float sd = max(dot(d, uSun), 0.0);
+   328→          col += vec3(1.0, 0.88, 0.62) * (pow(sd, 900.0) * 1.2 + pow(sd, 16.0) * 0.3 + pow(sd, 4.0) * 0.1);
+   329→          gl_FragColor = vec4(col, 1.0);
+   330→        }
+   331→      `,
+   332→    });
+   333→    const sky = new THREE.Mesh(geo, mat);
+   334→    sky.frustumCulled = false;
+   335→    this.scene.add(sky);
+   336→  }
+   337→
+   338→  private loadBest() {
+   339→    try {
+   340→      const raw = localStorage.getItem("canyonrush.best.v1");
+   341→      if (raw) {
+   342→        const d = JSON.parse(raw) as {
+   343→          totalMs: number;
+   344→          bestLapMs: number;
+   345→          splits: number[];
+   346→          laps: number;
+   347→        };
+   348→        this.bestTotalMs = d.totalMs;
+   349→        this.bestLapMs = d.bestLapMs;
+   350→        this.bestSplits = d.splits ?? [];
+   351→      }
+   352→      const graw = localStorage.getItem(GHOST_KEY);
+   353→      if (graw) this.ghost = JSON.parse(graw) as GhostFrame[];
+   354→    } catch {
+   355→      /* ignore */
+   356→    }
+   357→  }
+   358→
+   359→  // ============================================================
+   360→  // public control API
+   361→  // ============================================================
+   362→
+   363→  onTelemetry(fn: (t: Telemetry) => void): () => void {
+   364→    this.telemetryListeners.add(fn);
+   365→    return () => this.telemetryListeners.delete(fn);
+   366→  }
+   367→
+   368→  applySettings(s: GameSettings) {
+   369→    const prevShadows = this.settings.shadows;
+   370→    this.settings = { ...s };
+   371→    // HARD strips the safety net — no auto-correct, no anti-spin
+   372→    this.physics.assist = s.difficulty === "hard" ? false : s.assist;
+   373→    this.particles.setHighDensity(s.highParticles);
+   374→    this.debris.setHighDensity(s.highParticles);
+   375→    this.audio.setVolumes(s.musicVol, s.sfxVol);
+   376→    this.input.setMouseSteer(s.mouseSteer);
+   377→    // difficulty: crate traffic, rival pace/brain, boost economy
+   378→    const diff = DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
+   379→    this.track.setActiveStacks(diff.stacks);
+   380→    this.physics.boostScale = diff.boostGain;
+   381→    for (const op of this.opponents) {
+   382→      op.brain = {
+   383→        skillScale: diff.aiSkill,
+   384→        mistakeEvery: diff.aiMistakeEvery,
+   385→        rubberAhead: diff.rubberAhead,
+   386→        rubberBehind: diff.rubberBehind,
+   387→        boostAggro: diff.aiBoostAggro,
+   388→        blocking: diff.blocking,
+   389→      };
+   390→      op.physics.speedCapScale = diff.aiSpeedCap;
+   391→    }
+   392→    if (prevShadows !== s.shadows) {
+   393→      this.renderer.shadowMap.enabled = s.shadows;
+   394→      this.sun.castShadow = s.shadows;
+   395→      this.scene.traverse((o) => {
+   396→        const mesh = o as THREE.Mesh;
+   397→        if (mesh.isMesh) {
+   398→          const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+   399→          for (const m of mats) (m as THREE.Material).needsUpdate = true;
+   400→        }
+   401→      });
+   402→    }
+   403→  }
+   404→
+   405→  startRace(laps: number) {
+   406→    this.totalLaps = laps;
+   407→    this.loadBest();
+   408→    this.lapsDone = 0;
+   409→    this.raceTime = 0;
+   410→    this.lapStart = 0;
+   411→    this.splits = [];
+   412→    this.lapTimes = [];
+   413→    this.bigAirCount = 0;
+   414→    this.physics.boostMeter = (DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium)
+   415→      .startBoost;
+   416→    this.physics.driftScore = 0;
+   417→    this.physics.nearMisses = 0;
+   418→    this.physics.topSpeed = 0;
+   419→    this.placeRaceGrid();
+   420→    // fresh crates for the new race (respecting the difficulty limit)
+   421→    this.track.setActiveStacks((DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium).stacks);
+   422→    this.particles.clearSkids(this.time);
+   423→    this.ghostRec = [];
+   424→    this.ghostRecT = 0;
+   425→    this.ghostCar.group.visible = this.ghost.length > 0;
+   426→    this.countdownT = 3;
+   427→    this.countdownShown = -99;
+   428→    this.recoverT = 0;
+   429→    this.wallWarned.clear();
+   430→    this.lineAbs = this.track.length; // first line crossing = one length from spawn
+   431→    this.nextGateK = 0;
+   432→    this.nextGateAbs = this.gateAbs(0);
+   433→    this.playerFinishMs = null;
+   434→    this.lastStandingsKey = "";
+   435→    this.pushStandings(true);
+   436→    this.setPhase("countdown");
+   437→    this.audio.startMusic();
+   438→  }
+   439→
+   440→  /** 2×2 start grid — two rivals on the front row, one alongside the player. */
+   441→  private placeRaceGrid() {
+   442→    const t = this.track;
+   443→    this.physics.place(t.N - 15, 2.6, 0);
+   444→    this.playerStartS = this.physics.progressS;
+   445→    for (let i = 0; i < this.opponents.length; i++) {
+   446→      const idx = i < 2 ? t.N - 8 : t.N - 15;
+   447→      this.opponents[i].place(idx, OPPONENT_GRID_LAT[i], 0);
+   448→    }
+   449→    this.syncCarVisual(0.016);
+   450→  }
+   451→
+   452→  /** Drop the rivals around the loop so the title flyover feels alive. */
+   453→  private scatterOpponentsOnTrack() {
+   454→    const t = this.track;
+   455→    for (let i = 0; i < this.opponents.length; i++) {
+   456→      this.opponents[i].place(
+   457→        wrapI(t.N - 40 - i * 110, t.N),
+   458→        (i % 2 === 0 ? -1 : 1) * 2.2,
+   459→        22
+   460→      );
+   461→    }
+   462→  }
+   463→
+   464→  restart() {
+   465→    if (this.phase === "countdown" || this.phase === "racing" || this.phase === "finished") {
+   466→      this.startRace(this.totalLaps);
+   467→    }
+   468→  }
+   469→
+   470→  toTitle() {
+   471→    this.setPhase("title");
+   472→    this.physics.place(this.track.N - 10, 0, 0);
+   473→    this.ghostCar.group.visible = false;
+   474→    this.scatterOpponentsOnTrack();
+   475→    gameStore.getState().setStandings([]);
+   476→  }
+   477→
+   478→  setPaused(v: boolean) {
+   479→    this.paused = v;
+   480→    this.audio.setDucked(v);
+   481→  }
+   482→
+   483→  /** Self-test helpers: deterministic stepping decoupled from rAF. */
+   484→  debugSelftestActive = false;
+   485→
+   486→  debugSkipCountdown() {
+   487→    this.countdownT = 0;
+   488→    this.countdownShown = 0;
+   489→    this.setPhase("racing");
+   490→    this.raceTime = 0;
+   491→    this.lapStart = 0;
+   492→  }
+   493→
+   494→  debugStep(input: DriveInput, dt = 1 / 60) {
+   495→    this.updateRacing(dt, input);
+   496→    this.syncCarVisual(dt);
+   497→  }
+   498→
+   499→  private setPhase(p: GamePhase) {
+   500→    this.phase = p;
+   501→    this.cbs.onPhaseChange(p);
+   502→  }
+   503→
+   504→  dispose() {
+   505→    this.disposed = true;
+   506→    cancelAnimationFrame(this.raf);
+   507→    this.track.dispose();
+   508→    this.car.dispose();
+   509→    this.ghostCar.dispose();
+   510→    for (const op of this.opponents) op.dispose();
+   511→    this.particles.dispose();
+   512→    this.debris.dispose();
+   513→    this.renderer.dispose();
+   514→  }
+   515→
+   516→  resize() {
+   517→    const canvas = this.renderer.domElement;
+   518→    const w = canvas.clientWidth || window.innerWidth;
+   519→    const h = canvas.clientHeight || window.innerHeight;
+   520→    this.renderer.setSize(w, h, false);
+   521→    this.camera.aspect = w / h;
+   522→    this.camera.updateProjectionMatrix();
+   523→  }
+   524→
+   525→  // ============================================================
+   526→  // main loop
+   527→  // ============================================================
+   528→
+   529→  private loop = () => {
+   530→    if (this.disposed) return;
+   531→    this.raf = requestAnimationFrame(this.loop);
+   532→    if (this.debugSelftestActive) return; // selftest drives physics deterministically
+   533→    const now = performance.now();
+   534→    let dt = (now - this.lastT) / 1000;
+   535→    this.lastT = now;
+   536→    dt = clamp(dt, 0.0005, 1 / 30);
+   537→    if (this.paused) dt = 0;
+   538→
+   539→    this.time += dt;
+   540→
+   541→    const input = this.input.sample(Math.max(dt, 0.0001));
+   542→    this.curInput = input;
+   543→    // longitudinal accel estimate for body pitch
+   544→    const sp = this.physics.speed;
+   545→    if (dt > 0.0001) {
+   546→      this.lastAccel = damp(this.lastAccel, (sp - this.prevSpeed) / dt, 6, dt);
+   547→    }
+   548→    this.prevSpeed = sp;
+   549→    this.noteInput(input.steer, input.brake, this.lastAccel);
+   550→
+   551→    if (this.phase === "countdown") this.updateCountdown(dt);
+   552→    else if (this.phase === "racing") this.updateRacing(dt, input);
+   553→    else if (this.phase === "finished") this.updateFinished(dt);
+   554→    else this.updateTitle(dt);
+   555→
+   556→    if (this.recoverT > 0) this.recoverT -= dt;
+   557→
+   558→    this.updateCamera(dt);
+   559→    this.updateSun();
+   560→    this.particles.update(dt, this.time);
+   561→    this.debris.update(dt);
+   562→    this.updateGateGlow();
+   563→    this.updateWallFx();
+   564→    this.track.updateBoxes(this.time * 1000); // smashed crates come back
+   565→    this.emitTelemetry();
+   566→
+   567→    // audio
+   568→    const { rpm } = this.physics.gearAndRpm();
+   569→    const intensity =
+   570→      this.phase === "title"
+   571→        ? 0
+   572→        : this.phase === "countdown"
+   573→          ? 1
+   574→          : this.phase === "finished"
+   575→            ? 1
+   576→            : clamp(1 + (this.physics.speed > 26 ? 1 : 0) + (this.physics.boosting || this.physics.boostMeter > 82 ? 1 : 0), 0, 3);
+   577→    this.audio.update(dt, {
+   578→      rpm:
+   579→        this.phase === "countdown"
+   580→          ? 0.25 + input.throttle * 0.55
+   581→          : this.phase === "racing" || this.phase === "finished"
+   582→            ? rpm
+   583→            : 0.22,
+   584→      throttle: this.phase === "racing" ? input.throttle : this.phase === "countdown" ? input.throttle * 0.7 : 0,
+   585→      speed: this.physics.speed,
+   586→      driftIntensity: this.physics.drifting ? clamp(Math.abs(this.physics.slip) / 0.5, 0, 1) : 0,
+   587→      boosting: this.physics.boosting && this.phase === "racing",
+   588→      wallRide: this.physics.wallRiding,
+   589→      musicIntensity: intensity,
+   590→    });
+   591→
+   592→    // render directly to the canvas — keeps MSAA + tone mapping crisp
+   593→    this.renderer.render(this.scene, this.camera);
+   594→  };
+   595→
+   596→  private updateCountdown(dt: number) {
+   597→    this.countdownT -= dt;
+   598→    const v = Math.ceil(this.countdownT);
+   599→    if (v !== this.countdownShown && v >= 0) {
+   600→      this.countdownShown = v;
+   601→      this.cbs.onCountdown(v);
+   602→      this.audio.countdownBeep(v === 0);
+   603→    }
+   604→    if (this.countdownT <= 0) {
+   605→      this.setPhase("racing");
+   606→      this.raceTime = 0;
+   607→      this.lapStart = 0;
+   608→    }
+   609→  }
+   610→
+   611→  private updateRacing(dt: number, input: DriveInput) {
+   612→    if (this.recoverT > 0) {
+   613→      // player frozen briefly after recovery — the field keeps racing
+   614→      this.updateOpponents(dt, "race");
+   615→      this.resolveCarCollisions();
+   616→      return;
+   617→    }
+   618→    const prevS = this.physics.progressS;
+   619→    this.physics.update(input, dt);
+   620→    this.raceTime += dt * 1000;
+   621→    this.updateOpponents(dt, "race");
+   622→    this.resolveCarCollisions();
+   623→    this.updateStandings(dt);
+   624→    this.syncCarVisual(dt);
+   625→    this.emitEffects(dt);
+   626→    this.recordGhost(dt);
+   627→    this.playGhost();
+   628→    this.checkGates(prevS);
+   629→    // wrong-way popup (throttled)
+   630→    if (this.physics.wrongWay && this.time - this.lastWrongWayPopup > 2.5) {
+   631→      this.lastWrongWayPopup = this.time;
+   632→      gameStore.getState().pushPopup("wrongway", "WRONG WAY!");
+   633→    }
+   634→  }
+   635→
+   636→  private lastWrongWayPopup = -10;
+   637→
+   638→  private updateFinished(dt: number) {
+   639→    this.physics.update({ steer: 0, throttle: 0, brake: 0.25, handbrake: false, boost: false }, dt);
+   640→    this.raceTime += dt * 1000; // clock keeps running so the AI field can finish
+   641→    this.updateOpponents(dt, "race");
+   642→    this.resolveCarCollisions();
+   643→    this.updateStandings(dt);
+   644→    this.syncCarVisual(dt);
+   645→    this.finishOrbitT += dt;
+   646→  }
+   647→
+   648→  private updateTitle(dt: number) {
+   649→    this.titleCamS += dt * 15;
+   650→    const t = this.track;
+   651→    const idx = Math.floor(this.titleCamS / t.step) % t.N;
+   652→    const s = t.sample(idx);
+   653→    const ahead = t.sample(idx + 22);
+   654→    this.camPos.set(
+   655→      s.x + s.rx * Math.sin(this.titleCamS * 0.05) * 6,
+   656→      s.y + 10 + Math.sin(this.titleCamS * 0.03) * 2.5,
+   657→      s.z + s.rz * Math.sin(this.titleCamS * 0.05) * 6
+   658→    );
+   659→    this.camLook.set(ahead.x, ahead.y + 5, ahead.z);
+   660→    this.camera.position.copy(this.camPos);
+   661→    this.camera.up.set(0, 1, 0);
+   662→    this.camera.lookAt(this.camLook);
+   663→    this.camera.fov = damp(this.camera.fov, 62, 2, dt);
+   664→    this.camera.updateProjectionMatrix();
+   665→    this.syncCarVisual(dt);
+   666→    this.updateOpponents(dt, "cruise");
+   667→  }
+   668→
+   669→  // ============================================================
+   670→  // racing internals
+   671→  // ============================================================
+   672→
+   673→  private gateAbs(k: number): number {
+   674→    const t = this.track;
+   675→    const gate = t.gates[k];
+   676→    if (!gate) return Infinity;
+   677→    return this.lineAbs + (gate.isFinish ? t.length : gate.idx * t.step);
+   678→  }
+   679→
+   680→  private checkGates(prevS: number) {
+   681→    const t = this.track;
+   682→    while (this.physics.progressS >= this.nextGateAbs) {
+   683→      const gate = t.gates[this.nextGateK];
+   684→      if (!gate) break;
+   685→      const latOk = Math.abs(this.physics.lateral) < t.sample(gate.idx).hw + 10;
+   686→      const prevOk = prevS <= this.nextGateAbs + 1;
+   687→      if (!latOk || !prevOk) break;
+   688→      if (gate.isFinish) {
+   689→        this.completeLap();
+   690→      } else {
+   691→        const lapMs = this.raceTime - this.lapStart;
+   692→        this.splits.push(lapMs);
+   693→        const best = this.bestSplits[this.splits.length - 1];
+   694→        const delta = best != null ? lapMs - best : null;
+   695→        gameStore.getState().pushPopup("checkpoint", `CHECKPOINT ${this.splits.length}`, { deltaMs: delta ?? undefined });
+   696→        // HARD trims the checkpoint top-up along with every other boost gain
+   697→        this.physics.boostMeter = clamp(
+   698→          this.physics.boostMeter + 12 * this.physics.boostScale,
+   699→          0,
+   700→          100
+   701→        );
+   702→        this.audio.checkpoint(delta);
+   703→        this.nextGateK++;
+   704→        this.nextGateAbs = this.gateAbs(this.nextGateK);
+   705→      }
+   706→    }
+   707→  }
+   708→
+   709→  private completeLap() {
+   710→    const lapMs = this.raceTime - this.lapStart;
+   711→    this.lapTimes.push(lapMs);
+   712→    const lapIsBest = this.bestLapMs == null || lapMs < this.bestLapMs;
+   713→    if (lapIsBest) {
+   714→      this.bestLapMs = lapMs;
+   715→      if (this.ghostRec.length > 10) this.ghost = this.ghostRec;
+   716→    }
+   717→    this.lapsDone++;
+   718→    const store = gameStore.getState();
+   719→    if (this.lapsDone >= this.totalLaps) {
+   720→      // ---- finish ----
+   721→      const totalMs = this.raceTime;
+   722→      const bestLap = Math.min(...this.lapTimes);
+   723→      const isNewRecord = this.bestTotalMs == null || totalMs < this.bestTotalMs;
+   724→      if (isNewRecord) {
+   725→        this.bestTotalMs = totalMs;
+   726→        this.bestSplits = [...this.splits];
+   727→      }
+   728→      try {
+   729→        localStorage.setItem(
+   730→          "canyonrush.best.v1",
+   731→          JSON.stringify({
+   732→            totalMs: this.bestTotalMs,
+   733→            bestLapMs: this.bestLapMs,
+   734→            splits: this.bestSplits,
+   735→            laps: this.totalLaps,
+   736→          })
+   737→        );
+   738→        if (this.ghost.length > 10) {
+   739→          localStorage.setItem(GHOST_KEY, JSON.stringify(this.ghost));
+   740→        }
+   741→      } catch {
+   742→        /* ignore */
+   743→      }
+   744→      if (isNewRecord) {
+   745→        store.saveBest({ totalMs, bestLapMs: this.bestLapMs, splits: this.bestSplits, laps: this.totalLaps });
+   746→        store.pushPopup("newrecord", "NEW RECORD!");
+   747→      }
+   748→      this.audio.finish(isNewRecord);
+   749→      this.playerFinishMs = totalMs;
+   750→      this.pushStandings(true);
+   751→      const position = this.playerPos;
+   752→      this.setPhase("finished");
+   753→      this.finishOrbitT = 0;
+   754→      this.ghostCar.group.visible = false;
+   755→      // CRITICAL: advance past the finish gate so checkGates' while-loop
+   756→      // terminates instead of re-triggering completeLap forever (tab freeze)
+   757→      this.nextGateK = this.track.gates.length;
+   758→      this.nextGateAbs = Infinity;
+   759→      this.cbs.onFinish({
+   760→        totalMs,
+   761→        bestLapMs: bestLap,
+   762→        topSpeedKmh: Math.round(this.physics.topSpeed),
+   763→        driftScore: Math.round(this.physics.driftScore),
+   764→        nearMisses: this.physics.nearMisses,
+   765→        bigAirCount: this.bigAirCount,
+   766→        laps: this.totalLaps,
+   767→        isNewRecord,
+   768→        splits: [...this.splits],
+   769→        position,
+   770→        totalCars: 1 + this.opponents.length,
+   771→      });
+   772→      return;
+   773→    }
+   774→    // lap complete, more to go
+   775→    store.pushPopup("lap", `LAP ${this.lapsDone}/${this.totalLaps} — ${fmt(lapMs)}`);
+   776→    this.audio.checkpoint(-1);
+   777→    this.lapStart = this.raceTime;
+   778→    this.lineAbs += this.track.length;
+   779→    this.nextGateK = 0;
+   780→    this.nextGateAbs = this.gateAbs(0);
+   781→    this.ghostRec = [];
+   782→    this.ghostRecT = 0;
+   783→    this.ghostCar.group.visible = this.ghost.length > 0;
+   784→  }
+   785→
+   786→  private startRecovery() {
+   787→    if (this.recoverT > 0 || this.phase !== "racing") return;
+   788→    this.recoverT = 0.85;
+   789→    this.audio.recovery();
+   790→    gameStore.getState().pushPopup("recovery", "RECOVERED — HOLD YOUR LINE!");
+   791→    const t = this.track;
+   792→    if (this.nextGateK > 0) {
+   793→      const gate = t.gates[this.nextGateK - 1];
+   794→      const idx = wrapI(gate.idx + 4, t.N);
+   795→      const baseS = this.lineAbs + gate.idx * t.step;
+   796→      this.physics.place(idx, 0, 13, false);
+   797→      this.physics.syncProgress(baseS + 4 * t.step);
+   798→    } else {
+   799→      // no gate passed yet this lap → back to the lap start line
+   800→      this.physics.place(t.N - 10, 0, 13, false);
+   801→      this.physics.syncProgress(this.lineAbs - 20);
+   802→    }
+   803→    this.syncCarVisual(0.016);
+   804→    this.trauma = Math.min(1, this.trauma + 0.3);
+   805→  }
+   806→
+   807→  // ============================================================
+   808→  // opponents & standings
+   809→  // ============================================================
+   810→
+   811→  private updateOpponents(dt: number, mode: "race" | "cruise") {
+   812→    const ctx = {
+   813→      playerDist: this.physics.progressS - this.playerStartS,
+   814→      playerLat: this.physics.lateral,
+   815→    };
+   816→    const raceLen = this.totalLaps * this.track.length;
+   817→    for (const op of this.opponents) {
+   818→      const inp = opponentInput(op, this.track, ctx, dt, mode);
+   819→      op.update(inp, dt);
+   820→      if (mode === "race" && op.finishMs == null && op.raceDist >= raceLen) {
+   821→        op.finishMs = this.raceTime;
+   822→      }
+   823→    }
+   824→  }
+   825→
+   826→  /** Soft sphere collisions between all cars (player + rivals). */
+   827→  private resolveCarCollisions() {
+   828→    const cars: CarPhysics[] = [this.physics];
+   829→    for (const op of this.opponents) cars.push(op.physics);
+   830→    const R = 2.55;
+   831→    const R2 = R * R;
+   832→    for (let i = 0; i < cars.length; i++) {
+   833→      for (let j = i + 1; j < cars.length; j++) {
+   834→        const a = cars[i];
+   835→        const b = cars[j];
+   836→        if (Math.abs(a.pos.y - b.pos.y) > 2.2) continue;
+   837→        const dx = b.pos.x - a.pos.x;
+   838→        const dz = b.pos.z - a.pos.z;
+   839→        const d2 = dx * dx + dz * dz;
+   840→        if (d2 >= R2 || d2 < 1e-6) continue;
+   841→        const d = Math.sqrt(d2);
+   842→        const nx = dx / d;
+   843→        const nz = dz / d;
+   844→        const pen = (R - d) * 0.5;
+   845→        a.pos.x -= nx * pen;
+   846→        a.pos.z -= nz * pen;
+   847→        b.pos.x += nx * pen;
+   848→        b.pos.z += nz * pen;
+   849→        const rvx = b.vel.x - a.vel.x;
+   850→        const rvz = b.vel.z - a.vel.z;
+   851→        const vn = rvx * nx + rvz * nz;
+   852→        if (vn < 0) {
+   853→          // equal-mass bump with a bit of bounce
+   854→          const imp = -vn * 0.7;
+   855→          a.vel.x -= nx * imp;
+   856→          a.vel.z -= nz * imp;
+   857→          b.vel.x += nx * imp;
+   858→          b.vel.z += nz * imp;
+   859→          if ((a.isPlayer || b.isPlayer) && -vn > 4.5 && this.time - this.lastBumpT > 0.6) {
+   860→            this.lastBumpT = this.time;
+   861→            const impact = -vn;
+   862→            this.audio.crash(clamp(impact / 26, 0.12, 0.45));
+   863→            this.trauma = Math.min(1, this.trauma + 0.1 + impact * 0.012);
+   864→            this.input.rumble(clamp(impact / 20, 0.15, 0.6), 110);
+   865→          }
+   866→        }
+   867→      }
+   868→    }
+   869→  }
+   870→
+   871→  private updateStandings(dt: number) {
+   872→    this.standingsTimer -= dt;
+   873→    if (this.standingsTimer > 0) return;
+   874→    this.standingsTimer = 0.35;
+   875→    this.pushStandings(false);
+   876→  }
+   877→
+   878→  /** Current race order (finished cars first, then track position). */
+   879→  getStandings(): StandingEntry[] {
+   880→    const raw = [
+   881→      {
+   882→        name: "YOU",
+   883→        isPlayer: true,
+   884→        color: "#f0641e",
+   885→        s: this.physics.progressS,
+   886→        finishMs: this.playerFinishMs,
+   887→      },
+   888→      ...this.opponents.map((op) => ({
+   889→        name: op.def.name,
+   890→        isPlayer: false,
+   891→        color: op.def.cssColor,
+   892→        s: op.physics.progressS,
+   893→        finishMs: op.finishMs,
+   894→      })),
+   895→    ];
+   896→    raw.sort((x, y) => {
+   897→      if (x.finishMs != null && y.finishMs != null) return x.finishMs - y.finishMs;
+   898→      if (x.finishMs != null) return -1;
+   899→      if (y.finishMs != null) return 1;
+   900→      return y.s - x.s;
+   901→    });
+   902→    return raw.map((e, i) => ({
+   903→      pos: i + 1,
+   904→      name: e.name,
+   905→      isPlayer: e.isPlayer,
+   906→      color: e.color,
+   907→      timeMs: e.finishMs,
+   908→    }));
+   909→  }
+   910→
+   911→  private pushStandings(force: boolean) {
+   912→    const standings = this.getStandings();
+   913→    this.playerPos = standings.findIndex((s) => s.isPlayer) + 1;
+   914→    const key = standings.map((s) => `${s.pos}${s.name}${s.timeMs ?? "?"}`).join("|");
+   915→    if (force || key !== this.lastStandingsKey) {
+   916→      this.lastStandingsKey = key;
+   917→      gameStore.getState().setStandings(standings);
+   918→    }
+   919→  }
+   920→
+   921→  // ============================================================
+   922→  // visuals sync & effects
+   923→  // ============================================================
+   924→
+   925→  /** Hide one crate/wall segment, schedule its respawn and spray wooden debris. */
+   926→  private smashBox(b: TrackBox, dirX: number, dirZ: number, power: number, delay: number) {
+   927→    b.active = false;
+   928→    b.mesh.visible = false;
+   929→    // barricades rebuild slowly — a smashed-open wall should read as GONE
+   930→    b.respawnAt = this.time * 1000 + (b.wall ? WALL_RESPAWN_MS : BOX_RESPAWN_MS);
+   931→    this.particles.emitShards(b.x, b.y, b.z, b.wall ? 9 : 7);
+   932→    const groundY = b.y - b.halfH - 0.05;
+   933→    if (b.wall) {
+   934→      this.debris.spawnWallBurst(b.x, b.y, b.z, groundY, dirX, dirZ, power, delay);
+   935→    } else {
+   936→      this.debris.spawnCrateBurst(b.x, b.y, b.z, groundY, dirX, dirZ, power, delay);
+   937→    }
+   938→  }
+   939→
+   940→  private syncCarVisual(dt: number) {
+   941→    const p = this.physics;
+   942→    const g = this.car.group;
+   943→    g.position.copy(p.pos);
+   944→    g.rotation.set(0, p.yaw, 0);
+   945→    // align to ground slope (continuous queries — no per-sample stepping)
+   946→    if (p.grounded) {
+   947→      const slopeL = this.track.slopeLatAtP(p.groundP, p.lateral);
+   948→      const slopeF = this.track.slopeFwdAtP(p.groundP, p.lateral);
+   949→      g.rotation.order = "YXZ";
+   950→      g.rotation.x = damp(g.rotation.x, clamp(-Math.atan(slopeF), -0.5, 0.5), 8, dt);
+   951→      g.rotation.z = damp(g.rotation.z, clamp(Math.atan(slopeL), -0.9, 0.9), 8, dt);
+   952→      if (p.wallRiding) {
+   953→        const side = this.track.sample(p.idx).wallRideR && p.lateral > 0 ? 1 : -1;
+   954→        g.rotation.z = damp(g.rotation.z, side * clamp(Math.atan(slopeL), -1.15, 1.15), 8, dt);
+   955→      }
+   956→    } else {
+   957→      g.rotation.order = "YXZ";
+   958→      g.rotation.x = damp(g.rotation.x, clamp(-p.vel.y * 0.02, -0.35, 0.35), 3, dt);
+   959→      g.rotation.z = damp(g.rotation.z, 0, 4, dt);
+   960→    }
+   961→    const { gear, rpm } = p.gearAndRpm();
+   962→    void gear;
+   963→    void rpm;
+   964→    this.car.update({
+   965→      speed: p.vel.x * Math.sin(p.yaw) + p.vel.z * Math.cos(p.yaw),
+   966→      steer: this.lastSteer,
+   967→      slip: p.drifting ? p.slip : 0,
+   968→      grounded: p.grounded,
+   969→      boosting: p.boosting,
+   970→      braking: this.lastBrake > 0.05,
+   971→      pitchRate: this.lastAccel,
+   972→      rollRate: p.drifting ? -p.slip * 12 : 0,
+   973→      dt,
+   974→    });
+   975→  }
+   976→
+   977→  private curInput: DriveInput = { steer: 0, throttle: 0, brake: 0, handbrake: false, boost: false };
+   978→  private lastSteer = 0;
+   979→  private lastBrake = 0;
+   980→  private lastAccel = 0;
+   981→  private prevSpeed = 0;
+   982→
+   983→  private emitEffects(dt: number) {
+   984→    const p = this.physics;
+   985→    const fwd = this.tmpV.set(Math.sin(p.yaw), 0, Math.cos(p.yaw));
+   986→    const right = this.tmpV2.set(-Math.cos(p.yaw), 0, Math.sin(p.yaw));
+   987→
+   988→    const speedH = p.speed;
+   989→
+   990→    if (p.grounded) {
+   991→      // drift smoke + skids
+   992→      if (p.drifting && speedH > 8) {
+   993→        const q = clamp(Math.abs(p.slip) / 0.5, 0.2, 1);
+   994→        for (const side of [-1, 1]) {
+   995→          const wx = p.pos.x - fwd.x * 1.25 + right.x * side * 0.85;
+   996→          const wz = p.pos.z - fwd.z * 1.25 + right.z * side * 0.85;
+   997→          const wy = p.pos.y;
+   998→          this.particles.emitSmoke(wx, wy, wz, q);
+   999→        }
+  1000→        this.skidTimer -= dt;
+  1001→        if (this.skidTimer <= 0) {
+  1002→          this.skidTimer = 0.03;
+  1003→          const vx = p.vel.x / Math.max(1, speedH);
+  1004→          const vz = p.vel.z / Math.max(1, speedH);
+  1005→          for (const side of [-1, 1]) {
+  1006→            const wx = p.pos.x - fwd.x * 1.25 + right.x * side * 0.85;
+  1007→            const wz = p.pos.z - fwd.z * 1.25 + right.z * side * 0.85;
+  1008→            this.particles.emitSkid(wx, p.pos.y, wz, vx, vz, clamp(Math.abs(p.slip) * 2, 0.3, 1), this.time);
+  1009→          }
+  1010→        }
+  1011→      }
+  1012→      // off-road dust
+  1013→      if (p.offRoad && speedH > 9) {
+  1014→        this.particles.emitDust(
+  1015→          p.pos.x - fwd.x * 1.4, p.pos.y, p.pos.z - fwd.z * 1.4,
+  1016→          clamp(speedH / 30, 0.3, 1.2), p.vel.x, p.vel.z
+  1017→        );
+  1018→      }
+  1019→      // wall-ride sparks
+  1020→      if (p.wallRiding) {
+  1021→        this.sparkTimer -= dt;
+  1022→        if (this.sparkTimer <= 0) {
+  1023→          this.sparkTimer = 0.06;
+  1024→          const side = p.lateral > 0 ? 1 : -1;
+  1025→          this.particles.emitSparks(
+  1026→            p.pos.x + right.x * side * 1.1, p.pos.y + 0.2, p.pos.z + right.z * side * 1.1,
+  1027→            -right.x * side, -right.z * side, 3
+  1028→          );
+  1029→        }
+  1030→      }
+  1031→    }
+  1032→    // boost trail
+  1033→    if (p.boosting) {
+  1034→      this.boostTrailTimer -= dt;
+  1035→      if (this.boostTrailTimer <= 0) {
+  1036→        this.boostTrailTimer = 0.02;
+  1037→        this.particles.emitBoost(p.pos.x - fwd.x * 2.0, p.pos.y + 0.45, p.pos.z - fwd.z * 2.0, -fwd.x, -fwd.z);
+  1038→      }
+  1039→    }
+  1040→  }
+  1041→
+  1042→  private dustBurst(n: number) {
+  1043→    const p = this.physics;
+  1044→    for (let i = 0; i < n; i++) {
+  1045→      this.particles.emitDust(
+  1046→        p.pos.x + (Math.random() - 0.5) * 2, p.pos.y + 0.1, p.pos.z + (Math.random() - 0.5) * 2,
+  1047→        1.4, p.vel.x, p.vel.z
+  1048→      );
+  1049→    }
+  1050→  }
+  1051→
+  1052→  private updateGateGlow() {
+  1053→    const t = this.track;
+  1054→    for (let k = 0; k < t.gates.length; k++) {
+  1055→      const g = t.gates[k];
+  1056→      if (!g.glow) continue;
+  1057→      const isNext = this.phase === "racing" && k === this.nextGateK;
+  1058→      const passed = this.phase === "racing" && k < this.nextGateK;
+  1059→      if (isNext) {
+  1060→        g.glow.emissiveIntensity = 1.6 + Math.sin(this.time * 5) * 0.6;
+  1061→      } else {
+  1062→        g.glow.emissiveIntensity = passed ? 0.5 : 1.1;
+  1063→      }
+  1064→    }
+  1065→  }
+  1066→
+  1067→  /** BREAK-wall theatre: pulse the amber glow strips + beacons, sync them
+  1068→   *  with the wall's live state, and warn the rider (alarm + popup) as they
+  1069→   *  charge toward an intact barricade. */
+  1070→  private wallWarned = new Set<number>();
+  1071→
+  1072→  private updateWallFx() {
+  1073→    const t = this.track;
+  1074→    for (let i = 0; i < t.wallGlowMats.length; i++) {
+  1075→      const pulse = 0.5 + 0.5 * Math.sin(this.time * 5 + i * 1.7);
+  1076→      t.wallGlowMats[i].opacity = 0.45 + 0.55 * pulse;
+  1077→    }
+  1078→    for (const w of t.breakWalls) {
+  1079→      const standing = w.firstBox.active;
+  1080→      w.glow.visible = standing;
+  1081→      if (this.phase !== "racing") continue;
+  1082→      // signed distance ahead of the player (samples → meters)
+  1083→      let d = w.idx - this.physics.idx;
+  1084→      if (d < -t.N / 2) d += t.N;
+  1085→      else if (d > t.N / 2) d -= t.N;
+  1086→      const dist = d * t.step;
+  1087→      if (standing && dist > 8 && dist < 80) {
+  1088→        if (!this.wallWarned.has(w.cluster)) {
+  1089→          this.wallWarned.add(w.cluster);
+  1090→          this.audio.wallWarn();
+  1091→          gameStore.getState().pushPopup("smash", "BREAK WALL AHEAD — SMASH IT!");
+  1092→        }
+  1093→      } else if (dist <= 8 || dist > 120) {
+  1094→        // passed through (or broke it) → re-arm for the next approach
+  1095→        this.wallWarned.delete(w.cluster);
+  1096→      }
+  1097→    }
+  1098→  }
+  1099→
+  1100→  // ============================================================
+  1101→  // ghost
+  1102→  // ============================================================
+  1103→
+  1104→  private recordGhost(dt: number) {
+  1105→    this.ghostRecT += dt;
+  1106→    if (this.ghostRecT >= 0.05) {
+  1107→      this.ghostRecT = 0;
+  1108→      const p = this.physics;
+  1109→      this.ghostRec.push({ t: this.raceTime, x: p.pos.x, y: p.pos.y, z: p.pos.z, yaw: p.yaw });
+  1110→      if (this.ghostRec.length > 4000) this.ghostRec.shift();
+  1111→    }
+  1112→  }
+  1113→
+  1114→  private playGhost() {
+  1115→    if (!this.ghost.length) {
+  1116→      this.ghostCar.group.visible = false;
+  1117→      return;
+  1118→    }
+  1119→    this.ghostCar.group.visible = true;
+  1120→    const tMs = this.raceTime;
+  1121→    const frames = this.ghost;
+  1122→    // binary search
+  1123→    let lo = 0;
+  1124→    let hi = frames.length - 1;
+  1125→    while (lo < hi) {
+  1126→      const mid = (lo + hi) >> 1;
+  1127→      if (frames[mid].t < tMs) lo = mid + 1;
+  1128→      else hi = mid;
+  1129→    }
+  1130→    const i = Math.max(1, lo);
+  1131→    const a = frames[i - 1];
+  1132→    const b = frames[Math.min(frames.length - 1, i)];
+  1133→    const span = Math.max(1e-3, b.t - a.t);
+  1134→    const f = clamp((tMs - a.t) / span, 0, 1);
+  1135→    const g = this.ghostCar.group;
+  1136→    g.position.set(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f);
+  1137→    let dy = b.yaw - a.yaw;
+  1138→    while (dy > Math.PI) dy -= Math.PI * 2;
+  1139→    while (dy < -Math.PI) dy += Math.PI * 2;
+  1140→    g.rotation.set(0, a.yaw + dy * f, 0);
+  1141→  }
+  1142→
+  1143→  // ============================================================
+  1144→  // camera
+  1145→  // ============================================================
+  1146→
+  1147→  private updateCamera(dt: number) {
+  1148→    if (this.phase === "title") return; // handled in updateTitle
+  1149→    const p = this.physics;
+  1150→    const fwd = this.tmpV.set(Math.sin(p.yaw), 0, Math.cos(p.yaw));
+  1151→
+  1152→    if (this.phase === "countdown") {
+  1153→      // cinematic sweep down to the chase position
+  1154→      const t = clamp(1 - this.countdownT / 3, 0, 1);
+  1155→      const e = t * t * (3 - 2 * t);
+  1156→      const ang = 2.4 - e * 2.4;
+  1157→      const dist = 30 - 24 * e;
+  1158→      this.camPos.set(
+  1159→        p.pos.x + Math.sin(ang) * dist + fwd.x * -4,
+  1160→        p.pos.y + 14 - 11.5 * e,
+  1161→        p.pos.z + Math.cos(ang) * dist + fwd.z * -4
+  1162→      );
+  1163→      this.camLook.set(p.pos.x + fwd.x * 6, p.pos.y + 1.2, p.pos.z + fwd.z * 6);
+  1164→      this.camera.position.copy(this.camPos);
+  1165→      this.camera.up.set(0, 1, 0);
+  1166→      this.camera.lookAt(this.camLook);
+  1167→      this.camera.fov = damp(this.camera.fov, 66, 3, dt);
+  1168→      this.camera.updateProjectionMatrix();
+  1169→      return;
+  1170→    }
+  1171→
+  1172→    if (this.phase === "finished") {
+  1173→      const a = this.finishOrbitT * 0.5;
+  1174→      this.camPos.set(p.pos.x + Math.sin(a) * 9, p.pos.y + 3.2, p.pos.z + Math.cos(a) * 9);
+  1175→      this.camLook.copy(p.pos).add(new THREE.Vector3(0, 1, 0));
+  1176→      this.camera.position.copy(this.camPos);
+  1177→      this.camera.up.set(0, 1, 0);
+  1178→      this.camera.lookAt(this.camLook);
+  1179→      return;
+  1180→    }
+  1181→
+  1182→    // chase camera
+  1183→    const mode = this.settings.cameraMode;
+  1184→    const dist = mode === 1 ? 9.6 : 6.4;
+  1185→    const height = mode === 1 ? 3.8 : 2.55;
+  1186→    if (mode === 2) {
+  1187→      // hood cam
+  1188→      this.camPos.set(p.pos.x + fwd.x * 0.5, p.pos.y + 1.35, p.pos.z + fwd.z * 0.5);
+  1189→      this.camLook.set(p.pos.x + fwd.x * 12, p.pos.y + 1.6, p.pos.z + fwd.z * 12);
+  1190→      this.camera.position.copy(this.camPos);
+  1191→      this.camera.up.set(0, 1, 0);
+  1192→      this.camera.lookAt(this.camLook);
+  1193→    } else {
+  1194→      const ffX = clamp(p.vel.x * 0.16, -7, 7);
+  1195→      const ffZ = clamp(p.vel.z * 0.16, -7, 7);
+  1196→      const tx = p.pos.x - fwd.x * dist + ffX;
+  1197→      const ty = p.pos.y + height;
+  1198→      const tz = p.pos.z - fwd.z * dist + ffZ;
+  1199→      const rate = 6.5;
+  1200→      this.camPos.x = damp(this.camPos.x, tx, rate, dt);
+  1201→      this.camPos.y = damp(this.camPos.y, ty, rate, dt);
+  1202→      this.camPos.z = damp(this.camPos.z, tz, rate, dt);
+  1203→      this.camLook.set(p.pos.x + fwd.x * 7, p.pos.y + 1.3, p.pos.z + fwd.z * 7);
+  1204→      this.camera.position.copy(this.camPos);
+  1205→      this.camera.up.set(0, 1, 0);
+  1206→      this.camera.lookAt(this.camLook);
+  1207→      // banking roll (positive rotateZ banks right, matching steer > 0)
+  1208→      const targetRoll = clamp(-p.slip * 0.3 + this.lastSteer * 0.05, -0.24, 0.24);
+  1209→      this.camRoll = damp(this.camRoll, targetRoll, 5, dt);
+  1210→      this.camera.rotateZ(this.camRoll);
+  1211→    }
+  1212→
+  1213→    // wall-ride lean
+  1214→    this.wallRideLean = damp(this.wallRideLean, p.wallRiding ? clamp(p.lateral / 24, 0, 1) * 0.5 : 0, 4, dt);
+  1215→    if (this.wallRideLean > 0.01) this.camera.rotateZ(this.wallRideLean);
+  1216→
+  1217→    // FOV kick
+  1218→    const speedFrac = clamp(p.speed / 55, 0, 1.1);
+  1219→    const targetFov = 64 + speedFrac * 10 + (p.boosting ? 9 : 0);
+  1220→    this.fov = damp(this.fov, targetFov, 4, dt);
+  1221→    this.camera.fov = this.fov;
+  1222→    this.camera.updateProjectionMatrix();
+  1223→
+  1224→    // restrained screen shake
+  1225→    this.trauma = Math.max(0, this.trauma - dt * 1.6);
+  1226→    const sh = this.trauma * this.trauma;
+  1227→    if (sh > 0.001) {
+  1228→      this.camera.position.x += (Math.random() - 0.5) * sh * 0.55;
+  1229→      this.camera.position.y += (Math.random() - 0.5) * sh * 0.4;
+  1230→      this.camera.position.z += (Math.random() - 0.5) * sh * 0.55;
+  1231→      this.camera.rotateZ((Math.random() - 0.5) * sh * 0.03);
+  1232→    }
+  1233→  }
+  1234→
+  1235→  private updateSun() {
+  1236→    const p = this.physics.pos;
+  1237→    this.sun.position.set(p.x + SUN_DIR.x * 190, p.y + SUN_DIR.y * 190, p.z + SUN_DIR.z * 190);
+  1238→    this.sun.target.position.set(p.x, p.y, p.z);
+  1239→    this.sun.target.updateMatrixWorld();
+  1240→  }
+  1241→
+  1242→  // ============================================================
+  1243→  // telemetry
+  1244→  // ============================================================
+  1245→
+  1246→  private emitTelemetry() {
+  1247→    const p = this.physics;
+  1248→    const { gear, rpm } = p.gearAndRpm();
+  1249→    const t: Telemetry = {
+  1250→      speedKmh: p.speedKmh,
+  1251→      boostMeter: p.boostMeter,
+  1252→      boosting: p.boosting,
+  1253→      drifting: p.drifting,
+  1254→      driftMult: 1 + Math.min(2, p.driftChain / 6),
+  1255→      lap: Math.min(this.lapsDone + 1, this.totalLaps),
+  1256→      totalLaps: this.totalLaps,
+  1257→      position: this.playerPos,
+  1258→      totalCars: 1 + this.opponents.length,
+  1259→      blips: this.opponents.map((op) => ({
+  1260→        x: op.physics.pos.x,
+  1261→        z: op.physics.pos.z,
+  1262→        color: op.def.cssColor,
+  1263→      })),
+  1264→      raceTimeMs: this.raceTime,
+  1265→      lapTimeMs: this.raceTime - this.lapStart,
+  1266→      bestLapMs: this.bestLapMs,
+  1267→      bestTotalMs: this.bestTotalMs,
+  1268→      wrongWay: p.wrongWay,
+  1269→      airborne: !p.grounded,
+  1270→      wallRide: p.wallRiding,
+  1271→      offRoad: p.offRoad,
+  1272→      nextCpDist: Math.max(0, (this.nextGateAbs - p.progressS) % this.track.length),
+  1273→      gear,
+  1274→      rpm,
+  1275→      progressPct: p.lapProgress,
+  1276→    };
+  1277→    for (const fn of this.telemetryListeners) fn(t);
+  1278→  }
+  1279→
+  1280→  /** expose a bit of input state for car visuals */
+  1281→  noteInput(steer: number, brake: number, accel: number) {
+  1282→    this.lastSteer = steer;
+  1283→    this.lastBrake = brake;
+  1284→    this.lastAccel = accel;
+  1285→  }
+  1286→}
+  1287→
+  1288→function wrapI(i: number, n: number): number {
+  1289→  return ((i % n) + n) % n;
+  1290→}
+  1291→
+  1292→function fmt(ms: number): string {
+  1293→  const m = Math.floor(ms / 60000);
+  1294→  const s = Math.floor((ms % 60000) / 1000);
+  1295→  const cs = Math.floor((ms % 1000) / 10);
+  1296→  return `${m}:${s.toString().padStart(2, "0")}.${cs.toString().padStart(2, "0")}`;
+  1297→}
+  1298→

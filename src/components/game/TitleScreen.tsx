@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { Globe } from "lucide-react";
 import type { GameEngine } from "@/game/engine";
 import { useGameStore } from "@/game/store";
+import { useMPStore } from "@/game/net-store";
 import {
   DIFFICULTIES,
   DIFFICULTY_ORDER,
@@ -45,6 +47,7 @@ export function TitleScreen({
   const setSettings = useGameStore((s) => s.setSettings);
   const bestTotalMs = useGameStore((s) => s.bestTotalMs);
   const bestLapMs = useGameStore((s) => s.bestLapMs);
+  const setMPScreen = useMPStore((s) => s.setScreen);
   const records = useRecords(settings.laps);
   const [ready, setReady] = useState(false);
 
@@ -145,6 +148,15 @@ export function TitleScreen({
                   className="w-32 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-4 py-2 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
                 >
                   <span className="block skew-x-6">HOW TO PLAY</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMPScreen("home")}
+                  className="w-36 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#1f8a70] px-4 py-2 text-sm font-black tracking-wider text-[#fff6e6] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+                >
+                  <span className="flex skew-x-6 items-center justify-center gap-1.5">
+                    <Globe className="h-4 w-4" aria-hidden /> MULTIPLAYER
+                  </span>
                 </button>
                 <button
                   type="button"

@@ -1,7 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Loader2, RotateCcw, Users } from "lucide-react";
 import { useGameStore } from "@/game/store";
+import { useMPStore } from "@/game/net-store";
 import {
   DIFFICULTIES,
   formatTime,
@@ -36,10 +38,30 @@ function StandingsRow({ entry }: { entry: StandingEntry }) {
   );
 }
 
-export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry: () => void; onTitle: () => void }) {
+export interface ResultsMPProps {
+  isMultiplayer: boolean;
+  isHost: boolean;
+  roomPhase: string;
+  onRematch: () => void;
+  onLobby: () => void;
+}
+
+export function Results({
+  data,
+  onRetry,
+  onTitle,
+  mp,
+}: {
+  data: ResultsData;
+  onRetry: () => void;
+  onTitle: () => void;
+  mp?: ResultsMPProps;
+}) {
   const [records, setRecords] = useState<RaceRecord[] | null>(null);
   const settings = useGameStore((s) => s.settings);
   const standings = useGameStore((s) => s.standings);
+  const finalResults = useMPStore((s) => s.finalResults);
+  const myId = useMPStore((s) => s.myId);
 
   useEffect(() => {
     let alive = true;
@@ -55,6 +77,17 @@ export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry
       alive = false;
     };
   }, [data.laps]);
+
+  const isMP = !!mp?.isMultiplayer;
+  const finalRows: StandingEntry[] = isMP
+    ? (finalResults ?? []).map((r, i) => ({
+        pos: r.pos ?? i + 1,
+        name: r.name + (r.finished ? "" : " — DNF"),
+        isPlayer: r.pid === myId,
+        color: r.color,
+        timeMs: r.totalMs ?? null,
+      }))
+    : [];
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center overflow-y-auto bg-[rgba(43,28,18,0.55)] p-4 backdrop-blur-[2px]">
@@ -75,18 +108,33 @@ export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry
             >
               P{data.position}/{data.totalCars}
             </span>
-            <span>SUNSTONE CANYON · {DIFFICULTIES[settings.difficulty].label} · {data.laps} LAP{data.laps > 1 ? "S" : ""}</span>
+            <span>
+              {isMP ? "CANYON CLASH" : "SUNSTONE CANYON"} ·{" "}
+              {isMP ? "MULTIPLAYER" : DIFFICULTIES[settings.difficulty].label} · {data.laps} LAP{data.laps > 1 ? "S" : ""}
+            </span>
           </div>
         </div>
 
-        {/* live race standings */}
+        {/* live / final race standings */}
         <div className="mt-3 rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.82)] p-2 text-[#fff6e6]">
-          <div className="mb-1 px-1 text-[10px] font-black tracking-[0.25em] text-[#ffb020]">RACE STANDINGS</div>
+          <div className="mb-1 flex items-center justify-between px-1">
+            <span className="text-[10px] font-black tracking-[0.25em] text-[#ffb020]">
+              {isMP ? (finalResults ? "FINAL RESULTS" : "RACE STANDINGS") : "RACE STANDINGS"}
+            </span>
+            {isMP && !finalResults && (
+              <span className="flex items-center gap-1 text-[9px] font-bold text-[#c9a06a]">
+                <Loader2 className="h-3 w-3 animate-spin" aria-hidden /> waiting for the field…
+              </span>
+            )}
+          </div>
           <div className="flex flex-col gap-0.5">
-            {(standings.length ? standings : []).map((e) => (
-              <StandingsRow key={e.name} entry={e} />
+            {(isMP && finalRows.length ? finalRows : standings).map((e, i) => (
+              <StandingsRow key={e.name + i} entry={e} />
             ))}
           </div>
+          {isMP && finalResults && finalResults.some((r) => !r.finished) && (
+            <div className="mt-1 px-1 text-[9px] font-bold text-[#c9a06a]">DNF = did not finish</div>
+          )}
         </div>
 
         <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
@@ -120,22 +168,59 @@ export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry
           </div>
         </div>
 
-        <div className="mt-4 flex items-center justify-center gap-3">
-          <button
-            type="button"
-            onClick={onRetry}
-            className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#f0641e] px-6 py-3 font-[family-name:var(--font-bungee)] text-xl text-[#fff6e6] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none"
-          >
-            <span className="block skew-x-6">RETRY</span>
-          </button>
-          <button
-            type="button"
-            onClick={onTitle}
-            className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-6 py-3 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none"
-          >
-            <span className="block skew-x-6">TITLE</span>
-          </button>
-        </div>
+        {/* actions */}
+        {isMP && mp ? (
+          <div className="mt-4 flex flex-col items-center gap-2">
+            <div className="flex items-center justify-center gap-3">
+              {mp.isHost ? (
+                <button
+                  type="button"
+                  onClick={mp.onRematch}
+                  disabled={mp.roomPhase !== "results"}
+                  className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#f0641e] px-6 py-3 font-[family-name:var(--font-bungee)] text-xl text-[#fff6e6] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none disabled:opacity-50"
+                >
+                  <span className="flex skew-x-6 items-center gap-2">
+                    <RotateCcw className="h-5 w-5" aria-hidden /> REMATCH
+                  </span>
+                </button>
+              ) : (
+                <div className="flex items-center gap-1.5 rounded-md border-2 border-dashed border-[rgba(43,28,18,0.4)] px-4 py-3 text-xs font-bold text-[#5a3c28]">
+                  <Users className="h-4 w-4" aria-hidden />
+                  {mp.roomPhase === "results"
+                    ? "Host can launch the rematch"
+                    : "Waiting for the race to wrap up…"}
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={mp.onLobby}
+                className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-6 py-3 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+              >
+                <span className="block skew-x-6">LOBBY</span>
+              </button>
+            </div>
+            <p className="text-[10px] font-semibold text-[#5a3c28]/80">
+              The room stays open — same code, same drivers.
+            </p>
+          </div>
+        ) : (
+          <div className="mt-4 flex items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={onRetry}
+              className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#f0641e] px-6 py-3 font-[family-name:var(--font-bungee)] text-xl text-[#fff6e6] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+            >
+              <span className="block skew-x-6">RETRY</span>
+            </button>
+            <button
+              type="button"
+              onClick={onTitle}
+              className="-skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-6 py-3 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+            >
+              <span className="block skew-x-6">TITLE</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
