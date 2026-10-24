@@ -73,6 +73,16 @@ export interface TrackBox {
   mesh: THREE.Mesh;
 }
 
+/** One live BREAK barricade on the loop (there are two). */
+export interface BreakWall {
+  idx: number;
+  cluster: number;
+  /** first plank segment — its active flag drives the glow group visibility */
+  firstBox: TrackBox;
+  /** amber glow strip + beacon lamps — visible only while the wall stands */
+  glow: THREE.Group;
+}
+
 export interface GroundInfo {
   h: number;
   onRoad: boolean;
@@ -141,8 +151,12 @@ export class Track {
   gates: Gate[] = [];
   obstacles: Obstacle[] = [];
   boxes: TrackBox[] = [];
-  /** sample index of the BREAK barricade (-1 = none) */
-  breakWallIdx = -1;
+  /** sample indices of the BREAK barricades */
+  breakWallIdxs: number[] = [];
+  /** per-wall live info (glow visibility + approach warnings) */
+  breakWalls: BreakWall[] = [];
+  /** pulsing amber glow materials (strips + beacons) — engine animates opacity */
+  wallGlowMats: THREE.MeshBasicMaterial[] = [];
   kickers: Kicker[] = [];
   N = 0;
   step = 2;
@@ -150,6 +164,8 @@ export class Track {
   group = new THREE.Group();
   minimapPts: { x: number; z: number }[] = [];
   gatePts: { x: number; z: number; finish: boolean }[] = [];
+  /** BREAK barricade positions for the minimap */
+  wallPts: { x: number; z: number }[] = [];
   private disposables: (THREE.BufferGeometry | THREE.Material | THREE.Texture)[] = [];
 
   constructor() {
@@ -607,7 +623,10 @@ export class Track {
     this.buildArch();
     this.buildScenery();
     this.buildGates();
-    this.buildBreakWall();
+    // two BREAK barricades: one right after the first jump (you spot its
+    // banner mid-air), one on the final arc — both with the full clarity kit
+    this.buildBreakWall(5, 1_000_000);
+    this.buildBreakWall(25, 1_000_001);
     this.buildStacks();
   }
 
@@ -1233,17 +1252,20 @@ export class Track {
   }
 
   /**
-   * The BREAK barricade: a plank wall spanning the whole canyon floor with
-   * "BREAK!" painted across every board (plus a warning sign on the approach)
-   * so riders know they can smash straight through — and they should, because
-   * it explodes into flying planks. One cluster id = the whole wall goes at once.
+   * The BREAK barricade: a full-width plank wall that is MEANT to be smashed.
+   * Full clarity kit so no rider can miss it at 180 km/h:
+   *  - giant unlit gantry banner overhead: "BREAK" with hazard borders + down arrows
+   *  - pulsing amber glow strip along the wall top + beacon lamps on the gantry
+   *  - two roadside "BREAK AHEAD" diamond signs (56 m + 28 m) with beacons
+   *  - triple chevron decals painted onto the approach road
+   * One cluster id = the whole wall chain-breaks when you hit it.
    */
-  private buildBreakWall() {
-    const WALL_CLUSTER = 1_000_000;
-    const idx = this.idxNear(CONTROL[25][0], CONTROL[25][2]);
-    this.breakWallIdx = idx;
+  private buildBreakWall(controlIdx: number, cluster: number) {
+    const idx = this.idxNear(CONTROL[controlIdx][0], CONTROL[controlIdx][2]);
+    this.breakWallIdxs.push(idx);
     const s = this.samples[idx];
     const yaw = Math.atan2(-s.rz, s.rx); // local +X along the road's right vector
+    const faceBack = Math.atan2(-s.dx, -s.dz); // plane normal toward oncoming riders
 
     const span = s.hw + 1.6; // road + shoulders — nowhere to sneak around
     const segW = 2.0;
@@ -1252,10 +1274,66 @@ export class Track {
     const tex = makeWallTexture();
     const geo = new THREE.BoxGeometry(segW, segH, 0.18);
     const mat = new THREE.MeshLambertMaterial({ map: tex });
-    const postGeo = new THREE.BoxGeometry(0.26, 3.2, 0.26);
     const postMat = new THREE.MeshLambertMaterial({ color: 0x6e4523 });
-    this.disposables.push(geo, mat, tex, postGeo, postMat);
+    this.disposables.push(geo, mat, tex, postMat);
 
+    // ---- glow group: amber top strip + beacon lamps (engine pulses them) ----
+    const glow = new THREE.Group();
+    const glowMat = new THREE.MeshBasicMaterial({
+      color: 0xffb020,
+      transparent: true,
+      opacity: 0.95,
+      depthWrite: false,
+    });
+    this.wallGlowMats.push(glowMat);
+    const stripGeo = new THREE.BoxGeometry(span * 2 + 0.4, 0.12, 0.12);
+    const strip = new THREE.Mesh(stripGeo, glowMat);
+    strip.position.set(s.x, this.heightAt(idx, 0) + segH + 0.16, s.z);
+    strip.rotation.y = yaw;
+    glow.add(strip);
+    const beaconGeo = new THREE.SphereGeometry(0.26, 10, 8);
+    this.disposables.push(stripGeo, beaconGeo, glowMat);
+
+    // ---- gantry: posts + crossbeam + the big BREAK banner ----
+    const postH = 7.3;
+    const gLat = span + 1.0;
+    const postGeo = new THREE.BoxGeometry(0.32, postH, 0.32);
+    this.disposables.push(postGeo);
+    for (const e of [-gLat, gLat]) {
+      const post = new THREE.Mesh(postGeo, postMat);
+      post.position.set(s.x + s.rx * e, this.heightAt(idx, e) + postH / 2, s.z + s.rz * e);
+      post.rotation.y = yaw;
+      post.castShadow = true;
+      this.group.add(post);
+      const beacon = new THREE.Mesh(beaconGeo, glowMat);
+      beacon.position.set(s.x + s.rx * e, this.heightAt(idx, e) + postH + 0.28, s.z + s.rz * e);
+      glow.add(beacon);
+    }
+    const beamGeo = new THREE.BoxGeometry(gLat * 2 + 0.32, 0.36, 0.36);
+    const beam = new THREE.Mesh(beamGeo, postMat);
+    beam.position.set(s.x, this.heightAt(idx, 0) + postH, s.z);
+    beam.rotation.y = yaw;
+    this.group.add(beam);
+    this.disposables.push(beamGeo);
+
+    const banW = Math.min(gLat * 2 - 0.5, 14);
+    const banH = 2.5;
+    const banTex = makeBreakBannerTexture();
+    const banGeo = new THREE.PlaneGeometry(banW, banH);
+    const banMat = new THREE.MeshBasicMaterial({
+      map: banTex,
+      side: THREE.DoubleSide,
+      transparent: true,
+      fog: true,
+    });
+    const banner = new THREE.Mesh(banGeo, banMat);
+    banner.position.set(s.x, this.heightAt(idx, 0) + postH - banH / 2 - 0.4, s.z);
+    banner.rotation.y = faceBack;
+    this.group.add(banner);
+    this.disposables.push(banTex, banGeo, banMat);
+
+    // ---- the wall itself ----
+    let firstBox: TrackBox | null = null;
     for (let lat = -span; lat <= span + 0.01; lat += segW) {
       const l = Math.min(lat, span);
       const x = s.x + s.rx * l;
@@ -1266,53 +1344,74 @@ export class Track {
       mesh.rotation.y = yaw;
       mesh.castShadow = true;
       this.group.add(mesh);
-      this.boxes.push({
+      const box: TrackBox = {
         x,
         z,
         y,
         idx,
         lat: l,
-        cluster: WALL_CLUSTER,
+        cluster,
         halfH: segH / 2,
         wall: true,
         enabled: true,
         active: true,
         respawnAt: 0,
         mesh,
-      });
+      };
+      this.boxes.push(box);
+      if (!firstBox) firstBox = box;
     }
 
-    // scaffold posts at the ends (static scenery, off the driving line)
-    for (const e of [-(span + 0.55), span + 0.55]) {
-      const post = new THREE.Mesh(postGeo, postMat);
-      post.position.set(s.x + s.rx * e, this.heightAt(idx, e) + 1.6, s.z + s.rz * e);
-      post.rotation.y = yaw;
-      post.castShadow = true;
-      this.group.add(post);
-    }
+    this.group.add(glow);
+    this.breakWalls.push({ idx, cluster, firstBox: firstBox!, glow });
+    this.wallPts.push({ x: s.x, z: s.z });
 
-    // warning sign on the approach: "BREAK AHEAD" diamond, facing oncoming riders
-    const signIdx = wrapIdx(idx - 16, this.N);
-    const ss = this.samples[signIdx];
+    // ---- roadside warning signs (56 m + 28 m out, alternating sides) ----
     const signTex = makeSignTexture();
-    const signGeo = new THREE.PlaneGeometry(2.4, 2.4);
+    const signGeo = new THREE.PlaneGeometry(2.9, 2.9);
     const signMat = new THREE.MeshBasicMaterial({
       map: signTex,
       transparent: true,
       side: THREE.DoubleSide,
     });
-    const slat = ss.hw + 2.4;
-    const signPostGeo = new THREE.BoxGeometry(0.14, 2.4, 0.14);
-    const sign = new THREE.Mesh(signGeo, signMat);
-    const signPost = new THREE.Mesh(signPostGeo, postMat);
-    const sy = this.heightAt(signIdx, slat) + 2.55;
-    sign.position.set(ss.x + ss.rx * slat, sy, ss.z + ss.rz * slat);
-    sign.rotation.y = Math.atan2(-ss.dx, -ss.dz); // face backwards along the track
-    signPost.position.set(ss.x + ss.rx * slat, sy - 1.25, ss.z + ss.rz * slat);
-    signPost.castShadow = true;
-    this.group.add(sign);
-    this.group.add(signPost);
+    const signPostGeo = new THREE.BoxGeometry(0.16, 3.0, 0.16);
     this.disposables.push(signTex, signGeo, signMat, signPostGeo);
+    for (const [back, side] of [
+      [56, 1],
+      [28, -1],
+    ] as const) {
+      const si = wrapIdx(idx - back, this.N);
+      const ss = this.samples[si];
+      const slat = (ss.hw + 2.6) * side;
+      const sy = this.heightAt(si, slat) + 3.1;
+      const sign = new THREE.Mesh(signGeo, signMat);
+      sign.position.set(ss.x + ss.rx * slat, sy, ss.z + ss.rz * slat);
+      sign.rotation.y = Math.atan2(-ss.dx, -ss.dz); // face oncoming riders
+      const signPost = new THREE.Mesh(signPostGeo, postMat);
+      signPost.position.set(ss.x + ss.rx * slat, sy - 1.55, ss.z + ss.rz * slat);
+      signPost.castShadow = true;
+      this.group.add(sign);
+      this.group.add(signPost);
+      const beacon = new THREE.Mesh(beaconGeo, glowMat);
+      beacon.position.set(ss.x + ss.rx * slat, sy + 1.8, ss.z + ss.rz * slat);
+      glow.add(beacon);
+    }
+
+    // ---- chevron decals painted onto the approach road ----
+    const chevTex = makeChevronTexture();
+    const chevGeo = new THREE.PlaneGeometry(4.8, 3.4);
+    chevGeo.rotateX(-Math.PI / 2);
+    const chevMat = new THREE.MeshBasicMaterial({ map: chevTex, transparent: true, depthWrite: false });
+    this.disposables.push(chevTex, chevGeo, chevMat);
+    for (const back of [26, 17, 8]) {
+      const ci = wrapIdx(idx - back, this.N);
+      const cs = this.samples[ci];
+      const m = new THREE.Mesh(chevGeo, chevMat);
+      m.position.set(cs.x, this.heightAt(ci, 0) + 0.09, cs.z);
+      m.rotation.y = Math.atan2(-cs.dx, -cs.dz); // chevrons point toward the wall
+      m.renderOrder = 1;
+      this.group.add(m);
+    }
   }
 
   /**
@@ -1337,8 +1436,8 @@ export class Track {
       }
     }
     for (let k = -60; k <= 60; k++) blocked[wrapIdx(k, n)] = 1; // start/finish + grid
-    if (this.breakWallIdx >= 0) {
-      for (let k = -14; k <= 14; k++) blocked[wrapIdx(this.breakWallIdx + k, n)] = 1;
+    for (const wi of this.breakWallIdxs) {
+      for (let k = -16; k <= 16; k++) blocked[wrapIdx(wi + k, n)] = 1;
     }
 
     const crateTex = makeCrateTexture();
@@ -1591,7 +1690,8 @@ function makeCrateTexture(): THREE.Texture {
   return tex;
 }
 
-/** Plank barricade segment — vertical boards, cross braces and a big painted BREAK! stencil. */
+/** Plank barricade segment — pale weathered timber (reads man-made against the
+ *  red rock), cross braces, hazard stripes and a big amber-on-dark BREAK! stencil. */
 function makeWallTexture(): THREE.Texture {
   const W = 256;
   const H = 340;
@@ -1601,21 +1701,21 @@ function makeWallTexture(): THREE.Texture {
   const ctx = c.getContext("2d")!;
   const rnd = mulberry32(777);
 
-  // vertical planks
+  // vertical planks — pale timber so the wall pops from the canyon
   const plankW = W / 4;
   for (let p = 0; p < 4; p++) {
     const shade = 0.9 + rnd() * 0.2;
-    const r = Math.floor(0xa9 * shade);
-    const g = Math.floor(0x71 * shade);
-    const b = Math.floor(0x3d * shade);
+    const r = Math.floor(0xc9 * shade);
+    const g = Math.floor(0xa6 * shade);
+    const b = Math.floor(0x70 * shade);
     ctx.fillStyle = `rgb(${r},${g},${b})`;
     ctx.fillRect(p * plankW, 0, plankW, H);
     // seam
-    ctx.fillStyle = "rgba(64,38,16,0.85)";
+    ctx.fillStyle = "rgba(84,52,22,0.85)";
     ctx.fillRect(p * plankW, 0, 3, H);
     // grain
     for (let i = 0; i < 14; i++) {
-      ctx.fillStyle = `rgba(${70 + rnd() * 50},${42 + rnd() * 26},${18 + rnd() * 14},${0.14 + rnd() * 0.16})`;
+      ctx.fillStyle = `rgba(${96 + rnd() * 46},${64 + rnd() * 24},${28 + rnd() * 12},${0.14 + rnd() * 0.16})`;
       ctx.fillRect(p * plankW + 4 + rnd() * (plankW - 10), rnd() * H, 2, 18 + rnd() * 60);
     }
     // nails top & bottom
@@ -1629,7 +1729,7 @@ function makeWallTexture(): THREE.Texture {
 
   // horizontal cross braces
   for (const by of [64, H - 88]) {
-    ctx.fillStyle = "#8a5a2e";
+    ctx.fillStyle = "#a87c48";
     ctx.fillRect(0, by, W, 26);
     ctx.fillStyle = "rgba(255,232,196,0.16)";
     ctx.fillRect(0, by, W, 5);
@@ -1656,22 +1756,32 @@ function makeWallTexture(): THREE.Texture {
   }
   ctx.restore();
 
-  // big painted stencil: BREAK! (font auto-shrinks to fit the board)
+  // big painted stencil: BREAK! — dark plate + amber letters (matches the
+  // gantry banner & beacons so the whole hazard kit reads as one system)
   ctx.save();
   ctx.translate(W / 2, H / 2 - 16);
-  ctx.rotate(-0.1);
+  ctx.rotate(-0.06);
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.lineJoin = "round";
-  let fontSize = 78;
+  let fontSize = 96;
   do {
     ctx.font = `900 ${fontSize}px system-ui, sans-serif`;
-    fontSize -= 2;
-  } while (ctx.measureText("BREAK!").width > W - 34 && fontSize > 30);
-  ctx.strokeStyle = "#fff6e6";
-  ctx.lineWidth = Math.max(8, fontSize * 0.16);
+    fontSize -= 3;
+  } while (ctx.measureText("BREAK!").width > W - 26 && fontSize > 40);
+  const tw = ctx.measureText("BREAK!").width;
+  ctx.fillStyle = "rgba(30,16,7,0.85)";
+  if (typeof ctx.roundRect === "function") {
+    ctx.beginPath();
+    ctx.roundRect(-tw / 2 - 12, -fontSize * 0.62, tw + 24, fontSize * 1.2, 8);
+    ctx.fill();
+  } else {
+    ctx.fillRect(-tw / 2 - 12, -fontSize * 0.62, tw + 24, fontSize * 1.2);
+  }
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "#2b1c12";
+  ctx.lineWidth = Math.max(7, fontSize * 0.13);
   ctx.strokeText("BREAK!", 0, 0);
-  ctx.fillStyle = "#2b1c12";
+  ctx.fillStyle = "#ffb020";
   ctx.fillText("BREAK!", 0, 0);
   ctx.restore();
 
@@ -1684,6 +1794,119 @@ function makeWallTexture(): THREE.Texture {
     ctx.beginPath();
     ctx.moveTo(x0, y0);
     ctx.lineTo(x0 + (rnd() - 0.5) * 44, y0 + 16 + rnd() * 40);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Giant overhead gantry banner for the BREAK wall — unlit black/amber plate
+ *  with "BREAK", hazard borders, down-arrows pointing at the wall and a SMASH tagline. */
+function makeBreakBannerTexture(): THREE.Texture {
+  const W = 1024;
+  const H = 256;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d")!;
+
+  // dark plate
+  ctx.fillStyle = "#1d1108";
+  ctx.fillRect(0, 0, W, H);
+  // amber frame
+  ctx.strokeStyle = "#ffb020";
+  ctx.lineWidth = 8;
+  ctx.strokeRect(4, 4, W - 8, H - 8);
+
+  // hazard stripe bands top & bottom
+  const stripe = 30;
+  for (const y0 of [10, H - stripe - 10]) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(10, y0, W - 20, stripe);
+    ctx.clip();
+    ctx.fillStyle = "#ffb020";
+    ctx.fillRect(10, y0, W - 20, stripe);
+    ctx.fillStyle = "#1d1108";
+    for (let x = 8 - stripe * 2; x < W; x += stripe * 2) {
+      ctx.beginPath();
+      ctx.moveTo(x, y0 + stripe);
+      ctx.lineTo(x + stripe, y0 + stripe);
+      ctx.lineTo(x + stripe * 2, y0);
+      ctx.lineTo(x + stripe, y0);
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // stacked down-arrows flanking the word, pointing at the wall below
+  ctx.fillStyle = "#ffb020";
+  for (const cx of [W * 0.145, W * 0.855]) {
+    for (const dy of [0, 54]) {
+      ctx.beginPath();
+      ctx.moveTo(cx - 42, 86 + dy);
+      ctx.lineTo(cx + 42, 86 + dy);
+      ctx.lineTo(cx, 86 + dy + 44);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // THE word
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  let f = 148;
+  do {
+    ctx.font = `900 ${f}px system-ui, sans-serif`;
+    f -= 4;
+  } while (ctx.measureText("BREAK").width > W * 0.55 && f > 60);
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = "#1d1108";
+  ctx.lineWidth = 18;
+  ctx.strokeText("BREAK", W / 2, H / 2 - 10);
+  ctx.fillStyle = "#fff6e6";
+  ctx.fillText("BREAK", W / 2, H / 2 - 10);
+
+  // tagline
+  let f2 = 32;
+  ctx.font = `900 ${f2}px system-ui, sans-serif`;
+  while (ctx.measureText("SMASH THROUGH — FULL SEND").width > W * 0.46 && f2 > 16) {
+    f2 -= 2;
+    ctx.font = `900 ${f2}px system-ui, sans-serif`;
+  }
+  ctx.fillStyle = "#ffb020";
+  ctx.fillText("SMASH THROUGH — FULL SEND", W / 2, H - 58);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+/** Road-paint chevron decal — twin amber arrows pointing toward the wall. */
+function makeChevronTexture(): THREE.Texture {
+  const S = 256;
+  const c = document.createElement("canvas");
+  c.width = c.height = S;
+  const ctx = c.getContext("2d")!;
+
+  ctx.lineJoin = "round";
+  for (const y0 of [158, 84]) {
+    ctx.beginPath();
+    ctx.moveTo(40, y0);
+    ctx.lineTo(S / 2, y0 - 52);
+    ctx.lineTo(S - 40, y0);
+    ctx.lineTo(S - 40, y0 + 26);
+    ctx.lineTo(S / 2, y0 - 26);
+    ctx.lineTo(40, y0 + 26);
+    ctx.closePath();
+    ctx.fillStyle = "#ffb020";
+    ctx.strokeStyle = "rgba(43,28,18,0.9)";
+    ctx.lineWidth = 10;
+    ctx.fill();
     ctx.stroke();
   }
 
@@ -1715,18 +1938,18 @@ function makeSignTexture(): THREE.Texture {
   ctx.fillStyle = "#2b1c12";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  let f1 = 60;
+  let f1 = 66;
   do {
     ctx.font = `900 ${f1}px system-ui, sans-serif`;
     f1 -= 2;
-  } while (ctx.measureText("BREAK").width > S * 0.62 && f1 > 24);
-  ctx.fillText("BREAK", S / 2, S / 2 - 30);
-  let f2 = 40;
+  } while (ctx.measureText("BREAK").width > S * 0.64 && f1 > 24);
+  ctx.fillText("BREAK", S / 2, S / 2 - 32);
+  let f2 = 42;
   do {
     ctx.font = `900 ${f2}px system-ui, sans-serif`;
     f2 -= 2;
-  } while (ctx.measureText("AHEAD").width > S * 0.52 && f2 > 16);
-  ctx.fillText("AHEAD", S / 2, S / 2 + 18);
+  } while (ctx.measureText("AHEAD").width > S * 0.54 && f2 > 16);
+  ctx.fillText("AHEAD", S / 2, S / 2 + 16);
 
   // little impact burst
   ctx.strokeStyle = "#2b1c12";

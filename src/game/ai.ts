@@ -33,6 +33,39 @@ export const OPPONENTS: OpponentDefinition[] = [
   { name: "HAWK", cssColor: "#1f8a70", body: 0x1f8a70, accent: 0xfff3dd, skill: 0.9 },
 ];
 
+/** Per-difficulty driving brain, set by the engine from DIFFICULTIES. */
+export interface AiBrain {
+  /** pace multiplier (corner + straight targets) */
+  skillScale: number;
+  /** seconds between unforced errors (0 = flawless — HARD) */
+  mistakeEvery: number;
+  /** catch-up bonus when the PLAYER leads (per 200 m of gap) */
+  rubberAhead: number;
+  /** mercy slowdown when the player trails (per 200 m of gap) */
+  rubberBehind: number;
+  /** 0..1 — how low the boost threshold sits on straights */
+  boostAggro: number;
+  /** actively sit on the player's line when just ahead */
+  blocking: boolean;
+}
+
+const DEFAULT_BRAIN: AiBrain = {
+  skillScale: 1,
+  mistakeEvery: 26,
+  rubberAhead: 0.05,
+  rubberBehind: 0.055,
+  boostAggro: 0.55,
+  blocking: false,
+};
+
+/** Player context the rivals react to. */
+export interface AiContext {
+  /** player race distance (progressS - startS) */
+  playerDist: number;
+  /** player lateral offset on the track (for line blocking) */
+  playerLat: number;
+}
+
 /** Per-car grid slot: lateral offset on the start line. */
 export const OPPONENT_GRID_LAT = [-2.6, 2.6, -2.6];
 
@@ -49,8 +82,8 @@ export class Opponent {
   startS = 0;
   finishMs: number | null = null;
   avgSpeed = 26;
-  /** difficulty pace multiplier (easy < 1, hard > 1) */
-  skillScale = 1;
+  /** difficulty driving brain (pace, mistakes, rubber-band, blocking) */
+  brain: AiBrain = { ...DEFAULT_BRAIN };
   /** engine hook so rival crate smashes also spawn debris */
   boxHitHook?: (box: TrackBox) => void;
 
@@ -190,23 +223,26 @@ export class Opponent {
 export function opponentInput(
   op: Opponent,
   track: Track,
-  playerDist: number,
+  ctx: AiContext,
   dt: number,
   mode: "race" | "cruise"
 ): DriveInput {
   const p = op.physics;
+  const brain = op.brain;
   const t = performance.now() * 0.001 + op.phase;
 
-  // occasional human-ish mistakes
-  if (mode === "race") {
+  // occasional human-ish mistakes (HARD rivals never fluff a line)
+  if (mode === "race" && brain.mistakeEvery > 0) {
     if (op.mistakeLeft > 0) op.mistakeLeft -= dt;
     else {
       op.mistakeT -= dt;
       if (op.mistakeT <= 0) {
         op.mistakeLeft = 0.7 + Math.random() * 0.6;
-        op.mistakeT = 12 + Math.random() * 18;
+        op.mistakeT = brain.mistakeEvery * (0.7 + Math.random() * 0.6);
       }
     }
+  } else {
+    op.mistakeLeft = 0;
   }
 
   // aim at a look-ahead point on this car's preferred line
@@ -214,11 +250,22 @@ export function opponentInput(
   const li = wrapIdxLocal(p.idx + Math.round(look / track.step), track.N);
   const s = track.sample(li);
   let lat = clamp(op.baseLat * 0.6 + Math.sin(t * 0.14) * 1.3, -4.5, 4.5);
+
+  // HARD: defend the racing line — when this rival is just ahead of the
+  // player, drift over onto the player's line so they have to out-brake it
+  if (brain.blocking && mode === "race") {
+    const gap = op.raceDist - ctx.playerDist; // >0 = rival ahead of player
+    if (gap > 0 && gap < 22) {
+      lat = clamp(lat * 0.35 + ctx.playerLat * 0.75, -(s.hw - 2.2), s.hw - 2.2);
+    }
+  }
+
   // dodge active crates near the intended line — sharper minds dodge better
+  // (full-width BREAK walls are ignored: they get smashed, not dodged)
   if (op.mistakeLeft <= 0) {
     let dodge = 0;
     for (const b of track.boxes) {
-      if (!b.active) continue;
+      if (!b.active || b.wall) continue;
       let d = b.idx - p.idx;
       if (d < -track.N / 2) d += track.N;
       else if (d > track.N / 2) d -= track.N;
@@ -241,24 +288,29 @@ export function opponentInput(
   const dTheta = Math.abs(angDiff(Math.atan2(s3.dx, s3.dz), Math.atan2(s2.dx, s2.dz)));
   const fullSend = s.rampP >= 0 || s.gap || s2.rampP >= 0 || s2.gap || s3.rampP >= 0 || s3.gap;
 
-  // speed target: skill, difficulty pace, gentle rubber-band, mistakes
-  let speedFactor = op.def.skill * op.skillScale;
+  // speed target: skill, asymmetric difficulty rubber-band, mistakes
+  let speedFactor = op.def.skill * brain.skillScale;
   if (mode === "race") {
-    const band = clamp((playerDist - op.raceDist) / 200, -1, 1);
-    speedFactor *= 1 + 0.055 * band;
+    const band = clamp((ctx.playerDist - op.raceDist) / 200, -1, 1);
+    speedFactor *= 1 + (band >= 0 ? brain.rubberAhead : brain.rubberBehind) * band;
     if (op.mistakeLeft > 0) speedFactor *= 0.72;
   } else {
     speedFactor *= 0.6; // relaxed title-screen cruise
   }
-  speedFactor = clamp(speedFactor, 0.5, 1.08);
+  speedFactor = clamp(speedFactor, 0.5, 1.32);
 
-  const target = fullSend ? 55 : clamp(52 / (1 + dTheta * 9), 15, 52) * speedFactor;
+  const target = fullSend
+    ? 55 * speedFactor
+    : clamp(clamp(52 / (1 + dTheta * 9), 15, 52) * speedFactor, 15, 58);
+
+  // boost eagerness scales with difficulty — HARD rivals fire it early & often
+  const boostThreshold = 74 - 36 * brain.boostAggro;
 
   return {
     steer,
     throttle: p.speed < target ? 1 : 0,
     brake: p.speed > target * 1.3 ? 0.55 : 0,
     handbrake: Math.abs(err) > 0.62 && p.speed > 21,
-    boost: mode === "race" && p.boostMeter > 74 && dTheta < 0.05 && p.grounded,
+    boost: mode === "race" && p.boostMeter > boostThreshold && dTheta < 0.05 && p.grounded,
   };
 }

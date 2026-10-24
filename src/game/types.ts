@@ -35,20 +35,91 @@ export type GamePhase = "title" | "countdown" | "racing" | "finished";
 export type CameraMode = 0 | 1 | 2; // 0 chase near, 1 chase far, 2 hood
 export type Difficulty = "easy" | "medium" | "hard";
 
-/** Difficulty presets — crate-stack traffic, rival pace, boost economy. */
-export const DIFFICULTIES: Record<
-  Difficulty,
-  { label: string; short: string; stacks: number; aiSkill: number; boostGain: number; hint: string }
-> = {
-  easy: { label: "EASY", short: "EASY", stacks: 5, aiSkill: 0.86, boostGain: 1.3, hint: "Few crate stacks · relaxed rivals · juicy boost" },
-  medium: { label: "MEDIUM", short: "MED", stacks: 9, aiSkill: 1.0, boostGain: 1.0, hint: "The standard canyon challenge" },
-  hard: { label: "HARD", short: "HARD", stacks: 14, aiSkill: 1.08, boostGain: 0.82, hint: "Crate-strewn racing line · hungry rivals" },
+/**
+ * Difficulty presets.
+ * - stacks: how many crate-stack clusters are live
+ * - aiSkill: rival corner-speed / pace multiplier
+ * - aiSpeedCap: rival straight-line speed cap multiplier (>1 = they out-run
+ *   the player's non-boost top speed — on HARD you must drift + boost to win)
+ * - boostGain: player boost-economy scale (hard punishes wasteful boosting)
+ * - startBoost: player's boost meter when the lights go out
+ * - aiMistakeEvery: seconds between rival unforced errors (0 = flawless)
+ * - rubberAhead / rubberBehind: asymmetric catch-up — how much the rivals
+ *   speed up when the PLAYER leads, vs. how much mercy they show when behind
+ * - aiBoostAggro: 0..1 — how eagerly rivals spend boost on straights
+ * - blocking: rivals actively defend their line when just ahead of the player
+ */
+export interface DifficultyPreset {
+  label: string;
+  short: string;
+  stacks: number;
+  aiSkill: number;
+  aiSpeedCap: number;
+  boostGain: number;
+  startBoost: number;
+  aiMistakeEvery: number;
+  rubberAhead: number;
+  rubberBehind: number;
+  aiBoostAggro: number;
+  blocking: boolean;
+  hint: string;
+}
+
+export const DIFFICULTIES: Record<Difficulty, DifficultyPreset> = {
+  easy: {
+    label: "EASY",
+    short: "EASY",
+    stacks: 5,
+    aiSkill: 0.86,
+    aiSpeedCap: 0.94,
+    boostGain: 1.3,
+    startBoost: 45,
+    aiMistakeEvery: 13,
+    rubberAhead: 0.03,
+    rubberBehind: 0.1,
+    aiBoostAggro: 0.25,
+    blocking: false,
+    hint: "Few crate stacks · relaxed rivals · juicy boost",
+  },
+  medium: {
+    label: "MEDIUM",
+    short: "MED",
+    stacks: 9,
+    aiSkill: 1.0,
+    aiSpeedCap: 1.0,
+    boostGain: 1.0,
+    startBoost: 35,
+    aiMistakeEvery: 26,
+    rubberAhead: 0.05,
+    rubberBehind: 0.055,
+    aiBoostAggro: 0.55,
+    blocking: false,
+    hint: "The standard canyon challenge",
+  },
+  hard: {
+    label: "HARD",
+    short: "HARD",
+    stacks: 14,
+    aiSkill: 1.22,
+    aiSpeedCap: 1.17,
+    boostGain: 0.6,
+    startBoost: 22,
+    aiMistakeEvery: 0,
+    rubberAhead: 0.14,
+    rubberBehind: 0.02,
+    aiBoostAggro: 1.0,
+    blocking: true,
+    hint: "Flawless rivals block & out-run you · 40% weaker boost · assists off",
+  },
 };
 
 export const DIFFICULTY_ORDER: Difficulty[] = ["easy", "medium", "hard"];
 
 /** How long a smashed crate stays gone before respawning (ms). */
 export const BOX_RESPAWN_MS = 15000;
+
+/** The breakable barricade rebuilds more slowly — its absence should read clearly. */
+export const WALL_RESPAWN_MS = 30000;
 
 export interface GameSettings {
   assist: boolean;

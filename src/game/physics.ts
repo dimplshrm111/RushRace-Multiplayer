@@ -107,6 +107,9 @@ export class CarPhysics {
   isPlayer = true;
   /** Difficulty boost-economy multiplier (easy > 1, hard < 1). */
   boostScale = 1;
+  /** Difficulty straight-line speed-cap multiplier — HARD rivals (1.17) cruise
+   *  at ~61 u/s vs the player's 52, so the player must drift + boost to keep up. */
+  speedCapScale = 1;
 
   private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
   private ev: PhysicsEvents;
@@ -272,7 +275,7 @@ export class CarPhysics {
     }
 
     // ---- longitudinal forces ----
-    const cap = this.boosting ? BOOST_SPEED : MAX_SPEED;
+    const cap = this.boosting ? BOOST_SPEED : MAX_SPEED * this.speedCapScale;
     if (input.throttle > 0.02) {
       let a = ACCEL * (1 - clamp(vf / cap, -1, 1)) * input.throttle;
       if (!this.onRoad && this.grounded) a *= 0.5;

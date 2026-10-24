@@ -143,6 +143,7 @@ export function HUD({
     if (!engine || !canvas) return;
     const pts = engine.track.minimapPts;
     const gates = engine.track.gatePts;
+    const walls = engine.track.wallPts;
     let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
     for (const p of pts) {
       minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
@@ -174,6 +175,20 @@ export function HUD({
     ctx.strokeStyle = "rgba(240,100,30,0.9)";
     ctx.lineWidth = 2.5;
     ctx.stroke();
+    // BREAK barricades — amber hazard diamonds so you see them coming
+    for (const w of walls) {
+      const x = ox + w.x * scale;
+      const y = oy + w.z * scale;
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = "#ffb020";
+      ctx.strokeStyle = "#2b1c12";
+      ctx.lineWidth = 1.5;
+      ctx.fillRect(-3.4, -3.4, 6.8, 6.8);
+      ctx.strokeRect(-3.4, -3.4, 6.8, 6.8);
+      ctx.restore();
+    }
     for (const g of gates) {
       ctx.beginPath();
       ctx.arc(ox + g.x * scale, oy + g.z * scale, g.finish ? 4 : 2.5, 0, Math.PI * 2);

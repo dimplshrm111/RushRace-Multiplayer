@@ -557,6 +557,16 @@ export class AudioSystem {
     this.tone(180, 0.12, 0.16, "triangle", 0.05, 80);
   }
 
+  /** Approach alarm for the BREAK barricade — urgent two-tone warning beeps. */
+  wallWarn() {
+    if (!this.ctx) return;
+    const seq = [640, 850, 640, 850];
+    seq.forEach((f, i) => {
+      this.tone(f, 0.09, 0.16, "square", i * 0.12);
+    });
+    this.tone(160, 0.5, 0.1, "sawtooth", 0, 120);
+  }
+
   driftBank(mult: number) {
     this.tone(660 + mult * 60, 0.08, 0.16, "square");
     this.tone(990 + mult * 90, 0.1, 0.16, "square", 0.07);

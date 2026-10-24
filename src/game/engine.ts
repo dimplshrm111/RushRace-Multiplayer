@@ -15,6 +15,7 @@ import {
   DEFAULT_SETTINGS,
   DIFFICULTIES,
   PALETTE,
+  WALL_RESPAWN_MS,
   clamp,
   damp,
   type DriveInput,
@@ -262,15 +263,17 @@ export class GameEngine {
           this.audio.wallSmash();
           this.trauma = Math.min(1, this.trauma + 0.38);
           this.input.rumble(0.55, 240);
-          this.physics.boostMeter = clamp(this.physics.boostMeter + 15, 0, 100);
-          gameStore.getState().pushPopup("smash", "BREAK THROUGH! +15");
+          const add = Math.round(15 * this.physics.boostScale);
+          this.physics.boostMeter = clamp(this.physics.boostMeter + add, 0, 100);
+          gameStore.getState().pushPopup("smash", `BREAK THROUGH! +${add}`);
         } else {
           this.audio.boxHit();
           this.trauma = Math.min(1, this.trauma + 0.16);
           this.input.rumble(0.3, 130);
           if (n > 1) {
-            this.physics.boostMeter = clamp(this.physics.boostMeter + 6, 0, 100);
-            gameStore.getState().pushPopup("smash", "CRATES SMASHED +6");
+            const add = Math.round(6 * this.physics.boostScale);
+            this.physics.boostMeter = clamp(this.physics.boostMeter + add, 0, 100);
+            gameStore.getState().pushPopup("smash", `CRATES SMASHED +${add}`);
           }
         }
       },
@@ -365,16 +368,27 @@ export class GameEngine {
   applySettings(s: GameSettings) {
     const prevShadows = this.settings.shadows;
     this.settings = { ...s };
-    this.physics.assist = s.assist;
+    // HARD strips the safety net — no auto-correct, no anti-spin
+    this.physics.assist = s.difficulty === "hard" ? false : s.assist;
     this.particles.setHighDensity(s.highParticles);
     this.debris.setHighDensity(s.highParticles);
     this.audio.setVolumes(s.musicVol, s.sfxVol);
     this.input.setMouseSteer(s.mouseSteer);
-    // difficulty: crate traffic, rival pace, boost economy
+    // difficulty: crate traffic, rival pace/brain, boost economy
     const diff = DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
     this.track.setActiveStacks(diff.stacks);
     this.physics.boostScale = diff.boostGain;
-    for (const op of this.opponents) op.skillScale = diff.aiSkill;
+    for (const op of this.opponents) {
+      op.brain = {
+        skillScale: diff.aiSkill,
+        mistakeEvery: diff.aiMistakeEvery,
+        rubberAhead: diff.rubberAhead,
+        rubberBehind: diff.rubberBehind,
+        boostAggro: diff.aiBoostAggro,
+        blocking: diff.blocking,
+      };
+      op.physics.speedCapScale = diff.aiSpeedCap;
+    }
     if (prevShadows !== s.shadows) {
       this.renderer.shadowMap.enabled = s.shadows;
       this.sun.castShadow = s.shadows;
@@ -397,7 +411,8 @@ export class GameEngine {
     this.splits = [];
     this.lapTimes = [];
     this.bigAirCount = 0;
-    this.physics.boostMeter = 35;
+    this.physics.boostMeter = (DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium)
+      .startBoost;
     this.physics.driftScore = 0;
     this.physics.nearMisses = 0;
     this.physics.topSpeed = 0;
@@ -411,6 +426,7 @@ export class GameEngine {
     this.countdownT = 3;
     this.countdownShown = -99;
     this.recoverT = 0;
+    this.wallWarned.clear();
     this.lineAbs = this.track.length; // first line crossing = one length from spawn
     this.nextGateK = 0;
     this.nextGateAbs = this.gateAbs(0);
@@ -544,6 +560,7 @@ export class GameEngine {
     this.particles.update(dt, this.time);
     this.debris.update(dt);
     this.updateGateGlow();
+    this.updateWallFx();
     this.track.updateBoxes(this.time * 1000); // smashed crates come back
     this.emitTelemetry();
 
@@ -676,7 +693,12 @@ export class GameEngine {
         const best = this.bestSplits[this.splits.length - 1];
         const delta = best != null ? lapMs - best : null;
         gameStore.getState().pushPopup("checkpoint", `CHECKPOINT ${this.splits.length}`, { deltaMs: delta ?? undefined });
-        this.physics.boostMeter = clamp(this.physics.boostMeter + 12, 0, 100);
+        // HARD trims the checkpoint top-up along with every other boost gain
+        this.physics.boostMeter = clamp(
+          this.physics.boostMeter + 12 * this.physics.boostScale,
+          0,
+          100
+        );
         this.audio.checkpoint(delta);
         this.nextGateK++;
         this.nextGateAbs = this.gateAbs(this.nextGateK);
@@ -787,10 +809,13 @@ export class GameEngine {
   // ============================================================
 
   private updateOpponents(dt: number, mode: "race" | "cruise") {
-    const playerDist = this.physics.progressS - this.playerStartS;
+    const ctx = {
+      playerDist: this.physics.progressS - this.playerStartS,
+      playerLat: this.physics.lateral,
+    };
     const raceLen = this.totalLaps * this.track.length;
     for (const op of this.opponents) {
-      const inp = opponentInput(op, this.track, playerDist, dt, mode);
+      const inp = opponentInput(op, this.track, ctx, dt, mode);
       op.update(inp, dt);
       if (mode === "race" && op.finishMs == null && op.raceDist >= raceLen) {
         op.finishMs = this.raceTime;
@@ -901,7 +926,8 @@ export class GameEngine {
   private smashBox(b: TrackBox, dirX: number, dirZ: number, power: number, delay: number) {
     b.active = false;
     b.mesh.visible = false;
-    b.respawnAt = this.time * 1000 + BOX_RESPAWN_MS;
+    // barricades rebuild slowly — a smashed-open wall should read as GONE
+    b.respawnAt = this.time * 1000 + (b.wall ? WALL_RESPAWN_MS : BOX_RESPAWN_MS);
     this.particles.emitShards(b.x, b.y, b.z, b.wall ? 9 : 7);
     const groundY = b.y - b.halfH - 0.05;
     if (b.wall) {
@@ -1034,6 +1060,39 @@ export class GameEngine {
         g.glow.emissiveIntensity = 1.6 + Math.sin(this.time * 5) * 0.6;
       } else {
         g.glow.emissiveIntensity = passed ? 0.5 : 1.1;
+      }
+    }
+  }
+
+  /** BREAK-wall theatre: pulse the amber glow strips + beacons, sync them
+   *  with the wall's live state, and warn the rider (alarm + popup) as they
+   *  charge toward an intact barricade. */
+  private wallWarned = new Set<number>();
+
+  private updateWallFx() {
+    const t = this.track;
+    for (let i = 0; i < t.wallGlowMats.length; i++) {
+      const pulse = 0.5 + 0.5 * Math.sin(this.time * 5 + i * 1.7);
+      t.wallGlowMats[i].opacity = 0.45 + 0.55 * pulse;
+    }
+    for (const w of t.breakWalls) {
+      const standing = w.firstBox.active;
+      w.glow.visible = standing;
+      if (this.phase !== "racing") continue;
+      // signed distance ahead of the player (samples → meters)
+      let d = w.idx - this.physics.idx;
+      if (d < -t.N / 2) d += t.N;
+      else if (d > t.N / 2) d -= t.N;
+      const dist = d * t.step;
+      if (standing && dist > 8 && dist < 80) {
+        if (!this.wallWarned.has(w.cluster)) {
+          this.wallWarned.add(w.cluster);
+          this.audio.wallWarn();
+          gameStore.getState().pushPopup("smash", "BREAK WALL AHEAD — SMASH IT!");
+        }
+      } else if (dist <= 8 || dist > 120) {
+        // passed through (or broke it) → re-arm for the next approach
+        this.wallWarned.delete(w.cluster);
       }
     }
   }
