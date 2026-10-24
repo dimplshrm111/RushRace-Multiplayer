@@ -3,7 +3,7 @@
 import * as THREE from "three";
 import { Track, SUN_DIR, type TrackBox } from "./track";
 import { CarVisual } from "./car";
-import { CarPhysics } from "./physics";
+import { CarPhysics, SURFACE_PROPS } from "./physics";
 import { ParticleSystem } from "./particles";
 import { DebrisSystem } from "./debris";
 import { AudioSystem } from "./audio";
@@ -12,6 +12,7 @@ import { gameStore } from "./store";
 import { OPPONENT_GRID_LAT, OPPONENTS, Opponent, opponentInput } from "./ai";
 import { RemotePlayer } from "./remote";
 import type { MPRemoteState } from "./net-types";
+import type { CarModelId } from "./cars";
 import {
   BOX_RESPAWN_MS,
   DEFAULT_SETTINGS,
@@ -127,6 +128,17 @@ export class GameEngine {
   private sparkTimer = 0;
   private boostTrailTimer = 0;
 
+  // --- rear-view mirror camera (small live view on the left of the screen) ---
+  private rearCam: THREE.PerspectiveCamera | null = null;
+  private rearTarget: THREE.WebGLRenderTarget | null = null;
+  private rearCanvas: HTMLCanvasElement | null = null;
+  private rearCtx: CanvasRenderingContext2D | null = null;
+  private rearSkipFrames = 0;
+  /** exposed for the HUD to read the rear-view canvas */
+  get rearViewCanvas(): HTMLCanvasElement | null {
+    return this.rearCanvas;
+  }
+
   constructor(
     canvas: HTMLCanvasElement,
     audio: AudioSystem,
@@ -183,10 +195,13 @@ export class GameEngine {
     this.debris = new DebrisSystem(isMobile);
     this.scene.add(this.debris.group);
 
-    // cars
-    this.car = new CarVisual(false);
+    // cars — the player's SUV comes from the garage selection; the ghost
+    // replays your own model so past-you looks like present-you
+    const sel = gameStore.getState();
+    this.carColorIdx = sel.carColor;
+    this.car = new CarVisual(false, undefined, sel.carModel, sel.carColor);
     this.scene.add(this.car.group);
-    this.ghostCar = new CarVisual(true);
+    this.ghostCar = new CarVisual(true, undefined, sel.carModel, sel.carColor);
     this.ghostCar.group.visible = false;
     this.scene.add(this.ghostCar.group);
 
@@ -300,8 +315,30 @@ export class GameEngine {
     // prewarm every shader while the loading overlay is still up — the first
     // real frame then paints instantly instead of hitching on compilation
     this.renderer.compile(this.scene, this.camera);
+    this.initRearView();
     this.lastT = performance.now();
     this.loop();
+  }
+
+  /** Set up the rear-view mirror camera: a second perspective camera that
+   *  looks backward along the car's heading, rendered into a low-resolution
+   *  render target on alternate frames (cheap). The HUD overlays the canvas
+   *  in the bottom-left so the driver can see approaching cars behind them. */
+  private initRearView() {
+    // low-res render target — keeps the second render pass cheap
+    this.rearTarget = new THREE.WebGLRenderTarget(256, 144, {
+      depthBuffer: true,
+      stencilBuffer: false,
+      type: THREE.UnsignedByteType,
+    });
+    this.rearTarget.texture.colorSpace = THREE.SRGBColorSpace;
+    this.rearCam = new THREE.PerspectiveCamera(58, 256 / 144, 0.3, 600);
+    this.rearCam.up.set(0, 1, 0);
+    // canvas the HUD reads — same dimensions as the render target
+    this.rearCanvas = document.createElement("canvas");
+    this.rearCanvas.width = 256;
+    this.rearCanvas.height = 144;
+    this.rearCtx = this.rearCanvas.getContext("2d");
   }
 
   // ============================================================
@@ -432,6 +469,7 @@ export class GameEngine {
     this.bigAirCount = 0;
     this.physics.boostMeter = (DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium)
       .startBoost;
+    this.physics.nitro = 100; // nitro starts full every race
     this.physics.driftScore = 0;
     this.physics.nearMisses = 0;
     this.physics.topSpeed = 0;
@@ -523,6 +561,20 @@ export class GameEngine {
     this.applySettings(this.settings);
   }
 
+  /** Swap the player's car model/paint (visual only — physics identical). */
+  setPlayerCar(model: CarModelId, colorIdx: number) {
+    if (this.car.model === model && this.carColorIdx === colorIdx) return;
+    this.carColorIdx = colorIdx;
+    this.scene.remove(this.car.group);
+    this.car.dispose();
+    this.car = new CarVisual(false, undefined, model, colorIdx);
+    this.car.group.visible = !this.mpSpectating;
+    this.scene.add(this.car.group);
+    this.syncCarVisual(0.016);
+  }
+
+  private carColorIdx = -1;
+
   /** Late joiners / quitters watch the canyon flythrough instead of racing. */
   setSpectating(v: boolean) {
     if (this.mpSpectating === v) return;
@@ -536,7 +588,7 @@ export class GameEngine {
   }
 
   /** Match the rendered remote-car roster to the room's player list. */
-  syncRemotes(roster: { id: string; name: string; color: string }[]) {
+  syncRemotes(roster: { id: string; name: string; color: string; car?: string; carColor?: number }[]) {
     const keep = new Set(roster.map((r) => r.id));
     this.remotes = this.remotes.filter((rp) => {
       if (keep.has(rp.id)) return true;
@@ -548,9 +600,10 @@ export class GameEngine {
       const existing = this.getRemote(r.id);
       if (existing) {
         existing.setName(r.name);
+        existing.setCar(r.car, r.carColor); // garage changes rebuild the visual
         continue;
       }
-      const rp = new RemotePlayer(r.id, r.name, r.color);
+      const rp = new RemotePlayer(r.id, r.name, r.color, r.car, r.carColor ?? 0);
       this.scene.add(rp.visual.group);
       this.remotes.push(rp);
     }
@@ -570,6 +623,10 @@ export class GameEngine {
       drift: st.drift,
       ground: st.ground,
       prog: st.prog,
+      nitro: st.nitro,
+      nitroActive: st.nitroActive,
+      surface: st.surface,
+      recovering: st.recovering,
     });
   }
 
@@ -610,6 +667,7 @@ export class GameEngine {
     this.physics.boostScale = 1.0;
     this.physics.speedCapScale = 1.0;
     this.physics.boostMeter = DIFFICULTIES.medium.startBoost;
+    this.physics.nitro = 100; // nitro starts full every MP race (identical for all cars)
     this.physics.driftScore = 0;
     this.physics.nearMisses = 0;
     this.physics.topSpeed = 0;
@@ -697,6 +755,7 @@ export class GameEngine {
     for (const rp of this.remotes) rp.dispose();
     this.particles.dispose();
     this.debris.dispose();
+    this.rearTarget?.dispose();
     this.renderer.dispose();
   }
 
@@ -761,7 +820,7 @@ export class GameEngine {
           ? 1
           : this.phase === "finished"
             ? 1
-            : clamp(1 + (this.physics.speed > 26 ? 1 : 0) + (this.physics.boosting || this.physics.boostMeter > 82 ? 1 : 0), 0, 3);
+            : clamp(1 + (this.physics.speed > 26 ? 1 : 0) + (this.physics.boosting || this.physics.nitroActive || this.physics.boostMeter > 82 ? 1 : 0), 0, 3);
     this.audio.update(dt, {
       rpm:
         this.phase === "countdown"
@@ -772,14 +831,81 @@ export class GameEngine {
       throttle: this.phase === "racing" ? input.throttle : this.phase === "countdown" ? input.throttle * 0.7 : 0,
       speed: this.physics.speed,
       driftIntensity: this.physics.drifting ? clamp(Math.abs(this.physics.slip) / 0.5, 0, 1) : 0,
-      boosting: this.physics.boosting && this.phase === "racing",
+      boosting: (this.physics.boosting || this.physics.nitroActive) && this.phase === "racing",
       wallRide: this.physics.wallRiding,
       musicIntensity: intensity,
     });
 
     // render directly to the canvas — keeps MSAA + tone mapping crisp
     this.renderer.render(this.scene, this.camera);
+    // rear-view mirror — render on alternate frames (cheap) and only while
+    // racing/countdown/finished (never on the title flythrough)
+    this.renderRearView();
   };
+
+  /** Render the rear-view camera into its canvas (low-res, every other frame). */
+  private renderRearView() {
+    if (
+      !this.rearCam ||
+      !this.rearTarget ||
+      !this.rearCanvas ||
+      !this.rearCtx ||
+      this.phase === "title"
+    ) {
+      return;
+    }
+    // skip every other frame — half the cost, still smooth at 30 Hz
+    this.rearSkipFrames = (this.rearSkipFrames + 1) % 2;
+    if (this.rearSkipFrames !== 0) return;
+    const p = this.physics;
+    // position the rear cam just behind & above the car, looking BACKWARDS
+    // (yaw + PI = reverse direction). Slightly raised so the road behind is
+    // visible over the car's roofline.
+    const back = this.tmpV.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw)); // backward = -forward
+    const camX = p.pos.x + back.x * 5.5;
+    const camY = p.pos.y + 2.6;
+    const camZ = p.pos.z + back.z * 5.5;
+    this.rearCam.position.set(camX, camY, camZ);
+    // look in the backward direction (toward where cars behind would be)
+    this.rearCam.lookAt(p.pos.x + back.x * 50, p.pos.y + 0.5, p.pos.z + back.z * 50);
+    // render the scene from the rear cam into the render target
+    const prevTarget = this.renderer.getRenderTarget();
+    this.renderer.setRenderTarget(this.rearTarget);
+    // hide the player's own car so it doesn't block the rear view
+    const wasVisible = this.car.group.visible;
+    this.car.group.visible = false;
+    this.renderer.render(this.scene, this.rearCam);
+    this.car.group.visible = wasVisible;
+    this.renderer.setRenderTarget(prevTarget);
+    // copy the render target pixels into the 2D canvas (the HUD reads this)
+    // reading from a WebGLRenderTarget is expensive on some GPUs, but at
+    // 256x144 every other frame it's a few hundred microseconds — acceptable.
+    try {
+      const img = this.renderer.domElement; // not the target — read pixels directly
+      void img;
+      // Three.js: use readRenderTargetPixels into a Uint8ClampedArray, then
+      // putImageData onto the canvas. We allocate the buffer once.
+      if (!this.rearBuf || this.rearBuf.length !== 256 * 144 * 4) {
+        this.rearBuf = new Uint8ClampedArray(256 * 144 * 4);
+      }
+      this.renderer.readRenderTargetPixels(this.rearTarget, 0, 0, 256, 144, this.rearBuf);
+      // WebGL origin is bottom-left; canvas is top-left — flip vertically
+      if (!this.rearImg) {
+        this.rearImg = this.rearCtx.createImageData(256, 144);
+      }
+      const dst = this.rearImg.data;
+      for (let y = 0; y < 144; y++) {
+        const srcRow = (143 - y) * 256 * 4;
+        const dstRow = y * 256 * 4;
+        dst.set(this.rearBuf.subarray(srcRow, srcRow + 256 * 4), dstRow);
+      }
+      this.rearCtx.putImageData(this.rearImg, 0, 0);
+    } catch {
+      // readRenderTargetPixels can fail on context loss — silently skip
+    }
+  }
+  private rearBuf: Uint8ClampedArray | null = null;
+  private rearImg: ImageData | null = null;
 
   private updateCountdown(dt: number) {
     this.countdownT -= dt;
@@ -981,17 +1107,35 @@ export class GameEngine {
     this.audio.recovery();
     gameStore.getState().pushPopup("recovery", "RECOVERED — HOLD YOUR LINE!");
     const t = this.track;
+    // Recovery target: the LAST checkpoint the player passed (so they don't
+    // lose progress). If they haven't passed any gate yet, drop them just
+    // behind the start/finish line. Place them on the racing line (lat=0)
+    // a few samples PAST the gate so they're already moving forward, facing
+    // the correct way (the physics.place() sets yaw from the track direction).
+    let gateK: number;
+    let gateIdx: number;
     if (this.nextGateK > 0) {
-      const gate = t.gates[this.nextGateK - 1];
-      const idx = wrapI(gate.idx + 4, t.N);
-      const baseS = this.lineAbs + gate.idx * t.step;
-      this.physics.place(idx, 0, 13, false);
-      this.physics.syncProgress(baseS + 4 * t.step);
+      // last passed gate
+      gateK = this.nextGateK - 1;
+      gateIdx = t.gates[gateK].idx;
     } else {
-      // no gate passed yet this lap → back to the lap start line
-      this.physics.place(t.N - 10, 0, 13, false);
-      this.physics.syncProgress(this.lineAbs - 20);
+      // no gate passed yet this lap → back to the start/finish line
+      gateK = t.gates.length - 1; // the finish line is the last gate
+      gateIdx = t.gates[gateK].idx;
     }
+    const fwdOffset = 4; // samples past the gate
+    const placeIdx = wrapI(gateIdx + fwdOffset, t.N);
+    // compute the unwrapped progress for this position
+    const baseS =
+      (gateK === t.gates.length - 1 ? this.lineAbs - t.length : this.lineAbs + gateIdx * t.step) +
+      fwdOffset * t.step;
+    // place on the racing line (lat=0), small forward speed so momentum carries
+    this.physics.place(placeIdx, 0, 14, false);
+    this.physics.syncProgress(baseS);
+    // reset nitro/drift state so the recovered car doesn't inherit a broken slide
+    this.physics.drifting = false;
+    this.physics.driftChain = 0;
+    this.physics.yawRate = 0;
     this.syncCarVisual(0.016);
     this.trauma = Math.min(1, this.trauma + 0.3);
   }
@@ -1211,13 +1355,21 @@ export class GameEngine {
     const g = this.car.group;
     g.position.copy(p.pos);
     g.rotation.set(0, p.yaw, 0);
-    // align to ground slope (continuous queries — no per-sample stepping)
+    // align to ground slope + suspension-driven body pitch/roll
+    // (the physics now produces bodyPitch from weight transfer + bodyRoll
+    //  from lateral load shift; we combine them with the slope for the
+    //  chassis orientation so the SUV leans through corners and squats
+    //  under braking just like a real one)
     if (p.grounded) {
       const slopeL = this.track.slopeLatAtP(p.groundP, p.lateral);
       const slopeF = this.track.slopeFwdAtP(p.groundP, p.lateral);
       g.rotation.order = "YXZ";
-      g.rotation.x = damp(g.rotation.x, clamp(-Math.atan(slopeF), -0.5, 0.5), 8, dt);
-      g.rotation.z = damp(g.rotation.z, clamp(Math.atan(slopeL), -0.9, 0.9), 8, dt);
+      // pitch = ground slope + weight-transfer pitch (brake = nose dive)
+      const targetPitch = clamp(-Math.atan(slopeF), -0.5, 0.5) + p.bodyPitch;
+      // roll = ground slope roll + weight-transfer roll (cornering = lean out)
+      const targetRoll = clamp(Math.atan(slopeL), -0.9, 0.9) + p.bodyRoll;
+      g.rotation.x = damp(g.rotation.x, targetPitch, 8, dt);
+      g.rotation.z = damp(g.rotation.z, targetRoll, 8, dt);
       if (p.wallRiding) {
         const side = this.track.sample(p.idx).wallRideR && p.lateral > 0 ? 1 : -1;
         g.rotation.z = damp(g.rotation.z, side * clamp(Math.atan(slopeL), -1.15, 1.15), 8, dt);
@@ -1235,10 +1387,10 @@ export class GameEngine {
       steer: this.lastSteer,
       slip: p.drifting ? p.slip : 0,
       grounded: p.grounded,
-      boosting: p.boosting,
+      boosting: p.boosting || p.nitroActive,
       braking: this.lastBrake > 0.05,
       pitchRate: this.lastAccel,
-      rollRate: p.drifting ? -p.slip * 12 : 0,
+      rollRate: p.drifting ? -p.slip * 12 : -p.bodyRoll * 8,
       dt,
     });
   }
@@ -1298,8 +1450,8 @@ export class GameEngine {
         }
       }
     }
-    // boost trail
-    if (p.boosting) {
+    // boost trail (fires for both nitro and the drift-bank boost)
+    if (p.boosting || p.nitroActive) {
       this.boostTrailTimer -= dt;
       if (this.boostTrailTimer <= 0) {
         this.boostTrailTimer = 0.02;
@@ -1453,10 +1605,11 @@ export class GameEngine {
       return;
     }
 
-    // chase camera
+    // chase camera — raised ~5% (height × 1.05) per user request, preserving
+    // the existing angle (dist unchanged) and smooth-follow behaviour
     const mode = this.settings.cameraMode;
     const dist = mode === 1 ? 9.6 : 6.4;
-    const height = mode === 1 ? 3.8 : 2.55;
+    const height = mode === 1 ? 3.99 : 2.68; // was 3.8 / 2.55 — +5% lift
     if (mode === 2) {
       // hood cam
       this.camPos.set(p.pos.x + fwd.x * 0.5, p.pos.y + 1.35, p.pos.z + fwd.z * 0.5);
@@ -1490,7 +1643,7 @@ export class GameEngine {
 
     // FOV kick
     const speedFrac = clamp(p.speed / 55, 0, 1.1);
-    const targetFov = 64 + speedFrac * 10 + (p.boosting ? 9 : 0);
+    const targetFov = 64 + speedFrac * 10 + ((p.boosting || p.nitroActive) ? 9 : 0);
     this.fov = damp(this.fov, targetFov, 4, dt);
     this.camera.fov = this.fov;
     this.camera.updateProjectionMatrix();
@@ -1520,6 +1673,7 @@ export class GameEngine {
   private emitTelemetry() {
     const p = this.physics;
     const { gear, rpm } = p.gearAndRpm();
+    const surf = SURFACE_PROPS[p.surfaceBlend];
     const t: Telemetry = {
       speedKmh: p.speedKmh,
       boostMeter: p.boostMeter,
@@ -1553,6 +1707,11 @@ export class GameEngine {
       gear,
       rpm,
       progressPct: p.lapProgress,
+      nitro: p.nitro,
+      nitroActive: p.nitroActive,
+      surface: p.surfaceBlend,
+      surfaceLabel: surf.label,
+      surfaceColour: surf.colour,
     };
     for (const fn of this.telemetryListeners) fn(t);
   }

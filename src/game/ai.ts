@@ -4,6 +4,7 @@ import * as THREE from "three";
 import { Track, type TrackBox } from "./track";
 import { CarPhysics } from "./physics";
 import { CarVisual } from "./car";
+import type { CarModelId } from "./cars";
 import { clamp, damp, type DriveInput } from "./types";
 
 function angDiff(a: number, b: number): number {
@@ -22,15 +23,17 @@ export interface OpponentDefinition {
   cssColor: string;
   body: number;
   accent: number;
+  /** garage model the rival drives (visual only) */
+  car: CarModelId;
   /** 0..1 — corner-speed confidence & steering sharpness */
   skill: number;
 }
 
-/** The three rival buggies (identical performance, different skill). */
+/** The three rivals (identical performance, different rides & skill). */
 export const OPPONENTS: OpponentDefinition[] = [
-  { name: "VIPER", cssColor: "#2f9e63", body: 0x2f9e63, accent: 0xfff3dd, skill: 0.975 },
-  { name: "MESA", cssColor: "#d64530", body: 0xd64530, accent: 0xffe9c9, skill: 0.94 },
-  { name: "HAWK", cssColor: "#1f8a70", body: 0x1f8a70, accent: 0xfff3dd, skill: 0.9 },
+  { name: "VIPER", cssColor: "#2f9e63", body: 0x2f9e63, accent: 0x44484f, car: "bison", skill: 0.975 },
+  { name: "MESA", cssColor: "#d64530", body: 0xd64530, accent: 0x2b2d31, car: "himalaya", skill: 0.94 },
+  { name: "HAWK", cssColor: "#1f8a70", body: 0x1f8a70, accent: 0xb9bec4, car: "falcon", skill: 0.9 },
 ];
 
 /** Per-difficulty driving brain, set by the engine from DIFFICULTIES. */
@@ -115,7 +118,7 @@ export class Opponent {
     });
     this.physics.isPlayer = false;
 
-    this.visual = new CarVisual(false, { body: def.body, accent: def.accent });
+    this.visual = new CarVisual(false, { body: def.body, accent: def.accent }, def.car);
 
     // floating name tag
     const cvs = document.createElement("canvas");

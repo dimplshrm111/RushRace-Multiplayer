@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import {
+  Car,
   Check,
   Copy,
   Crown,
@@ -17,6 +18,8 @@ import {
 } from "lucide-react";
 import { net } from "@/game/net";
 import { useMPStore } from "@/game/net-store";
+import { useGameStore } from "@/game/store";
+import { carModelName } from "@/game/cars";
 import { formatTime, type StandingEntry } from "@/game/types";
 import type { GameEngine } from "@/game/engine";
 import { ChatPanel } from "./ChatPanel";
@@ -26,7 +29,7 @@ function PlayerRow({
   isMe,
   isHost,
 }: {
-  p: { id: string; name: string; color: string; ready: boolean; connected: boolean; racing: boolean };
+  p: { id: string; name: string; color: string; car: string; ready: boolean; connected: boolean; racing: boolean };
   isMe: boolean;
   isHost: boolean;
 }) {
@@ -41,9 +44,14 @@ function PlayerRow({
         style={{ backgroundColor: p.color }}
         aria-hidden
       />
-      <span className="min-w-0 flex-1 truncate text-sm font-black text-[#fff6e6]">
-        {p.name}
-        {isMe && <span className="ml-1.5 text-[10px] font-bold text-[#ffb020]">(YOU)</span>}
+      <span className="min-w-0 flex-1 truncate">
+        <span className="block truncate text-sm font-black text-[#fff6e6]">
+          {p.name}
+          {isMe && <span className="ml-1.5 text-[10px] font-bold text-[#ffb020]">(YOU)</span>}
+        </span>
+        <span className="flex items-center gap-1 text-[9px] font-black tracking-wider text-[#c9a06a]">
+          <Car className="h-2.5 w-2.5" aria-hidden /> {carModelName(p.car)}
+        </span>
       </span>
       {isHost && (
         <span className="flex items-center gap-0.5 rounded bg-[#ffb020] px-1.5 py-0.5 text-[9px] font-black tracking-wider text-[#2b1c12]" title="Host">
@@ -86,6 +94,7 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
     !!room && room.players.filter((p) => p.connected).every((p) => p.ready);
   const raceLive = room?.phase === "countdown" || room?.phase === "racing" || room?.phase === "results";
   const spectating = raceLive && !my?.racing;
+  const setGarageOpen = useGameStore((s) => s.setGarageOpen);
 
   // live standings while spectating a race
   useEffect(() => {
@@ -211,7 +220,18 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
                 <span className="text-[10px] font-black tracking-[0.3em] text-[#ffb020]">
                   DRIVERS ({room.players.length}/{room.maxPlayers})
                 </span>
-                {/* rename */}
+                <div className="flex items-center gap-1">
+                  {/* garage — change your car anytime (syncs to the room) */}
+                  <button
+                    type="button"
+                    onClick={() => setGarageOpen(true)}
+                    disabled={raceLive && my.racing}
+                    className="flex items-center gap-1 rounded border border-[rgba(255,246,230,0.35)] px-2 py-1 text-[10px] font-black text-[#f6e3c2] transition-colors hover:bg-[rgba(255,246,230,0.12)] disabled:opacity-40"
+                    aria-label="Open the garage to change your car"
+                  >
+                    <Car className="h-3 w-3" aria-hidden /> GARAGE
+                  </button>
+                  {/* rename */}
                 {renaming ? (
                   <div className="flex items-center gap-1">
                     <input
@@ -246,6 +266,7 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
                     <Pencil className="h-3 w-3" aria-hidden /> RENAME
                   </button>
                 )}
+                </div>
               </div>
               {renameErr && <div className="mb-1.5 text-[10px] font-bold text-[#ff9a8a]">{renameErr}</div>}
               <div className="flex max-h-64 flex-col gap-1 overflow-y-auto settings-scroll pr-0.5">

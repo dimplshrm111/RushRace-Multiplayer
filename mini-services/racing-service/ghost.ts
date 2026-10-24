@@ -11,8 +11,9 @@ import { io, type Socket } from "socket.io-client";
 const URL = "http://localhost:3003";
 const code = (process.argv[2] ?? "").toUpperCase();
 const name = process.argv[3] ?? "GHOST";
+const car = process.argv[4] ?? "sultan";
 if (code.length !== 4) {
-  console.error("usage: bun run ghost.ts <CODE> [NAME]");
+  console.error("usage: bun run ghost.ts <CODE> [NAME] [CAR]");
   process.exit(1);
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -45,6 +46,8 @@ sock.on("connect", async () => {
   myPid = r.pid;
   console.log("[ghost] joined room", code, "as", name, r.pid);
   await sleep(300);
+  await ack(sock, "mp:car", { model: car, color: 0 });
+  console.log("[ghost] driving a", car);
   await ack(sock, "mp:chat", { text: "hey pilot! ghost driver reporting in" });
   await sleep(400);
   await ack(sock, "mp:ready", { ready: true });

@@ -55,7 +55,15 @@ export class InputManager {
     this.keys.add(code);
     const now = performance.now();
     if (code === "Space") this.lastDriftPress = now;
-    if (code === "ShiftLeft" || code === "KeyK") this.lastBoostPress = now;
+    // Nitro / boost: Shift, K, X (user-requested), or Numpad0 (user-requested)
+    if (
+      code === "ShiftLeft" ||
+      code === "KeyK" ||
+      code === "KeyX" ||
+      code === "Numpad0"
+    ) {
+      this.lastBoostPress = now;
+    }
     if (code === "KeyC") this.fireAction("camera");
     if (code === "KeyR") this.fireAction("restart");
     if (code === "Escape" || code === "KeyP") this.fireAction("pause");
@@ -178,7 +186,15 @@ export class InputManager {
     if (k.has("KeyW") || k.has("ArrowUp")) out.throttle = 1;
     if (k.has("KeyS") || k.has("ArrowDown")) out.brake = 1;
     if (k.has("Space")) out.handbrake = true;
-    if (k.has("ShiftLeft") || k.has("KeyK")) out.boost = true;
+    // Nitro: Shift, K, X, or Numpad0 — all map to the boost input
+    if (
+      k.has("ShiftLeft") ||
+      k.has("KeyK") ||
+      k.has("KeyX") ||
+      k.has("Numpad0")
+    ) {
+      out.boost = true;
+    }
     if (keySteer !== 0) out.steer = keySteer;
 
     if (this.mouseSteerEnabled && !this.usingGamepad) {

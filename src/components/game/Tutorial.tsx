@@ -31,12 +31,24 @@ const STEPS: Step[] = [
     ),
   },
   {
-    title: "BOOST",
+    title: "NITRO & BOOST",
     accent: "#d64530",
     body: (
       <>
-        <p>Hold <b>SHIFT</b> (or <b>X / RB</b> / BOOST) to burn the meter for raw speed.</p>
-        <p className="mt-1 text-[#5a3c28]">Earn boost by drifting, <b>airtime</b>, <b>wall-rides</b>, <b>near-misses</b>, clean landings and checkpoints.</p>
+        <p>Hold <b>X</b> or <b>NUM 0</b> (also <b>SHIFT</b> / <b>K</b> / RB / NITRO button) for raw speed.</p>
+        <p className="mt-1 text-[#5a3c28]"><b>NITRO</b> is your main boost bar — it recharges fully in <b>10s</b> when you let go. Identical for every car.</p>
+        <p className="mt-1 text-[#5a3c28]">Drifting, <b>airtime</b>, <b>wall-rides</b>, <b>near-misses</b>, clean landings and checkpoints also feed the bonus <b>BOOST</b> bank.</p>
+      </>
+    ),
+  },
+  {
+    title: "SURFACES",
+    accent: "#9b6b3f",
+    body: (
+      <>
+        <p>Every surface drives differently — watch the chip under your speed.</p>
+        <p className="mt-1 text-[#5a3c28]"><b>Tarmac</b> &amp; <b>concrete</b> = max grip. <b>Dirt</b> &amp; <b>gravel</b> = loose. <b>Grass</b> drags. <b>Sand</b> &amp; <b>mud</b> slow you hard. <b>Wet</b> road is slippy. <b>Rock</b> is bumpy.</p>
+        <p className="mt-1 text-[#5a3c28]">Brake earlier off-road, drifts are easier on loose surfaces, and slopes affect your speed naturally.</p>
       </>
     ),
   },

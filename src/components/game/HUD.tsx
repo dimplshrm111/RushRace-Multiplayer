@@ -26,6 +26,12 @@ export function HUD({
   const gearRef = useRef<HTMLSpanElement>(null);
   const boostRef = useRef<HTMLDivElement>(null);
   const boostLabelRef = useRef<HTMLSpanElement>(null);
+  const nitroRef = useRef<HTMLDivElement>(null);
+  const nitroLabelRef = useRef<HTMLSpanElement>(null);
+  const nitroBtnRef = useRef<HTMLDivElement>(null);
+  const surfaceRef = useRef<HTMLDivElement>(null);
+  const surfaceChipRef = useRef<HTMLDivElement>(null);
+  const rearViewRef = useRef<HTMLCanvasElement>(null);
   const driftRef = useRef<HTMLDivElement>(null);
   const lapRef = useRef<HTMLSpanElement>(null);
   const timeRef = useRef<HTMLDivElement>(null);
@@ -71,6 +77,26 @@ export function HUD({
     }
   }, [countdownValue]);
 
+  // rear-view mirror — copy the engine's low-res rear canvas onto the
+  // displayed canvas every frame (the engine renders at 30 Hz, we just blit)
+  useEffect(() => {
+    const engine = engineRef.current;
+    const dst = rearViewRef.current;
+    if (!engine || !dst) return;
+    const ctx = dst.getContext("2d");
+    if (!ctx) return;
+    let raf = 0;
+    const draw = () => {
+      raf = requestAnimationFrame(draw);
+      const src = engine.rearViewCanvas;
+      if (src) {
+        ctx.drawImage(src, 0, 0, dst.width, dst.height);
+      }
+    };
+    raf = requestAnimationFrame(draw);
+    return () => cancelAnimationFrame(raf);
+  }, [engineRef]);
+
   // telemetry via direct DOM updates (no react re-render)
   useEffect(() => {
     const engine = engineRef.current;
@@ -88,6 +114,42 @@ export function HUD({
             : "linear-gradient(90deg,#e8a04c,#d97a2e)";
       }
       if (boostLabelRef.current) boostLabelRef.current.textContent = t.boosting ? "BOOST!" : "BOOST";
+      // nitro meter (separate from the drift/near-miss boost bank)
+      if (nitroRef.current) {
+        nitroRef.current.style.width = `${t.nitro}%`;
+        nitroRef.current.style.background = t.nitroActive
+          ? "linear-gradient(90deg,#ffd23f,#ff3a1f)"
+          : t.nitro > 50
+            ? "linear-gradient(90deg,#ff8a3f,#f0641e)"
+            : t.nitro > 15
+              ? "linear-gradient(90deg,#d97a2e,#c45a1e)"
+              : "linear-gradient(90deg,#7a3a1e,#5a2810)";
+      }
+      if (nitroLabelRef.current) {
+        nitroLabelRef.current.textContent = t.nitroActive
+          ? "NITRO!"
+          : t.nitro < 5
+            ? "EMPTY"
+            : t.nitro > 95
+              ? "READY"
+              : "NITRO";
+      }
+      if (nitroBtnRef.current) {
+        // the on-screen NITRO key indicator pulses while active
+        nitroBtnRef.current.style.boxShadow = t.nitroActive
+          ? "0 0 18px 4px rgba(255,210,63,0.85)"
+          : "0 0 0 0 rgba(255,210,63,0)";
+        nitroBtnRef.current.style.borderColor = t.nitro > 15 ? "#ffd23f" : "#7a3a1e";
+      }
+      // surface chip — shows the current driving surface (TARMAC/DIRT/SAND/…)
+      if (surfaceRef.current) surfaceRef.current.textContent = t.surfaceLabel;
+      if (surfaceChipRef.current) {
+        surfaceChipRef.current.style.background = t.surfaceColour;
+        surfaceChipRef.current.style.color =
+          t.surface === "asphalt" || t.surface === "wet" || t.surface === "mud"
+            ? "#fff6e6"
+            : "#2b1c12";
+      }
       if (driftRef.current) {
         driftRef.current.style.opacity = t.drifting ? "1" : "0";
         const mult = driftRef.current.querySelector("b");
@@ -263,6 +325,22 @@ export function HUD({
         </div>
       </div>
 
+      {/* rear-view mirror — small live camera on the LEFT side, below the minimap.
+          Shows the road and approaching cars behind the player. */}
+      <div className="absolute left-3 top-[200px] flex flex-col gap-0.5 sm:top-[260px]">
+        <div className="flex items-center gap-1.5 rounded-t-md bg-[rgba(43,28,18,0.82)] px-2 py-0.5 text-[9px] font-black tracking-[0.25em] text-[#ffd23f] shadow-lg backdrop-blur-[2px]">
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#d64530]" />
+          REAR
+        </div>
+        <canvas
+          ref={rearViewRef}
+          width={256}
+          height={144}
+          className="block h-[72px] w-[128px] rounded-b-md border-2 border-t-0 border-[#2b1c12] bg-[#2b1c12] shadow-lg sm:h-[90px] sm:w-[160px]"
+          aria-label="Rear view mirror"
+        />
+      </div>
+
       {/* wrong way */}
       <div ref={wrongRef} className="absolute left-1/2 top-1/3 -translate-x-1/2 rounded-md bg-[#d64530] px-5 py-2 font-[family-name:var(--font-bungee)] text-xl text-[#fff6e6] opacity-0 shadow-xl transition-opacity [text-shadow:0_2px_0_rgba(43,28,18,0.4)]">
         ⚠ WRONG WAY
@@ -287,6 +365,31 @@ export function HUD({
           <div className="h-3 overflow-hidden rounded-full border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.6)]">
             <div ref={boostRef} className="h-full w-0 rounded-full transition-[width] duration-100" style={{ background: "linear-gradient(90deg,#e8a04c,#d97a2e)" }} />
           </div>
+        </div>
+        {/* nitro meter — separate energy bar; recharges passively in 10s.
+            Bind: X / Numpad0 / Shift / K / touch NITRO button */}
+        <div className="w-44 sm:w-56">
+          <div className="mb-0.5 flex items-center justify-between">
+            <span ref={nitroLabelRef} className="text-[10px] font-black tracking-[0.25em] text-[#2b1c12] [text-shadow:0_1px_0_rgba(255,246,230,0.6)]">NITRO</span>
+            <span className="text-[9px] font-bold text-[#5a3c28]">X / NUM 0</span>
+          </div>
+          <div className="h-3 overflow-hidden rounded-full border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.6)]">
+            <div ref={nitroRef} className="h-full w-full rounded-full transition-[width] duration-100" style={{ background: "linear-gradient(90deg,#ff8a3f,#f0641e)" }} />
+          </div>
+        </div>
+        {/* surface chip — current driving surface (TARMAC / DIRT / SAND / …) */}
+        <div className="flex w-fit items-center gap-1.5 rounded border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.82)] px-2 py-0.5">
+          <div ref={surfaceChipRef} className="h-2.5 w-2.5 rounded-sm" style={{ background: "#4a4640" }} />
+          <span ref={surfaceRef} className="text-[10px] font-black tracking-[0.2em] text-[#2b1c12]">TARMAC</span>
+        </div>
+        {/* nitro key indicator (keyboard hint + active glow) */}
+        <div
+          ref={nitroBtnRef}
+          className="flex w-fit items-center gap-1.5 rounded border-2 bg-[rgba(43,28,18,0.72)] px-2 py-0.5 text-[10px] font-black tracking-[0.2em] text-[#ffd23f] transition-[box-shadow] duration-100"
+          style={{ borderColor: "#ffd23f" }}
+        >
+          <span>NITRO</span>
+          <span className="text-[#fff6e6]">[X]</span>
         </div>
       </div>
 

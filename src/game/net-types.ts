@@ -8,6 +8,9 @@ export interface MPRoomPlayer {
   id: string;
   name: string;
   color: string;
+  /** garage selection (visual only) */
+  car: string;
+  carColor: number;
   ready: boolean;
   connected: boolean;
   grid: number;
@@ -50,6 +53,15 @@ export interface MPRemoteState {
   ground: boolean;
   lap: number;
   prog: number;
+  /** nitro meter 0..100 (synced so every client shows the same boost level) */
+  nitro?: number;
+  /** nitro currently engaged (for flame-trail + audio on remote cars) */
+  nitroActive?: boolean;
+  /** current driving surface (so remote cars render the right dust colour) */
+  surface?: string;
+  /** set true for one tick after a recovery teleport — other clients snap
+   *  instead of interpolating, so the recovered car doesn't rubber-band */
+  recovering?: boolean;
 }
 
 export interface MPResultEntry {

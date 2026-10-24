@@ -2,6 +2,7 @@
 
 import * as THREE from "three";
 import { CarVisual } from "./car";
+import { DEFAULT_CAR, paintFor, type CarModelId } from "./cars";
 import { clamp, damp } from "./types";
 
 /** A received car-state sample, stamped with client receipt time. */
@@ -17,10 +18,18 @@ export interface RemoteSnapshot {
   drift: boolean;
   ground: boolean;
   prog: number;
+  /** nitro meter 0..100 (synced display) */
+  nitro?: number;
+  /** nitro currently engaged (flame-trail + audio on the remote car) */
+  nitroActive?: boolean;
+  /** driving surface the car is on (for dust colour) */
+  surface?: string;
+  /** true for one tick after a recovery teleport — snap instead of interp */
+  recovering?: boolean;
 }
 
-const INTERP_DELAY_MS = 120; // render this far behind the newest sample
-const EXTRAPOLATE_MS = 300; // dead-reckon at most this far ahead
+const INTERP_DELAY_MS = 90; // render this far behind the newest sample (lower = less latency, more jitter risk)
+const EXTRAPOLATE_MS = 220; // dead-reckon at most this far ahead (lower = less rubber-banding on packet loss)
 const STALE_MS = 2500; // hold position after this long without data
 
 function angLerp(a: number, b: number, t: number): number {
@@ -39,6 +48,8 @@ export class RemotePlayer {
   readonly id: string;
   name: string;
   readonly colorCss: string;
+  model: CarModelId;
+  colorIdx = 0;
   /** total race progress (progressS) — for standings */
   progressS = 0;
   /** server-assigned finish (null while racing) */
@@ -61,14 +72,13 @@ export class RemotePlayer {
   private vz = 0;
   private lastSnapAt = 0;
 
-  constructor(id: string, name: string, colorCss: string) {
+  constructor(id: string, name: string, colorCss: string, car?: string, carColorIdx = 0) {
     this.id = id;
     this.name = name;
     this.colorCss = colorCss;
-    this.visual = new CarVisual(false, {
-      body: parseInt(colorCss.slice(1), 16),
-      accent: 0xfff3dd,
-    });
+    this.model = (car as CarModelId) || DEFAULT_CAR;
+    this.colorIdx = carColorIdx;
+    this.visual = this.buildVisual();
     this.visual.group.visible = false;
     this.labelTex = RemotePlayer.makeLabel(name, colorCss);
     this.labelMat = new THREE.SpriteMaterial({
@@ -81,6 +91,35 @@ export class RemotePlayer {
     this.label.position.set(0, 2.75, 0);
     this.label.renderOrder = 4;
     this.visual.group.add(this.label);
+  }
+
+  private buildVisual(): CarVisual {
+    // the car wears the driver's SELECTED paint (model + colour option);
+    // their room identity colour stays on the label chip + minimap blip
+    const paint = paintFor(this.model, this.colorIdx);
+    return new CarVisual(false, { body: paint.body }, this.model);
+  }
+
+  /** Swap the car model/paint when the driver changes it in the garage. */
+  setCar(car: string | undefined, colorIdx: number | undefined): boolean {
+    const model = (car as CarModelId) || DEFAULT_CAR;
+    const color = colorIdx ?? 0;
+    if (model === this.model && color === this.colorIdx) return false;
+    const parent = this.visual.group.parent;
+    const wasVisible = this.visual.group.visible;
+    const pos = this.visual.group.position.clone();
+    const rot = this.visual.group.rotation.clone();
+    this.visual.dispose();
+    if (parent) parent.remove(this.visual.group);
+    this.model = model;
+    this.colorIdx = color;
+    this.visual = this.buildVisual();
+    this.visual.group.add(this.label);
+    this.visual.group.position.copy(pos);
+    this.visual.group.rotation.copy(rot);
+    this.visual.group.visible = wasVisible;
+    if (parent) parent.add(this.visual.group);
+    return true;
   }
 
   private static makeLabel(name: string, color: string): THREE.CanvasTexture {
@@ -126,6 +165,24 @@ export class RemotePlayer {
 
   push(s: Omit<RemoteSnapshot, "t">) {
     const t = performance.now();
+    // recovery teleport: if the owner flagged this tick as recovering, snap
+    // to the new position instead of buffering it (which would interpolate
+    // across the gap and look like a rubber-band sprint). Clear the buffer
+    // so the next render uses the new position directly.
+    if (s.recovering) {
+      this.buf = [{ ...s, t }];
+      this.lastSnapAt = t;
+      this.progressS = s.prog;
+      this.active = true;
+      this.visual.group.visible = true;
+      this.rx = s.x;
+      this.ry = s.y;
+      this.rz = s.z;
+      this.ryaw = s.yaw;
+      this.vx = 0;
+      this.vz = 0;
+      return;
+    }
     const last = this.buf[this.buf.length - 1];
     if (last) {
       const dt = Math.max(0.016, (t - last.t) / 1000);
@@ -209,7 +266,7 @@ export class RemotePlayer {
       steer: newest.steer,
       slip: newest.drift ? 0.4 : 0,
       grounded: newest.ground,
-      boosting: newest.boost,
+      boosting: newest.boost || !!newest.nitroActive, // nitro flame on remote cars
       braking: false,
       pitchRate: 0,
       rollRate: newest.drift ? -4.8 : 0,

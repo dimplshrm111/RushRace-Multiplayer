@@ -13,6 +13,23 @@ function wrapIdx(i: number, n: number): number {
   return ((i % n) + n) % n;
 }
 
+/**
+ * Driving surface types — each one has its own physics profile (grip,
+ * rolling resistance, acceleration penalty, braking response) defined in
+ * physics.ts via SURFACE_PROPS. The track samples carry one of these per
+ * location; off-road shoulders fall back through a graded transition.
+ */
+export type Surface =
+  | "asphalt" // primary race surface — max grip, max speed
+  | "concrete" // tunnel floor / gantries — slightly less grip, very stable
+  | "dirt" // graded terrace / dual-line low side — loose, reduced grip
+  | "gravel" // shoulder edges — slippy, slows you
+  | "grass" // outside the shoulders — soft, drags the car
+  | "sand" // riverbed / dry pit — heavy drag, very low grip
+  | "mud" // wet patches in the riverbed — slow + slidy
+  | "wet" // wet asphalt (after the riverbed climb) — reduced grip
+  | "rock"; // bare rock (arch pillars zone) — bumpy, medium grip
+
 export interface TrackSample {
   x: number;
   y: number;
@@ -35,6 +52,9 @@ export interface TrackSample {
   tunnel: boolean;
   wallHL: number;
   wallHR: number;
+  /** driving surface at this sample (within hw); shoulders fall back through
+   *  gravel → grass → sand as you leave the road, see Track.surfaceAt(). */
+  surface: Surface;
 }
 
 export interface Gate {
@@ -87,6 +107,9 @@ export interface GroundInfo {
   h: number;
   onRoad: boolean;
   inPitZone: boolean;
+  /** driving surface at this point (asphalt / sand / dirt / grass / …).
+   *  Drives per-wheel grip + rolling resistance in CarPhysics. */
+  surface: Surface;
 }
 
 const CONTROL: [number, number, number][] = [
@@ -239,6 +262,7 @@ export class Track {
         tunnel: false,
         wallHL: 24,
         wallHR: 24,
+        surface: "asphalt",
       });
     }
   }
@@ -300,14 +324,17 @@ export class Track {
       s.shoulderR = 3.2;
       s.wallHL = 30;
       s.wallHR = 30;
+      // dry-riverbed floor is sand; deeper sections near the middle are mud
+      s.surface = s.gapT > 0.18 && s.gapT < 0.55 ? "mud" : "sand";
     }
 
-    // --- natural arch zone: taller walls ---
+    // --- natural arch zone: taller walls, bare rock floor ---
     const archI = this.idxNear(CONTROL[6][0], CONTROL[6][2]);
     for (let k = archI - 14; k <= archI + 14; k++) {
       const s = S[wrapIdx(k, this.N)];
       s.wallHL = 42;
       s.wallHR = 42;
+      s.surface = "rock";
     }
 
     // --- wall-ride carousel: banked outer wall on the right ---
@@ -319,9 +346,10 @@ export class Track {
       s.shoulderR = 26 * edge + 8 * (1 - edge);
       s.wallHR = 30;
       s.bank = s.bank * (1 - edge) + (s.bank * 0.4 + 2.4) * edge;
+      // banked wall-ride surface stays asphalt (the wall itself is the feature)
     });
 
-    // --- tunnel through the mesa ---
+    // --- tunnel through the mesa: concrete floor ---
     const tunnel = this.range(13, 16);
     this.forEachInRange(tunnel, (i, t) => {
       const edge = sstep(0, 0.05, t) * (1 - sstep(0.95, 1, t));
@@ -330,17 +358,20 @@ export class Track {
       s.hw = 8.5 + 0.5 * (1 - edge);
       s.shoulderL = 1.5 + 6.5 * (1 - edge);
       s.shoulderR = 1.5 + 6.5 * (1 - edge);
+      if (edge > 0.5) s.surface = "concrete";
     });
 
-    // --- dual-line downhill: high terrace on the left ---
+    // --- dual-line downhill: high terrace on the left, dirt low side ---
     const dual = this.range(16, 18);
     this.forEachInRange(dual, (i, t) => {
       const s = S[i];
       s.dualT = sstep(0, 0.12, t) * (1 - sstep(0.88, 1, t));
       s.shoulderL = 9.5;
+      // the low (right) side of the dual-line is a graded dirt terrace
+      if (s.dualT > 0.4) s.surface = "dirt";
     });
 
-    // --- riverbed: wide sandy floor ---
+    // --- riverbed: wide sandy floor with mud patches near the banks ---
     const river = this.range(19, 24);
     this.forEachInRange(river, (i, t) => {
       const edge = sstep(0, 0.06, t) * (1 - sstep(0.94, 1, t));
@@ -351,7 +382,21 @@ export class Track {
       s.shoulderR = 8 + 6 * edge;
       s.wallHL = 20;
       s.wallHR = 20;
+      if (edge > 0.5) {
+        // muddy section near the riverbed middle (around CONTROL 21-22)
+        const mid = this.idxNear(CONTROL[21][0], CONTROL[21][2]);
+        const dToMid = Math.min(Math.abs(i - mid), this.N - Math.abs(i - mid));
+        s.surface = dToMid < 14 ? "mud" : "sand";
+      }
     });
+
+    // --- wet road briefly after the riverbed climb (the road is "damp"
+    //     where it meets the sand ramp) ---
+    const wetStart = this.idxNear(CONTROL[24][0], CONTROL[24][2]);
+    for (let k = 0; k < 8; k++) {
+      const s = S[wrapIdx(wetStart + k, this.N)];
+      s.surface = "wet";
+    }
 
     // --- low walls near the start/finish for the vista ---
     for (let k = -30; k <= 40; k++) {
@@ -480,6 +525,7 @@ export class Track {
       out.h = s.y + pitDepthAt(s.gapT);
       out.onRoad = false;
       out.inPitZone = true;
+      out.surface = s.surface; // sand / mud from the gap zone assignment
       return out;
     }
     out.inPitZone = false;
@@ -519,6 +565,27 @@ export class Track {
     }
     out.h = h;
     out.onRoad = onRoad;
+    // surface assignment:
+    //  - on the road (within hw) → the sample's own surface
+    //  - off the road (shoulder) → graded chain gravel → grass → sand
+    //    the further off you go, the looser it gets (so grass just past
+    //    the edge gives way to sand further out)
+    if (onRoad) {
+      out.surface = s.surface;
+    } else {
+      const sh = lat > 0 ? s.shoulderR : s.shoulderL;
+      const over = al - s.hw; // meters past the road edge
+      if (s.riverbed || s.gap) {
+        // already sand/mud in the riverbed — keep it
+        out.surface = s.surface;
+      } else if (over < Math.max(1.5, sh * 0.4)) {
+        out.surface = "gravel";
+      } else if (over < Math.max(3.5, sh * 0.85)) {
+        out.surface = "grass";
+      } else {
+        out.surface = "sand";
+      }
+    }
     return out;
   }
 
@@ -544,11 +611,13 @@ export class Track {
       out.h = use.h;
       out.onRoad = use.onRoad;
       out.inPitZone = use.inPitZone;
+      out.surface = use.surface;
       return out;
     }
     out.h = a.h + (b.h - a.h) * fr;
     out.onRoad = fr < 0.5 ? a.onRoad : b.onRoad;
     out.inPitZone = a.inPitZone;
+    out.surface = fr < 0.5 ? a.surface : b.surface;
     return out;
   }
 
@@ -582,6 +651,28 @@ export class Track {
   wallDist(i: number, side: 1 | -1): number {
     const s = this.sample(i);
     return side > 0 ? s.hw + s.shoulderR + 0.3 : s.hw + s.shoulderL + 0.3;
+  }
+
+  /** Surface type at a continuous sample coordinate p (= idx + fraction). */
+  surfaceAtP(p: number, lat: number): Surface {
+    return this.groundAtP(p, lat, TMP_GROUND).surface;
+  }
+
+  /** Find the checkpoint gate nearest to (idx) — used for recovery placement.
+   *  Returns the gate index (into this.gates) and a forward offset sample. */
+  nearestCheckpoint(idx: number): { gateK: number; gateIdx: number; ahead: number } {
+    let bestK = 0;
+    let bestD = Infinity;
+    for (let k = 0; k < this.gates.length; k++) {
+      let d = this.gates[k].idx - idx;
+      if (d < -this.N / 2) d += this.N;
+      else if (d > this.N / 2) d -= this.N;
+      if (d >= 0 && d < bestD) {
+        bestD = d;
+        bestK = k;
+      }
+    }
+    return { gateK: bestK, gateIdx: this.gates[bestK].idx, ahead: bestD };
   }
 
   nearestIdx(x: number, z: number, hint: number): number {
@@ -705,7 +796,17 @@ export class Track {
     const cSand = new THREE.Color(PALETTE.sand);
     const cPit = new THREE.Color(PALETTE.pitSand);
     const cTerr = new THREE.Color(0xcf8a52);
-    const gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+    // surface tints — match the physics so the player can SEE the surface change
+    const cAsphalt = new THREE.Color(0x4a4640); // dark grey-tan (main canyon road)
+    const cConcrete = new THREE.Color(0x8a8276); // pale concrete (tunnel)
+    const cDirt = new THREE.Color(0x9b6b3f); // brown dirt (dual-line low)
+    const cGravel = new THREE.Color(0xb09a7a); // pale gravel (shoulders)
+    const cGrass = new THREE.Color(0x6f7a3e); // dry grass (off-shoulder)
+    const cSandSurf = new THREE.Color(0xe0b878); // sand (riverbed)
+    const cMud = new THREE.Color(0x6a4a2a); // wet mud (riverbed mid)
+    const cWet = new THREE.Color(0x3a3a3a); // dark wet asphalt
+    const cRock = new THREE.Color(0x9c6a44); // bare rock (arch zone)
+    const gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
 
     const ringLats: number[][] = [];
     const ringStart: number[] = [];
@@ -717,13 +818,58 @@ export class Track {
       for (const l of lats) {
         this.groundAt(i, l, gi);
         let c: THREE.Color;
-        if (gi.inPitZone) c = cPit;
-        else if (Math.abs(l) <= s.hw + 0.01) c = cRoad.clone().lerp(cRoadDust, 0.3 + 0.2 * Math.sin(i * 0.37));
-        else if (s.dualT > 0 && l < -3) c = cTerr.clone();
-        else if (s.wallRideR && l > s.hw) {
+        if (gi.inPitZone) {
+          // pit sand (gap) — keep the warm pit-sand look
+          c = cPit;
+        } else if (Math.abs(l) <= s.hw + 0.01) {
+          // on the road — color by surface type so the driver can read it
+          const wobble = 0.3 + 0.2 * Math.sin(i * 0.37);
+          switch (gi.surface) {
+            case "concrete":
+              c = cConcrete.clone().lerp(cRoadDust, 0.1 * wobble);
+              break;
+            case "dirt":
+              c = cDirt.clone().lerp(cTerr, 0.15 + 0.1 * Math.sin(i * 0.21 + l));
+              break;
+            case "sand":
+              c = cSandSurf.clone().offsetHSL(0, 0, Math.sin(i * 0.53 + l) * 0.02);
+              break;
+            case "mud":
+              c = cMud.clone().lerp(cSandSurf, 0.25 + 0.1 * Math.sin(i * 0.41));
+              break;
+            case "wet":
+              c = cWet.clone().lerp(cAsphalt, 0.25 + 0.08 * Math.sin(i * 0.33));
+              break;
+            case "rock":
+              c = cRock.clone().lerp(cTerr, 0.2 + 0.12 * Math.sin(i * 0.19 + l));
+              break;
+            case "asphalt":
+            default:
+              c = cAsphalt.clone().lerp(cRoadDust, wobble);
+              break;
+          }
+        } else if (s.dualT > 0 && l < -3) {
+          c = cTerr.clone();
+        } else if (s.wallRideR && l > s.hw) {
           const t = clamp((l - 4) / 24, 0, 1);
           c = cRoad.clone().lerp(cTerr, t * 0.8);
-        } else c = cSand.clone().offsetHSL(0, 0, Math.sin(i * 0.53 + l) * 0.015);
+        } else {
+          // shoulders / off-road — graded chain: gravel → grass → sand
+          switch (gi.surface) {
+            case "gravel":
+              c = cGravel.clone().offsetHSL(0, 0, Math.sin(i * 0.29 + l) * 0.02);
+              break;
+            case "grass":
+              c = cGrass.clone().offsetHSL(0, 0, Math.sin(i * 0.23 + l * 0.5) * 0.03);
+              break;
+            case "sand":
+              c = cSand.clone().offsetHSL(0, 0, Math.sin(i * 0.53 + l) * 0.015);
+              break;
+            default:
+              c = cSand.clone().offsetHSL(0, 0, Math.sin(i * 0.53 + l) * 0.015);
+              break;
+          }
+        }
         pos.push(s.x + s.rx * l, gi.h, s.z + s.rz * l);
         col.push(c.r, c.g, c.b);
         uv.push(l / 12, (i * this.step) / 7);
@@ -1545,9 +1691,9 @@ export class Track {
   }
 }
 
-const TMP_GROUND: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
-const TMP_GA: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
-const TMP_GB: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+const TMP_GROUND: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
+const TMP_GA: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
+const TMP_GB: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
 
 // ---------------- helpers & textures ----------------
 

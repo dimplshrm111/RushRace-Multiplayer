@@ -47,6 +47,9 @@ const NAME_MAX = 14;
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_ROOMS = 100; // global room cap (memory safety)
 const CREATE_COOLDOWN_MS = 5000; // per-socket room-creation cooldown
+/** garage model whitelist — identical gameplay stats, visuals only */
+const CAR_MODELS = ["himalaya", "bison", "falcon", "sultan", "cub"];
+const CAR_MAX_COLOR = 4; // colour option index bound per model
 const PLAYER_COLORS = [
   "#f0641e",
   "#2f9e63",
@@ -78,6 +81,14 @@ interface RaceState {
   ground: boolean;
   lap: number;
   prog: number;
+  /** nitro meter 0..100 (synced across clients for fair boost display) */
+  nitro: number;
+  /** nitro currently engaged (drives remote flame-trail + audio) */
+  nitroActive: boolean;
+  /** current driving surface (asphalt/dirt/sand/… for remote dust colour) */
+  surface: string;
+  /** true for one tick after a recovery teleport — clients snap, not interp */
+  recovering: boolean;
 }
 
 interface Player {
@@ -85,6 +96,9 @@ interface Player {
   token: string;
   name: string;
   color: string;
+  /** garage selection (visual only — validated against the whitelist) */
+  car: string;
+  carColor: number;
   ready: boolean;
   connected: boolean;
   socketId: string | null;
@@ -211,6 +225,12 @@ function sanitizeState(raw: unknown): RaceState | null {
   let yaw = num(r.yaw);
   while (yaw > Math.PI) yaw -= Math.PI * 2;
   while (yaw < -Math.PI) yaw += Math.PI * 2;
+  // surface whitelist — must be one of the known physics surfaces
+  const SURFACES = new Set([
+    "asphalt", "concrete", "dirt", "gravel", "grass", "sand", "mud", "wet", "rock",
+  ]);
+  const surfRaw = typeof r.surface === "string" ? r.surface : "asphalt";
+  const surface = SURFACES.has(surfRaw) ? surfRaw : "asphalt";
   return {
     x: clampAbs(num(r.x), 6000),
     y: clampRange(num(r.y), -60, 400),
@@ -223,6 +243,10 @@ function sanitizeState(raw: unknown): RaceState | null {
     ground: !!r.ground,
     lap: Math.min(50, Math.max(0, Math.round(num(r.lap)))),
     prog: clampAbs(num(r.prog), 1e7),
+    nitro: clampRange(num(r.nitro, 100), 0, 100),
+    nitroActive: !!r.nitroActive,
+    surface,
+    recovering: !!r.recovering,
   };
 }
 
@@ -249,6 +273,8 @@ function roomState(r: Room) {
         id: p.id,
         name: p.name,
         color: p.color,
+        car: p.car,
+        carColor: p.carColor,
         ready: p.ready,
         connected: p.connected,
         grid: p.grid,
@@ -583,6 +609,8 @@ io.on("connection", (socket) => {
         token: randomUUID(),
         name,
         color: pickColor(room),
+        car: "himalaya",
+        carColor: 0,
         ready: false,
         connected: true,
         socketId: socket.id,
@@ -693,6 +721,8 @@ io.on("connection", (socket) => {
         token: randomUUID(),
         name,
         color,
+        car: "himalaya",
+        carColor: 0,
         ready: false,
         connected: true,
         socketId: socket.id,
@@ -1023,6 +1053,36 @@ io.on("connection", (socket) => {
       maybeScheduleCompile(r);
     } catch (err) {
       console.error("mp:finish error", err);
+    }
+  });
+
+  // ----- car selection (garage — visual only, whitelist-validated) ---------
+  socket.on("mp:car", (payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      const body = (payload ?? {}) as { model?: unknown; color?: unknown };
+      const model = sanitizeText(body.model).toLowerCase();
+      if (!CAR_MODELS.includes(model)) {
+        ack?.({ ok: false, error: "Unknown car model" });
+        return;
+      }
+      const color = Math.round(num(body.color, 0));
+      if (!Number.isInteger(color) || color < 0 || color > CAR_MAX_COLOR) {
+        ack?.({ ok: false, error: "Invalid colour selection" });
+        return;
+      }
+      p.car = model;
+      p.carColor = color;
+      ack?.({ ok: true });
+      broadcastRoom(r); // everyone re-renders the roster + remote cars
+    } catch (err) {
+      console.error("mp:car error", err);
+      ack?.({ ok: false, error: "Server error" });
     }
   });
 

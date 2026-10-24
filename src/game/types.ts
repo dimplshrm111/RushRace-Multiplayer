@@ -176,6 +176,13 @@ export interface Telemetry {
   gear: number; // 1..6
   rpm: number; // 0..1
   progressPct: number; // 0..1 through current lap
+  /** Nitro meter 0..100 (separate from the drift/near-miss boost bank). */
+  nitro: number;
+  nitroActive: boolean;
+  /** current driving surface (UI chip + rear-view effects). */
+  surface: string;
+  surfaceLabel: string;
+  surfaceColour: string;
 }
 
 export type UIEventType =

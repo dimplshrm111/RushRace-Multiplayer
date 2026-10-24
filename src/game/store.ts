@@ -1,6 +1,7 @@
 "use client";
 
 import { create } from "zustand";
+import { DEFAULT_CAR, type CarModelId } from "./cars";
 import {
   DEFAULT_SETTINGS,
   type GamePhase,
@@ -14,12 +15,40 @@ import {
 const SETTINGS_KEY = "canyonrush.settings.v1";
 const TUTORIAL_KEY = "canyonrush.tutorial.v1";
 const BEST_KEY = "canyonrush.best.v1";
+const CAR_KEY = "canyonrush.car.v1";
 
 interface BestData {
   totalMs: number;
   bestLapMs: number;
   splits: number[];
   laps: number;
+}
+
+interface CarSelection {
+  model: CarModelId;
+  color: number;
+}
+
+function loadCarSelection(): CarSelection {
+  try {
+    const raw = localStorage.getItem(CAR_KEY);
+    if (raw) {
+      const d = JSON.parse(raw) as Partial<CarSelection>;
+      if (
+        typeof d.model === "string" &&
+        ["himalaya", "bison", "falcon", "sultan", "cub"].includes(d.model)
+      ) {
+        const color =
+          typeof d.color === "number" && Number.isFinite(d.color)
+            ? Math.max(0, Math.min(4, Math.round(d.color)))
+            : 0;
+        return { model: d.model as CarModelId, color };
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  return { model: DEFAULT_CAR, color: 0 };
 }
 
 interface PopupItem extends UIEvent {
@@ -39,6 +68,12 @@ interface GameStore {
   /** local best (from localStorage) for current lap count */
   bestTotalMs: number | null;
   bestLapMs: number | null;
+  /** garage selection (visual only — physics identical for all cars) */
+  carModel: CarModelId;
+  carColor: number;
+  garageOpen: boolean;
+  setCar: (model: CarModelId, color: number) => void;
+  setGarageOpen: (v: boolean) => void;
   setPhase: (p: GamePhase) => void;
   setPaused: (v: boolean) => void;
   setSettings: (patch: Partial<GameSettings>) => void;
@@ -92,6 +127,9 @@ export const useGameStore = create<GameStore>((set, get) => ({
   countdownValue: -1,
   bestTotalMs: null,
   bestLapMs: null,
+  carModel: loadCarSelection().model,
+  carColor: loadCarSelection().color,
+  garageOpen: false,
 
   setPhase: (p) => set({ phase: p }),
   setPaused: (v) => set({ paused: v }),
@@ -153,6 +191,16 @@ export const useGameStore = create<GameStore>((set, get) => ({
     }
     set({ bestTotalMs: null, bestLapMs: null });
   },
+  setCar: (model, color) => {
+    const safeColor = Math.max(0, Math.min(4, Math.round(color) || 0));
+    try {
+      localStorage.setItem(CAR_KEY, JSON.stringify({ model, color: safeColor }));
+    } catch {
+      /* ignore */
+    }
+    set({ carModel: model, carColor: safeColor });
+  },
+  setGarageOpen: (v) => set({ garageOpen: v }),
 }));
 
 /** Non-hook accessor for engine code. */

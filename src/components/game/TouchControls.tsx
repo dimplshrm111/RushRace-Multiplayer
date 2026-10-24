@@ -102,11 +102,11 @@ export function TouchControls({
         <div className="flex flex-col gap-3">
           <button
             type="button"
-            aria-label="Boost"
-            className={`${btn} h-16 w-16 bg-[rgba(240,100,30,0.9)] text-sm`}
+            aria-label="Nitro"
+            className={`${btn} h-20 w-20 bg-[rgba(240,100,30,0.92)] text-sm ring-2 ring-[#ffd23f]/70`}
             {...hold({ boost: true }, { boost: false })}
           >
-            BOOST
+            NITRO
           </button>
           <button
             type="button"

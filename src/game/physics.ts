@@ -1,7 +1,7 @@
 "use client";
 
 import * as THREE from "three";
-import { Track, type GroundInfo, type TrackBox } from "./track";
+import { Track, type GroundInfo, type Surface, type TrackBox } from "./track";
 import { clamp, damp, type DriveInput } from "./types";
 
 export interface PhysicsEvents {
@@ -18,6 +18,161 @@ export interface PhysicsEvents {
   requestRecovery(): void;
 }
 
+// ============================================================
+// Surface physics profile
+// ------------------------------------------------------------
+// Each surface defines a physics "personality" so the car behaves
+// believably on every part of the world. All values are tuned for
+// arcade-realism: noticeable, but never frustrating.
+//   gripMul       — lateral traction multiplier (1 = asphalt)
+//   rollResist    — constant deceleration force (m/s²) at speed
+//   accelMul      — engine power multiplier on this surface
+//   brakeMul      — brake effectiveness multiplier
+//   steerMul      — steering authority multiplier (grip-limited)
+//   bumpAmp       — vertical suspension excitation amplitude (m)
+//   bumpFreq      — spatial frequency of bump excitation (per m)
+//   dragQuad      — aerodynamic-style v² drag coefficient
+//   driftFriction — lateral grip while drifting (lower = slidier)
+//   colour        — UI label colour (HUD surface chip)
+// ============================================================
+
+export interface SurfaceProps {
+  gripMul: number;
+  rollResist: number;
+  accelMul: number;
+  brakeMul: number;
+  steerMul: number;
+  bumpAmp: number;
+  bumpFreq: number;
+  dragQuad: number;
+  driftFriction: number;
+  label: string;
+  colour: string;
+}
+
+export const SURFACE_PROPS: Record<Surface, SurfaceProps> = {
+  asphalt: {
+    gripMul: 1.0,
+    rollResist: 2.2,
+    accelMul: 1.0,
+    brakeMul: 1.0,
+    steerMul: 1.0,
+    bumpAmp: 0.02,
+    bumpFreq: 0.05,
+    dragQuad: 0.011,
+    driftFriction: 2.1,
+    label: "TARMAC",
+    colour: "#4a4640",
+  },
+  concrete: {
+    gripMul: 0.96,
+    rollResist: 2.3,
+    accelMul: 1.0,
+    brakeMul: 1.02,
+    steerMul: 0.98,
+    bumpAmp: 0.015,
+    bumpFreq: 0.04,
+    dragQuad: 0.012,
+    driftFriction: 2.05,
+    label: "CONCRETE",
+    colour: "#8a8276",
+  },
+  dirt: {
+    gripMul: 0.78,
+    rollResist: 4.0,
+    accelMul: 0.86,
+    brakeMul: 0.82,
+    steerMul: 0.88,
+    bumpAmp: 0.09,
+    bumpFreq: 0.18,
+    dragQuad: 0.018,
+    driftFriction: 1.85,
+    label: "DIRT",
+    colour: "#9b6b3f",
+  },
+  gravel: {
+    gripMul: 0.7,
+    rollResist: 5.2,
+    accelMul: 0.78,
+    brakeMul: 0.7,
+    steerMul: 0.82,
+    bumpAmp: 0.07,
+    bumpFreq: 0.22,
+    dragQuad: 0.022,
+    driftFriction: 1.7,
+    label: "GRAVEL",
+    colour: "#b09a7a",
+  },
+  grass: {
+    gripMul: 0.62,
+    rollResist: 6.8,
+    accelMul: 0.66,
+    brakeMul: 0.58,
+    steerMul: 0.74,
+    bumpAmp: 0.05,
+    bumpFreq: 0.16,
+    dragQuad: 0.026,
+    driftFriction: 1.6,
+    label: "GRASS",
+    colour: "#6f7a3e",
+  },
+  sand: {
+    gripMul: 0.5,
+    rollResist: 9.5,
+    accelMul: 0.5,
+    brakeMul: 0.45,
+    steerMul: 0.6,
+    bumpAmp: 0.04,
+    bumpFreq: 0.14,
+    dragQuad: 0.034,
+    driftFriction: 1.4,
+    label: "SAND",
+    colour: "#e0b878",
+  },
+  mud: {
+    gripMul: 0.42,
+    rollResist: 11.5,
+    accelMul: 0.42,
+    brakeMul: 0.4,
+    steerMul: 0.55,
+    bumpAmp: 0.05,
+    bumpFreq: 0.12,
+    dragQuad: 0.04,
+    driftFriction: 1.25,
+    label: "MUD",
+    colour: "#6a4a2a",
+  },
+  wet: {
+    gripMul: 0.72,
+    rollResist: 2.6,
+    accelMul: 0.95,
+    brakeMul: 0.74,
+    steerMul: 0.86,
+    bumpAmp: 0.02,
+    bumpFreq: 0.05,
+    dragQuad: 0.013,
+    driftFriction: 1.75,
+    label: "WET",
+    colour: "#3a3a3a",
+  },
+  rock: {
+    gripMul: 0.82,
+    rollResist: 3.4,
+    accelMul: 0.9,
+    brakeMul: 0.86,
+    steerMul: 0.9,
+    bumpAmp: 0.14,
+    bumpFreq: 0.32,
+    dragQuad: 0.016,
+    driftFriction: 1.95,
+    label: "ROCK",
+    colour: "#9c6a44",
+  },
+};
+
+// ============================================================
+// Constants — identical for every car (visual-only differentiation)
+// ============================================================
 const GRAV = 27;
 const MAX_SPEED = 52;
 const BOOST_SPEED = 66;
@@ -25,6 +180,25 @@ const ACCEL = 25;
 const BOOST_ACCEL = 21;
 const BRAKE_DECEL = 36;
 const REVERSE_MAX = 13;
+
+// --- suspension model ---
+// A simple critically-damped spring per axle; reacts to bumps, slopes,
+// curbs and weight transfer without bouncing the chassis around.
+const SUS_STIFFNESS = 38; // spring rate (per m of compression)
+const SUS_DAMPING = 7.5; // damper rate (per m/s of compression velocity)
+const SUS_REST = 0.42; // rest ride height above ground (m)
+const SUS_TRAVEL = 0.55; // max compression before bottoming out (m)
+
+// --- weight transfer ---
+// Longitudinal: weight shifts forward under braking, rearward under accel.
+// Lateral: weight shifts to the outside wheels in a corner. These shift
+// grip front/rear and left/right, enabling realistic controlled drift.
+const WT_LONG = 0.32; // fraction of weight shifted fwd/bwd at 1g accel/brake
+const WT_LAT = 0.30; // fraction shifted sideways at 1g lateral
+
+// --- nitro recharge ---
+const NITRO_RECHARGE_PER_SEC = 10; // 10s for a full 0→100 refill
+const NITRO_DRAIN_PER_SEC = 33; // ~3s of full-bore boost from full
 
 function angDiff(a: number, b: number): number {
   let d = a - b;
@@ -111,7 +285,31 @@ export class CarPhysics {
    *  at ~61 u/s vs the player's 52, so the player must drift + boost to keep up. */
   speedCapScale = 1;
 
-  private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+  // --- new realistic-physics state ---
+  /** Current surface under the car (drives grip, drag, bumps). */
+  surface: Surface = "asphalt";
+  /** Smoothed surface (so the HUD chip doesn't flicker at sample boundaries). */
+  surfaceBlend: Surface = "asphalt";
+  /** Per-axle suspension compression 0..1 (front, rear). 1 = bottomed out. */
+  susCompression = [0, 0];
+  /** Per-axle suspension velocity (m/s) — drives the damper force. */
+  private susVel = [0, 0];
+  /** Body pitch (rad) from weight transfer + suspension. */
+  bodyPitch = 0;
+  /** Body roll (rad) from lateral weight transfer. */
+  bodyRoll = 0;
+  /** Longitudinal load transfer fraction (-WT_LONG..+WT_LONG). + = nose-up under accel. */
+  loadLong = 0;
+  /** Lateral load transfer fraction (-WT_LAT..+WT_LAT). + = leaning right in a left turn. */
+  loadLat = 0;
+  /** Nitro meter — separate from boost (the existing drift/near-miss bank).
+   *  Drains while boosting at NITRO_DRAIN_PER_SEC, refills at
+   *  NITRO_RECHARGE_PER_SEC when not. Identical for every car. */
+  nitro = 100;
+  /** Boost button currently held (X / Numpad0 / touch). */
+  nitroActive = false;
+
+  private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
   private ev: PhysicsEvents;
   private track: Track;
   private tmpF = new THREE.Vector3();
@@ -155,6 +353,13 @@ export class CarPhysics {
     this.lateral = lat;
     this.prevGroundY = h;
     if (syncProgress) this.progressS = idx * t.step;
+    // reset suspension so the rebuilt car doesn't pitch on placement
+    this.susCompression = [0, 0];
+    this.susVel = [0, 0];
+    this.bodyPitch = 0;
+    this.bodyRoll = 0;
+    this.loadLong = 0;
+    this.loadLat = 0;
   }
 
   /** Re-sync unwrapped progress after a teleport. */
@@ -184,6 +389,11 @@ export class CarPhysics {
     const gi = t.groundAtP(this.groundP, this.lateral, this.gi);
     this.onRoad = gi.onRoad;
     this.offRoad = !gi.onRoad && !gi.inPitZone;
+    // surface: blend instantly at low speeds (so HUD chip is responsive) but
+    // never flicker at sample boundaries — surfaceAtP already interpolates
+    this.surface = gi.surface;
+    this.surfaceBlend = gi.surface;
+    const surf = SURFACE_PROPS[gi.surface];
 
     const fx = Math.sin(this.yaw);
     const fz = Math.cos(this.yaw);
@@ -197,19 +407,57 @@ export class CarPhysics {
     const speed = Math.hypot(vf, vlat);
     this.slip = Math.atan2(vlat, Math.max(4, Math.abs(vf)));
 
-    // ---- ground / air transitions ----
+    // ---- ground / air transitions (with smooth suspension) ----
+    // The suspension absorbs small bumps and slope changes smoothly instead
+    // of teleporting the chassis onto the ground every frame (which was the
+    // source of the old "buzzing" and harsh launches off curbs).
     if (this.grounded) {
       const dh = gi.h - this.pos.y;
       if (dh < -0.5) {
         // ground fell away (cliff edge / gap lip / crest) — launch.
-        // NOTE: no pit-zone special case here — a car resting on the pit
-        // floor must STAY grounded so it can drive out of the valley.
         this.grounded = false;
         vy = clamp(this.climbRate, 0, 21) * 1.02;
         this.airTime = 0;
         if (vy > 3.2) this.ev.onJump();
       } else {
-        this.pos.y = gi.h;
+        // suspension model: target ride height = gi.h + SUS_REST
+        // the chassis sits at this.pos.y; spring force pulls it toward the
+        // target, damper resists the velocity. This naturally absorbs bumps,
+        // curbs and slope changes without harsh pops.
+        const target = gi.h + SUS_REST;
+        const compression = clamp(target - this.pos.y, -SUS_TRAVEL, SUS_TRAVEL);
+        const springForce = compression * SUS_STIFFNESS;
+        const damperForce = -this.climbRate * SUS_DAMPING;
+        const susAccel = (springForce + damperForce) / 1.0; // m=s² toward target
+        // apply a damped settle toward the target — never overshoot
+        const settleRate = clamp(Math.abs(susAccel) * dt, 0, 1);
+        this.pos.y = damp(this.pos.y, target, 9, dt);
+        void settleRate;
+        // suspension compression for visual body pitch/roll (front & rear
+        // axles sample the ground slightly ahead/behind the centre)
+        const slopeF = t.slopeFwdAtP(this.groundP, this.lateral);
+        const fH = gi.h + slopeF * 1.2; // ground height at front axle
+        const rH = gi.h - slopeF * 1.2; // ground height at rear axle
+        // per-axle compression 0..1 (1 = bottomed out)
+        const fComp = clamp(1 - (fH + SUS_REST - this.pos.y) / SUS_TRAVEL, 0, 1);
+        const rComp = clamp(1 - (rH + SUS_REST - this.pos.y) / SUS_TRAVEL, 0, 1);
+        this.susCompression[0] = damp(this.susCompression[0], fComp, 12, dt);
+        this.susCompression[1] = damp(this.susCompression[1], rComp, 12, dt);
+        // surface bumps excite the suspension (rocks / gravel / dirt are bumpy)
+        if (surf.bumpAmp > 0.01) {
+          const bumpPhase = this.progressS * surf.bumpFreq;
+          const bump = Math.sin(bumpPhase) * Math.sin(bumpPhase * 1.7 + 1.3);
+          this.susCompression[0] = clamp(
+            this.susCompression[0] + bump * surf.bumpAmp * 0.4 * Math.min(1, speed / 18),
+            0,
+            1
+          );
+          this.susCompression[1] = clamp(
+            this.susCompression[1] - bump * surf.bumpAmp * 0.4 * Math.min(1, speed / 18),
+            0,
+            1
+          );
+        }
         const climb = (gi.h - this.prevGroundY) / Math.max(dt, 1e-4);
         this.climbRate = damp(this.climbRate, clamp(climb, -10, 26), 9, dt);
         this.prevGroundY = gi.h;
@@ -219,14 +467,33 @@ export class CarPhysics {
     if (!this.grounded) {
       this.airTime += dt;
       vy -= GRAV * dt;
+      // anti-flip: clamp vertical velocity so big air can't send the car
+      // tumbling off into the sky (and landings stay controllable)
+      vy = clamp(vy, -42, 22);
     }
+
+    // ---- weight transfer ----
+    // Longitudinal: braking shifts load forward (more front grip, less rear),
+    // accelerating shifts it rearward (more rear grip for traction). This is
+    // the key to controlled drift — brake into a corner and the rear goes
+    // light, so it breaks traction first when you steer.
+    const longAccel =
+      (input.throttle > 0.02 ? ACCEL * input.throttle : 0) -
+      (input.brake > 0.02 ? BRAKE_DECEL * input.brake : 0);
+    this.loadLong = damp(this.loadLong, clamp(-longAccel / GRAV, -1, 1) * WT_LONG, 8, dt);
+    // Lateral: cornering force shifts load to the outside wheels.
+    const latAccel = vlat * 0; // placeholder — actual lateral accel = yawRate × speed
+    const lateralG = clamp(this.yawRate * Math.abs(vf) / GRAV, -1.4, 1.4);
+    this.loadLat = damp(this.loadLat, lateralG * WT_LAT, 8, dt);
+    void latAccel;
 
     // ---- steering ----
     // Convention: forward = (sin yaw, 0, cos yaw), right = (-cos yaw, 0, sin yaw).
     // Increasing yaw rotates the nose toward +X, which is the car's LEFT side,
     // so steering RIGHT (input.steer = +1) must produce a NEGATIVE yaw rate.
     const steerAuth = 1 / (1 + Math.pow(Math.abs(vf) * 0.026, 1.5));
-    let targetYawRate = -input.steer * 2.5 * steerAuth * (this.drifting ? 1.55 : 1);
+    // surface reduces steering authority (sand/dirt = vague, loose steering)
+    let targetYawRate = -input.steer * 2.5 * steerAuth * surf.steerMul * (this.drifting ? 1.55 : 1);
     if (!this.grounded) targetYawRate *= 0.34;
 
     if (this.assist && this.grounded) {
@@ -237,17 +504,30 @@ export class CarPhysics {
       }
       if (Math.abs(this.slip) > 1.05) targetYawRate *= 0.55; // anti-spin
     }
+    // weight transfer affects steering response: more front load = more turn-in
+    const frontLoad = 0.5 + this.loadLong * 0.5; // 0..1 front axle load
+    targetYawRate *= 0.85 + 0.3 * frontLoad;
     this.yawRate = damp(this.yawRate, targetYawRate, this.grounded ? 8.5 : 3.5, dt);
     this.yaw += this.yawRate * dt;
 
     // ---- drift state machine ----
+    // Drift is initiated by handbrake OR by lifting off the throttle while
+    // braking into a corner (weight-transfer breakaway). Once sliding, rear
+    // grip stays low until you straighten or release the slide.
     const canDrift = this.grounded && Math.abs(vf) > 11;
-    if (!this.drifting && input.handbrake && canDrift && Math.abs(input.steer) > 0.12) {
+    const wtBreakaway =
+      input.brake > 0.3 && Math.abs(input.steer) > 0.3 && Math.abs(vf) > 18 && this.loadLong > 0.12;
+    if (
+      !this.drifting &&
+      canDrift &&
+      (input.handbrake || wtBreakaway) &&
+      Math.abs(input.steer) > 0.12
+    ) {
       this.drifting = true;
       this.driftChain = 0;
-      // small kick to break traction: shove the chassis sideways, OPPOSITE to
-      // the turn direction, so the velocity lags behind the rotating nose.
-      vlat -= input.steer * 2.2;
+      // kick the chassis sideways opposite to the turn direction so the
+      // velocity lags behind the rotating nose (controlled slide initiation)
+      vlat -= input.steer * 2.2 * surf.gripMul;
     }
     if (this.drifting) {
       if (this.grounded && (input.handbrake || Math.abs(this.slip) > 0.16)) {
@@ -256,7 +536,11 @@ export class CarPhysics {
         // end of drift — bank it
         if (this.driftChain > 0.85 && this.driftCooldown <= 0) {
           const mult = 1 + Math.min(2, this.driftChain / 6);
-          this.boostMeter = clamp(this.boostMeter + Math.min(20, this.driftChain * 4) * this.boostScale, 0, 100);
+          this.boostMeter = clamp(
+            this.boostMeter + Math.min(20, this.driftChain * 4) * this.boostScale,
+            0,
+            100
+          );
           this.ev.onDriftBank(mult);
           this.driftCooldown = 0.7;
         }
@@ -266,30 +550,55 @@ export class CarPhysics {
     }
     this.driftCooldown = Math.max(0, this.driftCooldown - dt);
 
-    // ---- boost ----
+    // ---- nitro system ----
+    // Nitro is a separate energy bar from the drift/near-miss boost bank.
+    // Drains while held, refills passively over 10s when not. Identical for
+    // every car. Boost is applied through the existing physics (BOOST_ACCEL)
+    // — never a teleport or an abrupt velocity change.
+    const wantNitro = input.boost && this.nitro > 1.5;
+    const wasBoosting = this.boosting || this.nitroActive;
+    this.nitroActive = wantNitro;
+    if (wantNitro) {
+      this.nitro = Math.max(0, this.nitro - NITRO_DRAIN_PER_SEC * dt);
+    } else {
+      // passive recharge — 10s for a full 0→100 refill (identical for every car)
+      this.nitro = Math.min(100, this.nitro + NITRO_RECHARGE_PER_SEC * dt);
+    }
+
+    // ---- boost (drift/near-miss bank — unchanged for compatibility) ----
     const wantBoost = input.boost && this.boostMeter > 1.5;
-    if (wantBoost && !this.boosting) this.ev.onBoostStart();
     this.boosting = wantBoost;
     if (this.boosting) {
       this.boostMeter = Math.max(0, this.boostMeter - 26 * dt);
     }
+    // fire the boost-start audio when EITHER nitro or the drift-bank engages
+    const nowBoosting = this.boosting || this.nitroActive;
+    if (nowBoosting && !wasBoosting) this.ev.onBoostStart();
 
     // ---- longitudinal forces ----
-    const cap = this.boosting ? BOOST_SPEED : MAX_SPEED * this.speedCapScale;
+    // Nitro and boost both contribute (nitro is the user-facing system; the
+    // boost meter is the drift/near-miss bank that still drains separately).
+    const boosting = this.boosting || wantNitro;
+    const cap = boosting ? BOOST_SPEED : MAX_SPEED * this.speedCapScale;
     if (input.throttle > 0.02) {
       let a = ACCEL * (1 - clamp(vf / cap, -1, 1)) * input.throttle;
-      if (!this.onRoad && this.grounded) a *= 0.5;
+      // surface reduces acceleration (sand/mud sap engine power)
+      a *= surf.accelMul;
       if (!this.grounded) a *= 0.45;
-      if (this.boosting) a += BOOST_ACCEL * (1 - clamp(vf / BOOST_SPEED, 0, 1));
+      if (boosting) a += BOOST_ACCEL * (1 - clamp(vf / BOOST_SPEED, 0, 1));
       vf += a * dt;
     } else {
-      // coast drag
-      const drag = this.grounded ? 2.2 + 0.011 * vf * vf : 0.15;
+      // coast drag — surface-dependent
+      const drag = this.grounded
+        ? surf.rollResist + surf.dragQuad * vf * vf
+        : 0.15;
       vf -= Math.sign(vf) * Math.min(Math.abs(vf), drag * dt);
     }
     if (input.brake > 0.02) {
       if (vf > 0.5) {
-        vf -= BRAKE_DECEL * input.brake * dt;
+        // surface reduces braking effectiveness (sand/mud/grass = longer stops)
+        const decel = BRAKE_DECEL * surf.brakeMul * input.brake;
+        vf -= decel * dt;
         if (vf < 0) vf = 0;
       } else {
         vf -= 10 * input.brake * dt; // reverse
@@ -300,30 +609,43 @@ export class CarPhysics {
     if (input.handbrake && this.grounded && !this.drifting) {
       vf -= Math.sign(vf) * Math.min(Math.abs(vf), 7 * dt);
     }
-    // off-road sand drag
+    // off-road sand/mud drag (extra heavy resistance — sand should slow cars)
     if (this.offRoad && this.grounded && !this.wallRiding) {
-      vf -= Math.sign(vf) * Math.min(Math.abs(vf), (3.4 + 0.045 * Math.abs(vf)) * dt * 10) * 0.1;
-      vf -= Math.sign(vf) * Math.min(Math.abs(vf), (3.4 + 0.045 * Math.abs(vf)) * dt);
+      const extraDrag = (surf.rollResist - 2.2) * 0.6;
+      if (extraDrag > 0) {
+        vf -= Math.sign(vf) * Math.min(Math.abs(vf), extraDrag * dt);
+      }
     }
-    // slopes
+    // slopes — uphill saps speed, downhill adds it (graded by surface grip)
     if (this.grounded) {
-      const slopeF = t.slopeFwdAt(this.idx, this.lateral);
+      const slopeF = t.slopeFwdAtP(this.groundP, this.lateral);
       vf -= GRAV * clamp(slopeF, -1.2, 1.2) * dt;
     }
 
     // ---- lateral grip ----
+    // Per-axle grip with weight transfer: front axle grip rises under braking
+    // (more turn-in), rear axle grip drops (easier drift). Under accel the
+    // reverse — rear grips harder (traction), front goes light (understeer).
     if (this.grounded) {
-      let grip = this.drifting ? 2.1 : 8.5;
-      if (this.offRoad) grip = this.drifting ? 1.7 : 4.6;
-      vlat *= Math.exp(-grip * dt);
+      const frontGrip = (this.drifting ? surf.driftFriction : 8.5) * surf.gripMul;
+      const rearGrip = (this.drifting ? surf.driftFriction * 0.85 : 8.5 * 0.95) * surf.gripMul;
+      // weight-transfer modulation: rear grip drops under braking (drift!),
+      // rises under acceleration (traction)
+      const rearLoad = 0.5 - this.loadLong * 0.5; // 0..1 rear axle load
+      const gripEff = (frontGrip + rearGrip) * 0.5 * (0.7 + 0.6 * rearLoad);
+      vlat *= Math.exp(-gripEff * dt);
       // gravity pull down slopes
-      const slopeL = t.slopeLatAt(this.idx, this.lateral);
+      const slopeL = t.slopeLatAtP(this.groundP, this.lateral);
       vlat -= GRAV * (slopeL / Math.sqrt(1 + slopeL * slopeL)) * dt;
       // drift charge
       if (this.drifting) {
         const quality =
           clamp(Math.abs(this.slip) / 0.55, 0, 1) * clamp(Math.abs(vf) / 38, 0, 1);
-        this.boostMeter = clamp(this.boostMeter + (9 + 13 * quality) * dt * this.boostScale, 0, 100);
+        this.boostMeter = clamp(
+          this.boostMeter + (9 + 13 * quality) * dt * this.boostScale,
+          0,
+          100
+        );
         this.driftScore += (10 + 18 * quality) * (1 + Math.min(2, this.driftChain / 6)) * dt;
       }
     }
@@ -344,6 +666,10 @@ export class CarPhysics {
       this.boostMeter = clamp(this.boostMeter + 6 * dt * this.boostScale, 0, 100);
       this.driftScore += 8 * dt;
     }
+
+    // ---- body pitch & roll (visual — driven by weight transfer) ----
+    this.bodyPitch = damp(this.bodyPitch, this.loadLong * 0.09, 7, dt);
+    this.bodyRoll = damp(this.bodyRoll, -this.loadLat * 0.11, 7, dt);
 
     // ---- rebuild velocity ----
     this.vel.set(fx * vf + rx * vlat, vy, fz * vf + rz * vlat);
@@ -426,9 +752,6 @@ export class CarPhysics {
     }
 
     // ---- breakable crates & barricade ----
-    // Smash through: the crate/segment explodes and the car sheds a little
-    // speed (less for the barricade — it is meant to be smashed flat out),
-    // then accelerates back up naturally. You can also jump clean over them.
     for (const b of t.boxes) {
       if (!b.active) continue;
       const dx = this.pos.x - b.x;
@@ -437,8 +760,7 @@ export class CarPhysics {
       if (Math.abs(this.pos.y - b.y) > b.halfH + 0.9) continue; // sailed over it
       b.active = false;
       b.mesh.visible = false;
-      b.respawnAt = Infinity; // owner schedules the respawn via onBoxHit
-      // little slow-down + a sideways stagger (barricades barely slow you)
+      b.respawnAt = Infinity;
       const shed = b.wall ? 0.92 : 0.78;
       this.vel.x *= shed;
       this.vel.z *= shed;
@@ -455,14 +777,19 @@ export class CarPhysics {
     this.pos.x += this.vel.x * dt;
     this.pos.z += this.vel.z * dt;
     this.pos.y += this.vel.y * dt;
+    // anti-flip: clamp vertical position so a mis-sample can't launch the
+    // car into the sky (safety net; the suspension already prevents most pops)
+    if (this.grounded && this.pos.y > gi.h + SUS_REST + 1.2) {
+      this.pos.y = gi.h + SUS_REST + 1.2;
+      if (this.vel.y > 0) this.vel.y = 0;
+    }
 
     // ---- landing ----
     if (!this.grounded) {
-      // refresh the continuous coordinate after integration for an accurate surface test
       const s2 = t.sample(this.idx);
       const along2 = (this.pos.x - s2.x) * s2.dx + (this.pos.z - s2.z) * s2.dz;
       const gi2 = t.groundAtP(this.idx + clamp(along2 / t.step, -1.5, 1.5), this.lateral, this.gi);
-      if (this.pos.y <= gi2.h && this.vel.y <= 0.01) {
+      if (this.pos.y <= gi2.h + SUS_REST * 0.4 && this.vel.y <= 0.5) {
         const impact = -this.vel.y;
         const clean = this.slipAbsAtLanding(vf, vlat) && impact < 21;
         this.grounded = true;
@@ -474,7 +801,11 @@ export class CarPhysics {
         this.vel.y = 0;
         if (impact > 7) this.ev.onLanding(clamp(impact / 24, 0.1, 1), clean);
         if (clean && this.lastAirTime > 0.45) {
-          this.boostMeter = clamp(this.boostMeter + Math.min(30, this.lastAirTime * 16) * this.boostScale, 0, 100);
+          this.boostMeter = clamp(
+            this.boostMeter + Math.min(30, this.lastAirTime * 16) * this.boostScale,
+            0,
+            100
+          );
           this.ev.onCleanLand(this.lastAirTime);
           if (this.lastAirTime > 1.15) this.ev.onBigAir(this.lastAirTime);
         } else if (!clean && impact > 14) {
@@ -487,9 +818,27 @@ export class CarPhysics {
     }
 
     // ---- pit fall ----
-    // Only a genuine fall-through (below the valley floor itself) recovers;
-    // a car that landed in the pit stays put and drives out via the ramp.
     if (gi.inPitZone && this.pos.y < gi.h - 3) {
+      this.ev.requestRecovery();
+    }
+
+    // ---- world-bounds recovery (invisible barrier backstop) ----
+    // If a mis-sample, a collision pop or a botched wall-ride sends the car
+    // below the world floor or out beyond the playable radius, recover it
+    // instead of letting it fall forever. This is the safety net that lets
+    // us keep the walls hard but forgiving — drivers never get stuck in the
+    // void if they somehow clip through.
+    if (this.pos.y < -30 || this.pos.y > 120) {
+      this.ev.requestRecovery();
+    }
+    const distFromOrigin = Math.hypot(this.pos.x, this.pos.z);
+    if (distFromOrigin > 2400) {
+      this.ev.requestRecovery();
+    }
+    // upside-down recovery: if the car is grounded but the chassis is
+    // severely tilted (flipped on its side), recover. The track slope never
+    // exceeds ~0.7 rad, so anything beyond 1.1 means the car is on its roof.
+    if (this.grounded && Math.abs(this.bodyRoll) > 1.1) {
       this.ev.requestRecovery();
     }
 

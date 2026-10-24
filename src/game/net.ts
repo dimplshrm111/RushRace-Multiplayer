@@ -9,6 +9,7 @@
 import { io, type Socket } from "socket.io-client";
 import { gameStore } from "./store";
 import { mpStore } from "./net-store";
+import { DEFAULT_CAR } from "./cars";
 import type {
   Ack,
   MPChatMessage,
@@ -226,6 +227,7 @@ export class NetClient {
     this.token = res.token;
     mpStore.getState().setMyId(res.pid);
     mpStore.getState().setScreen("room");
+    this.syncCarSelection();
     return true;
   }
 
@@ -234,6 +236,7 @@ export class NetClient {
     if (res) {
       const st = mpStore.getState();
       st.setScreen("room");
+      this.syncCarSelection();
       return true;
     }
     return false;
@@ -312,6 +315,23 @@ export class NetClient {
     const token = this.loadToken(code);
     if (!token) return false;
     return this.rawJoin(code, undefined, token);
+  }
+
+  /** Push the local garage selection to the room (server default is
+   *  HIMALAYA/0 — if you picked something else, sync it on entry). */
+  private syncCarSelection() {
+    const gs = gameStore.getState();
+    if (gs.carModel !== DEFAULT_CAR || gs.carColor !== 0) {
+      this.socket?.emit("mp:car", { model: gs.carModel, color: gs.carColor }, () => undefined);
+    }
+  }
+
+  /** Change the car shown to everyone in the room (garage). */
+  async setCar(model: string, color: number): Promise<void> {
+    const res = await this.call<{ ok: boolean; error?: string }>("mp:car", { model, color });
+    if (!res.ok) {
+      mpStore.getState().showToast("error", res.error ?? "Could not change car");
+    }
   }
 
   async rename(name: string): Promise<string | null> {
@@ -413,7 +433,7 @@ export class NetClient {
       } catch (err) {
         console.error("[mp] sendState failed", err);
       }
-    }, 66);
+    }, 50); // 20 Hz state pump (was 15 Hz) — smoother remote cars, still cheap
   }
 
   detachEngine() {
@@ -432,6 +452,15 @@ export class NetClient {
     if (!eng.mpActive || eng.mpSpectating) return;
     if (eng.phase !== "countdown" && eng.phase !== "racing" && eng.phase !== "finished") return;
     const p = eng.physics;
+    // detect a recovery teleport: if the car just jumped a large distance
+    // since the last state send, flag this tick as "recovering" so other
+    // clients snap to the new position instead of interpolating across the gap
+    const dx = p.pos.x - this.lastSentX;
+    const dz = p.pos.z - this.lastSentZ;
+    const jumpDist = Math.hypot(dx, dz);
+    const recovering = jumpDist > 12;
+    this.lastSentX = p.pos.x;
+    this.lastSentZ = p.pos.z;
     sock.emit("mp:state", {
       x: +p.pos.x.toFixed(2),
       y: +p.pos.y.toFixed(2),
@@ -444,8 +473,16 @@ export class NetClient {
       ground: p.grounded,
       lap: eng.lapsDone,
       prog: +p.progressS.toFixed(1),
+      // new fields — sync the nitro bar, the active boost state, the surface
+      // the car is on, and the recovery flag so remote cars don't rubber-band
+      nitro: +p.nitro.toFixed(0),
+      nitroActive: p.nitroActive,
+      surface: p.surfaceBlend,
+      recovering,
     });
   }
+  private lastSentX = 0;
+  private lastSentZ = 0;
 
   private onRoom(room: MPRoomState) {
     const st = mpStore.getState();
@@ -474,7 +511,7 @@ export class NetClient {
     // sync remote cars with the roster
     const roster = room.players.filter((p) => p.id !== st.myId);
     eng.syncRemotes(
-      roster.map((p) => ({ id: p.id, name: p.name, color: p.color }))
+      roster.map((p) => ({ id: p.id, name: p.name, color: p.color, car: p.car, carColor: p.carColor }))
     );
     for (const p of roster) {
       if (p.finishMs != null) eng.setRemoteFinish(p.id, p.finishMs, p.finishPos);

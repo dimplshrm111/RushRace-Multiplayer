@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Globe } from "lucide-react";
+import { Car, Globe } from "lucide-react";
 import type { GameEngine } from "@/game/engine";
 import { useGameStore } from "@/game/store";
 import { useMPStore } from "@/game/net-store";
+import { carModelName, paintFor } from "@/game/cars";
 import {
   DIFFICULTIES,
   DIFFICULTY_ORDER,
@@ -48,6 +49,9 @@ export function TitleScreen({
   const bestTotalMs = useGameStore((s) => s.bestTotalMs);
   const bestLapMs = useGameStore((s) => s.bestLapMs);
   const setMPScreen = useMPStore((s) => s.setScreen);
+  const setGarageOpen = useGameStore((s) => s.setGarageOpen);
+  const carModel = useGameStore((s) => s.carModel);
+  const carColor = useGameStore((s) => s.carColor);
   const records = useRecords(settings.laps);
   const [ready, setReady] = useState(false);
 
@@ -141,29 +145,42 @@ export function TitleScreen({
                 </p>
               </div>
 
-              <div className="flex gap-3">
+              <div className="flex gap-2 sm:gap-3">
                 <button
                   type="button"
                   onClick={onHowToPlay}
-                  className="w-32 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-4 py-2 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+                  className="w-[4.5rem] -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-2 py-2 text-[11px] font-black tracking-wide text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-28 sm:text-sm"
                 >
-                  <span className="block skew-x-6">HOW TO PLAY</span>
+                  <span className="block skew-x-6">HOW TO</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGarageOpen(true)}
+                  className="flex w-28 -skew-x-6 flex-col items-center rounded-md border-2 border-[#2b1c12] bg-[#8a5a2b] px-2 py-1.5 text-[#fff6e6] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-32"
+                  aria-label="Open the garage to pick your car"
+                >
+                  <span className="flex skew-x-6 items-center gap-1 text-[11px] font-black tracking-wide sm:text-sm">
+                    <Car className="h-3.5 w-3.5" aria-hidden /> GARAGE
+                  </span>
+                  <span className="skew-x-6 text-[8px] font-bold tracking-wider text-[#ffd9a0]">
+                    {carModelName(carModel)}
+                  </span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setMPScreen("home")}
-                  className="w-36 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#1f8a70] px-4 py-2 text-sm font-black tracking-wider text-[#fff6e6] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+                  className="w-28 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#1f8a70] px-2 py-2 text-[11px] font-black tracking-wide text-[#fff6e6] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-36 sm:text-sm"
                 >
                   <span className="flex skew-x-6 items-center justify-center gap-1.5">
-                    <Globe className="h-4 w-4" aria-hidden /> MULTIPLAYER
+                    <Globe className="h-3.5 w-3.5" aria-hidden /> MULTIPLAYER
                   </span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setTab("settings")}
-                  className="w-32 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-4 py-2 text-sm font-black tracking-wider text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
+                  className="w-[4.5rem] -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-2 py-2 text-[11px] font-black tracking-wide text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-28 sm:text-sm"
                 >
-                  <span className="block skew-x-6">SETTINGS</span>
+                  <span className="block skew-x-6">SETUP</span>
                 </button>
               </div>
             </div>
@@ -201,6 +218,14 @@ export function TitleScreen({
             <p className="mb-2 max-w-md text-center text-[11px] font-semibold leading-relaxed text-[#f6e3c2]/90">
               Every car is equal — no upgrades, no advantages. Chains of drifts, near-misses,
               wall-rides and clean landings feed your boost. Master the line.
+            </p>
+            <p className="mb-2 flex items-center justify-center gap-1.5 text-[10px] font-bold text-[#c9a06a]">
+              <span
+                className="inline-block h-3 w-3 rounded-sm border border-[#fff6e6]"
+                style={{ backgroundColor: `#${paintFor(carModel, carColor).body.toString(16).padStart(6, "0")}` }}
+                aria-hidden
+              />
+              YOUR RIDE: {carModelName(carModel)} · IDENTICAL STATS FOR EVERY CAR
             </p>
           </div>
         )}

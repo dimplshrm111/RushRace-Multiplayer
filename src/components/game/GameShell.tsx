@@ -20,6 +20,7 @@ import { RotatePrompt } from "./RotatePrompt";
 import { MPHome } from "../multiplayer/MPHome";
 import { Lobby } from "../multiplayer/Lobby";
 import { ChatPanel } from "../multiplayer/ChatPanel";
+import { Garage } from "./Garage";
 
 export default function GameShell() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -34,6 +35,9 @@ export default function GameShell() {
   const results = useGameStore((s) => s.results);
   const settings = useGameStore((s) => s.settings);
   const tutorialSeen = useGameStore((s) => s.tutorialSeen);
+  const garageOpen = useGameStore((s) => s.garageOpen);
+  const carModel = useGameStore((s) => s.carModel);
+  const carColor = useGameStore((s) => s.carColor);
   const setPhase = useGameStore((s) => s.setPhase);
   const setPaused = useGameStore((s) => s.setPaused);
   const setCountdown = useGameStore((s) => s.setCountdown);
@@ -245,6 +249,11 @@ export default function GameShell() {
     engineRef.current?.applySettings(settings);
   }, [settings]);
 
+  // swap the player's SUV when the garage selection changes (visual only)
+  useEffect(() => {
+    engineRef.current?.setPlayerCar(carModel, carColor);
+  }, [carModel, carColor, ready]);
+
   // hide MP overlays whenever the game screen changes away from them
   useEffect(() => {
     if (mpScreen === "none") clearMPChatOpen(false);
@@ -410,6 +419,9 @@ export default function GameShell() {
           )}
         </>
       )}
+
+      {/* Car garage overlay (title screen, lobby, anywhere) */}
+      {ready && garageOpen && <Garage />}
 
       {/* MP toast (errors / notices) */}
       {mpToast && Date.now() - mpToast.at < 4200 && (

@@ -1,0 +1,2002 @@
+     1→"use client";
+     2→
+     3→import * as THREE from "three";
+     4→import { PALETTE, clamp } from "./types";
+     5→
+     6→/** Smooth 0..1 step. */
+     7→function sstep(a: number, b: number, x: number): number {
+     8→  const t = clamp((x - a) / (b - a), 0, 1);
+     9→  return t * t * (3 - 2 * t);
+    10→}
+    11→
+    12→function wrapIdx(i: number, n: number): number {
+    13→  return ((i % n) + n) % n;
+    14→}
+    15→
+    16→export interface TrackSample {
+    17→  x: number;
+    18→  y: number;
+    19→  z: number;
+    20→  dx: number;
+    21→  dz: number; // forward unit (XZ)
+    22→  rx: number;
+    23→  rz: number; // right unit (XZ)
+    24→  hw: number; // half road width
+    25→  shoulderL: number;
+    26→  shoulderR: number;
+    27→  bank: number; // meters raised at right edge
+    28→  gap: boolean;
+    29→  gapT: number; // -1 = none, else 0..1 progress through the gap (for the smooth pit profile)
+    30→  rampP: number; // -1 = none, else 0..1 through the launch ramp
+    31→  dualT: number; // 0..1 terrace blend
+    32→  wallRideR: boolean;
+    33→  wallRideL: boolean;
+    34→  riverbed: boolean;
+    35→  tunnel: boolean;
+    36→  wallHL: number;
+    37→  wallHR: number;
+    38→}
+    39→
+    40→export interface Gate {
+    41→  idx: number;
+    42→  pos: THREE.Vector3;
+    43→  isFinish: boolean;
+    44→  glow?: THREE.MeshStandardMaterial;
+    45→}
+    46→
+    47→export interface Obstacle {
+    48→  x: number;
+    49→  z: number;
+    50→  r: number;
+    51→  top: number; // top y
+    52→  lastNear: number;
+    53→}
+    54→
+    55→/** A breakable wooden crate sitting on the racing line. */
+    56→export interface TrackBox {
+    57→  x: number;
+    58→  z: number;
+    59→  y: number; // center height
+    60→  idx: number;
+    61→  lat: number;
+    62→  /** stack/cluster id — smash one crate and the whole stack goes (walls share one id) */
+    63→  cluster: number;
+    64→  /** vertical half-extent — cars can jump clean over low crates */
+    65→  halfH: number;
+    66→  /** true = barricade wall segment (plank FX + bigger smash) */
+    67→  wall: boolean;
+    68→  /** crates beyond the difficulty limit are parked entirely */
+    69→  enabled: boolean;
+    70→  active: boolean;
+    71→  /** game-time ms when the smashed crate reappears */
+    72→  respawnAt: number;
+    73→  mesh: THREE.Mesh;
+    74→}
+    75→
+    76→/** One live BREAK barricade on the loop (there are two). */
+    77→export interface BreakWall {
+    78→  idx: number;
+    79→  cluster: number;
+    80→  /** first plank segment — its active flag drives the glow group visibility */
+    81→  firstBox: TrackBox;
+    82→  /** amber glow strip + beacon lamps — visible only while the wall stands */
+    83→  glow: THREE.Group;
+    84→}
+    85→
+    86→export interface GroundInfo {
+    87→  h: number;
+    88→  onRoad: boolean;
+    89→  inPitZone: boolean;
+    90→}
+    91→
+    92→const CONTROL: [number, number, number][] = [
+    93→  [0, 0, 0],
+    94→  [100, 0, -6],
+    95→  [190, 1, -30],
+    96→  [255, 8, -95],
+    97→  [305, 0, -155],
+    98→  [350, 1, -205],
+    99→  [400, 3, -255],
+   100→  [455, 8, -300],
+   101→  [450, 14, -355],
+   102→  [420, 19, -410],
+   103→  [350, 23, -435],
+   104→  [280, 24, -430],
+   105→  [180, 23, -420],
+   106→  [90, 23, -415],
+   107→  [10, 22, -415],
+   108→  [-70, 22, -420],
+   109→  [-150, 22, -415],
+   110→  [-240, 17, -400],
+   111→  [-320, 12, -370],
+   112→  [-390, 6, -310],
+   113→  [-430, 2, -230],
+   114→  [-445, 0, -140],
+   115→  [-430, 0, -60],
+   116→  [-390, 0, 10],
+   117→  [-320, 1, 50],
+   118→  [-230, 1, 60],
+   119→  [-140, 0, 40],
+   120→  [-50, 0, 15],
+   121→];
+   122→
+   123→/** Fixed lateral columns for road mesh (meters from center). */
+   124→const ROAD_COLS = [-34, -28, -22, -17, -12, -8, -4, -2, 0, 2, 4, 8, 12, 17, 22, 28, 34];
+   125→
+   126→export const SUN_DIR = new THREE.Vector3(-0.62, 0.5, 0.38).normalize();
+   127→
+   128→interface Kicker {
+   129→  s: number;
+   130→  lat: number;
+   131→  r: number;
+   132→  h: number;
+   133→}
+   134→
+   135→/** How deep the dry-riverbed pit floor sits below road level at gap progress t (0..1). */
+   136→const PIT_DEPTH = -9;
+   137→export function pitDepthAt(gapT: number): number {
+   138→  if (gapT < 0) return 0;
+   139→  // flat landing floor under the cliff, then a smooth drivable climb back to road level
+   140→  if (gapT < 0.12) return PIT_DEPTH;
+   141→  if (gapT > 0.99) return 0;
+   142→  const u = (gapT - 0.12) / 0.87; // 0..1 across the exit ramp
+   143→  // smoothstep-blended ramp: gentle at both ends, steady grade in the middle
+   144→  const s = u * u * (3 - 2 * u);
+   145→  return PIT_DEPTH * (1 - s);
+   146→}
+   147→
+   148→/** The Sunstone Circuit: one spectacular closed loop through a red-rock canyon. */
+   149→export class Track {
+   150→  samples: TrackSample[] = [];
+   151→  gates: Gate[] = [];
+   152→  obstacles: Obstacle[] = [];
+   153→  boxes: TrackBox[] = [];
+   154→  /** sample indices of the BREAK barricades */
+   155→  breakWallIdxs: number[] = [];
+   156→  /** per-wall live info (glow visibility + approach warnings) */
+   157→  breakWalls: BreakWall[] = [];
+   158→  /** pulsing amber glow materials (strips + beacons) — engine animates opacity */
+   159→  wallGlowMats: THREE.MeshBasicMaterial[] = [];
+   160→  kickers: Kicker[] = [];
+   161→  N = 0;
+   162→  step = 2;
+   163→  length = 0;
+   164→  group = new THREE.Group();
+   165→  minimapPts: { x: number; z: number }[] = [];
+   166→  gatePts: { x: number; z: number; finish: boolean }[] = [];
+   167→  /** BREAK barricade positions for the minimap */
+   168→  wallPts: { x: number; z: number }[] = [];
+   169→  private disposables: (THREE.BufferGeometry | THREE.Material | THREE.Texture)[] = [];
+   170→
+   171→  constructor() {
+   172→    this.buildSpline();
+   173→    this.buildZones();
+   174→    this.buildMeshes();
+   175→  }
+   176→
+   177→  // ============================================================
+   178→  // Spline & samples
+   179→  // ============================================================
+   180→
+   181→  private buildSpline() {
+   182→    const pts = CONTROL.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+   183→    const curve = new THREE.CatmullRomCurve3(pts, true, "catmullrom", 0.5);
+   184→    const approxLen = curve.getLength();
+   185→    const n = Math.max(600, Math.round(approxLen / this.step));
+   186→    const spaced = curve.getSpacedPoints(n);
+   187→    this.N = n;
+   188→    this.length = n * this.step;
+   189→    const raw = spaced.slice(0, n);
+   190→
+   191→    const dirs: THREE.Vector2[] = [];
+   192→    for (let i = 0; i < n; i++) {
+   193→      const a = raw[wrapIdx(i - 1, n)];
+   194→      const b = raw[wrapIdx(i + 1, n)];
+   195→      const d = new THREE.Vector2(b.x - a.x, b.z - a.z);
+   196→      if (d.lengthSq() < 1e-8) d.set(0, -1);
+   197→      dirs.push(d.normalize());
+   198→    }
+   199→    // curvature → banking (outer edge raised)
+   200→    const banks = new Array<number>(n).fill(0);
+   201→    for (let i = 0; i < n; i++) {
+   202→      const d0 = dirs[wrapIdx(i - 2, n)];
+   203→      const d1 = dirs[wrapIdx(i + 2, n)];
+   204→      const crossY = d0.x * d1.y - d0.y * d1.x; // >0 = left turn
+   205→      const dot = clamp(d0.dot(d1), -1, 1);
+   206→      const dTheta = Math.atan2(crossY, dot);
+   207→      banks[i] = clamp((dTheta / (4 * this.step)) * 46, -1, 1) * 3.0;
+   208→    }
+   209→    const sm = new Array<number>(n).fill(0);
+   210→    for (let i = 0; i < n; i++) {
+   211→      let acc = 0;
+   212→      for (let k = -9; k <= 9; k++) acc += banks[wrapIdx(i + k, n)];
+   213→      sm[i] = acc / 19;
+   214→    }
+   215→
+   216→    for (let i = 0; i < n; i++) {
+   217→      const p = raw[i];
+   218→      const d = dirs[i];
+   219→      const r = new THREE.Vector2(-d.y, d.x); // right = (-dz, dx)
+   220→      this.samples.push({
+   221→        x: p.x,
+   222→        y: p.y,
+   223→        z: p.z,
+   224→        dx: d.x,
+   225→        dz: d.y,
+   226→        rx: r.x,
+   227→        rz: r.y,
+   228→        hw: 9,
+   229→        shoulderL: 8,
+   230→        shoulderR: 8,
+   231→        bank: sm[i],
+   232→        gap: false,
+   233→        gapT: -1,
+   234→        rampP: -1,
+   235→        dualT: 0,
+   236→        wallRideR: false,
+   237→        wallRideL: false,
+   238→        riverbed: false,
+   239→        tunnel: false,
+   240→        wallHL: 24,
+   241→        wallHR: 24,
+   242→      });
+   243→    }
+   244→  }
+   245→
+   246→  private idxNear(x: number, z: number): number {
+   247→    let best = 0;
+   248→    let bd = Infinity;
+   249→    for (let i = 0; i < this.N; i++) {
+   250→      const s = this.samples[i];
+   251→      const d = (s.x - x) * (s.x - x) + (s.z - z) * (s.z - z);
+   252→      if (d < bd) {
+   253→        bd = d;
+   254→        best = i;
+   255→      }
+   256→    }
+   257→    return best;
+   258→  }
+   259→
+   260→  private range(a: number, b: number): [number, number] {
+   261→    return [
+   262→      this.idxNear(CONTROL[a][0], CONTROL[a][2]),
+   263→      this.idxNear(CONTROL[b][0], CONTROL[b][2]),
+   264→    ];
+   265→  }
+   266→
+   267→  private forEachInRange(r: [number, number], fn: (i: number, t: number) => void) {
+   268→    const [a, b] = r;
+   269→    const span = (b - a + this.N) % this.N;
+   270→    for (let k = 0; k <= span; k++) fn(wrapIdx(a + k, this.N), span > 0 ? k / span : 1);
+   271→  }
+   272→
+   273→  // ============================================================
+   274→  // Feature zones
+   275→  // ============================================================
+   276→
+   277→  private buildZones() {
+   278→    const S = this.samples;
+   279→
+   280→    // --- launch ramp before the gap (last 58% of approach → crest) ---
+   281→    const ramp = this.range(2, 3);
+   282→    this.forEachInRange(ramp, (i, t) => {
+   283→      S[i].rampP = clamp((t - 0.42) / 0.58, 0, 1);
+   284→    });
+   285→
+   286→    // --- the GAP over the dry riverbed canyon ---
+   287→    // The pit is a smooth valley, not a box canyon: a short flat landing
+   288→    // floor under the cliff, then a long drivable ramp that climbs back up
+   289→    // to the landing road — undershoot the jump and you can still drive out.
+   290→    const crestI = this.idxNear(CONTROL[3][0], CONTROL[3][2]);
+   291→    const landI = this.idxNear(CONTROL[4][0], CONTROL[4][2]);
+   292→    const gapSpan = (landI - crestI + this.N) % this.N;
+   293→    const gapStart = crestI + 2;
+   294→    const gapEnd = crestI + Math.round(gapSpan * 0.62);
+   295→    for (let k = gapStart; k <= gapEnd; k++) {
+   296→      const s = S[wrapIdx(k, this.N)];
+   297→      s.gap = true;
+   298→      s.gapT = (k - gapStart) / Math.max(1, gapEnd - gapStart);
+   299→      s.shoulderL = 3.2;
+   300→      s.shoulderR = 3.2;
+   301→      s.wallHL = 30;
+   302→      s.wallHR = 30;
+   303→    }
+   304→
+   305→    // --- natural arch zone: taller walls ---
+   306→    const archI = this.idxNear(CONTROL[6][0], CONTROL[6][2]);
+   307→    for (let k = archI - 14; k <= archI + 14; k++) {
+   308→      const s = S[wrapIdx(k, this.N)];
+   309→      s.wallHL = 42;
+   310→      s.wallHR = 42;
+   311→    }
+   312→
+   313→    // --- wall-ride carousel: banked outer wall on the right ---
+   314→    const carousel = this.range(8, 11);
+   315→    this.forEachInRange(carousel, (i, t) => {
+   316→      const edge = sstep(0, 0.14, t) * (1 - sstep(0.86, 1, t));
+   317→      const s = S[i];
+   318→      s.wallRideR = edge > 0.01;
+   319→      s.shoulderR = 26 * edge + 8 * (1 - edge);
+   320→      s.wallHR = 30;
+   321→      s.bank = s.bank * (1 - edge) + (s.bank * 0.4 + 2.4) * edge;
+   322→    });
+   323→
+   324→    // --- tunnel through the mesa ---
+   325→    const tunnel = this.range(13, 16);
+   326→    this.forEachInRange(tunnel, (i, t) => {
+   327→      const edge = sstep(0, 0.05, t) * (1 - sstep(0.95, 1, t));
+   328→      const s = S[i];
+   329→      s.tunnel = edge > 0.01;
+   330→      s.hw = 8.5 + 0.5 * (1 - edge);
+   331→      s.shoulderL = 1.5 + 6.5 * (1 - edge);
+   332→      s.shoulderR = 1.5 + 6.5 * (1 - edge);
+   333→    });
+   334→
+   335→    // --- dual-line downhill: high terrace on the left ---
+   336→    const dual = this.range(16, 18);
+   337→    this.forEachInRange(dual, (i, t) => {
+   338→      const s = S[i];
+   339→      s.dualT = sstep(0, 0.12, t) * (1 - sstep(0.88, 1, t));
+   340→      s.shoulderL = 9.5;
+   341→    });
+   342→
+   343→    // --- riverbed: wide sandy floor ---
+   344→    const river = this.range(19, 24);
+   345→    this.forEachInRange(river, (i, t) => {
+   346→      const edge = sstep(0, 0.06, t) * (1 - sstep(0.94, 1, t));
+   347→      const s = S[i];
+   348→      s.riverbed = true;
+   349→      s.hw = 9 + 11 * edge;
+   350→      s.shoulderL = 8 + 6 * edge;
+   351→      s.shoulderR = 8 + 6 * edge;
+   352→      s.wallHL = 20;
+   353→      s.wallHR = 20;
+   354→    });
+   355→
+   356→    // --- low walls near the start/finish for the vista ---
+   357→    for (let k = -30; k <= 40; k++) {
+   358→      const s = S[wrapIdx(k, this.N)];
+   359→      s.wallHL = Math.min(s.wallHL, 14);
+   360→      s.wallHR = Math.min(s.wallHR, 14);
+   361→    }
+   362→
+   363→    // wall height noise
+   364→    for (let i = 0; i < this.N; i++) {
+   365→      const s = S[i];
+   366→      const n =
+   367→        Math.sin(i * 0.093) * 0.5 + Math.sin(i * 0.031 + 2.1) * 0.3 + Math.sin(i * 0.017 + 4) * 0.2;
+   368→      s.wallHL = Math.max(10, s.wallHL + n * 7);
+   369→      s.wallHR = Math.max(10, s.wallHR + n * 7 + Math.sin(i * 0.05) * 2);
+   370→    }
+   371→
+   372→    // --- kicker bumps in the riverbed ---
+   373→    const rB = this.idxNear(CONTROL[21][0], CONTROL[21][2]);
+   374→    const rC = this.idxNear(CONTROL[22][0], CONTROL[22][2]);
+   375→    const rD = this.idxNear(CONTROL[23][0], CONTROL[23][2]);
+   376→    this.kickers = [
+   377→      { s: (rB + 9) * this.step, lat: -8, r: 7, h: 2.1 },
+   378→      { s: (rC + 10) * this.step, lat: 7, r: 7, h: 2.2 },
+   379→      { s: (rD + 12) * this.step, lat: -5, r: 6.5, h: 1.9 },
+   380→    ];
+   381→
+   382→    // --- checkpoint gates in racing order ---
+   383→    const gateAnchors: { c: number; finish: boolean }[] = [
+   384→      { c: 4, finish: false }, // gap landing
+   385→      { c: 6, finish: false }, // arch
+   386→      { c: 7, finish: false }, // climb
+   387→      { c: 10, finish: false }, // carousel apex
+   388→      { c: 13, finish: false }, // tunnel entry
+   389→      { c: 16, finish: false }, // tunnel exit
+   390→      { c: 18, finish: false }, // dual-line merge
+   391→      { c: 22, finish: false }, // riverbed mid
+   392→      { c: 27, finish: false }, // final arc
+   393→      { c: 0, finish: true }, // start/finish
+   394→    ];
+   395→    for (const g of gateAnchors) {
+   396→      const idx = this.idxNear(CONTROL[g.c][0], CONTROL[g.c][2]);
+   397→      const s = S[idx];
+   398→      this.gates.push({ idx, pos: new THREE.Vector3(s.x, s.y, s.z), isFinish: g.finish });
+   399→      this.gatePts.push({ x: s.x, z: s.z, finish: g.finish });
+   400→    }
+   401→
+   402→    for (let i = 0; i < this.N; i += 6) this.minimapPts.push({ x: S[i].x, z: S[i].z });
+   403→
+   404→    this.addObstacles();
+   405→  }
+   406→
+   407→  private addObstacles() {
+   408→    const rnd = mulberry32(20240607);
+   409→    // riverbed boulders
+   410→    const rA = this.idxNear(CONTROL[20][0], CONTROL[20][2]);
+   411→    const rB = this.idxNear(CONTROL[23][0], CONTROL[23][2]);
+   412→    const span = (rB - rA + this.N) % this.N;
+   413→    for (let k = 0; k < 8; k++) {
+   414→      const idx = wrapIdx(rA + Math.round(span * (0.12 + 0.78 * rnd())), this.N);
+   415→      const s = this.samples[idx];
+   416→      const lat = (rnd() * 9 + 4.5) * (rnd() > 0.5 ? 1 : -1);
+   417→      const r = 1.7 + rnd() * 0.9;
+   418→      this.obstacles.push({
+   419→        x: s.x + s.rx * lat,
+   420→        z: s.z + s.rz * lat,
+   421→        r,
+   422→        top: this.heightAt(idx, lat) + r * 1.5,
+   423→        lastNear: -1e9,
+   424→      });
+   425→    }
+   426→    // rock fins on the dual-line low (right) side
+   427→    const dA = this.idxNear(CONTROL[17][0], CONTROL[17][2]);
+   428→    for (let k = 0; k < 3; k++) {
+   429→      const idx = wrapIdx(dA + 8 + k * 14, this.N);
+   430→      const s = this.samples[idx];
+   431→      const lat = 5.5 + rnd() * 3;
+   432→      this.obstacles.push({
+   433→        x: s.x + s.rx * lat,
+   434→        z: s.z + s.rz * lat,
+   435→        r: 1.6,
+   436→        top: this.heightAt(idx, lat) + 3.4,
+   437→        lastNear: -1e9,
+   438→      });
+   439→    }
+   440→    // arch pillars
+   441→    const archI = this.idxNear(CONTROL[6][0], CONTROL[6][2]);
+   442→    const as = this.samples[archI];
+   443→    for (const side of [-1, 1]) {
+   444→      const lat = side * (as.hw + 2.2);
+   445→      this.obstacles.push({
+   446→        x: as.x + as.rx * lat,
+   447→        z: as.z + as.rz * lat,
+   448→        r: 2.3,
+   449→        top: this.heightAt(archI, lat) + 9,
+   450→        lastNear: -1e9,
+   451→      });
+   452→    }
+   453→    // two rocks flanking the landing zone (near-miss bait)
+   454→    const landI = this.idxNear(CONTROL[4][0], CONTROL[4][2]);
+   455→    const ls = this.samples[landI];
+   456→    for (const side of [-1, 1]) {
+   457→      const lat = side * (ls.hw + 1.4);
+   458→      this.obstacles.push({
+   459→        x: ls.x + ls.rx * lat,
+   460→        z: ls.z + ls.rz * lat,
+   461→        r: 2.0,
+   462→        top: this.heightAt(landI, lat) + 3,
+   463→        lastNear: -1e9,
+   464→      });
+   465→    }
+   466→  }
+   467→
+   468→  // ============================================================
+   469→  // Sampling API
+   470→  // ============================================================
+   471→
+   472→  sample(i: number): TrackSample {
+   473→    return this.samples[wrapIdx(i, this.N)];
+   474→  }
+   475→
+   476→  groundAt(i: number, lat: number, out: GroundInfo): GroundInfo {
+   477→    const s = this.sample(i);
+   478→    const al = Math.abs(lat);
+   479→    if (s.gap && al < s.hw + 3) {
+   480→      out.h = s.y + pitDepthAt(s.gapT);
+   481→      out.onRoad = false;
+   482→      out.inPitZone = true;
+   483→      return out;
+   484→    }
+   485→    out.inPitZone = false;
+   486→    let h = s.y;
+   487→    const u = clamp(lat / s.hw, -1, 1);
+   488→    h += s.bank * u;
+   489→    if (s.riverbed) h += 0.45 * u * u;
+   490→    if (s.dualT > 0 && lat > 3) {
+   491→      const t = sstep(3, 5, lat) * (1 - sstep(13, 15.5, lat));
+   492→      h += 2.6 * s.dualT * t;
+   493→    }
+   494→    if (s.wallRideR && lat > 4) h += 13 * Math.pow(Math.min(1, (lat - 4) / 24), 2.4);
+   495→    if (s.wallRideL && lat < -4) h += 13 * Math.pow(Math.min(1, (-lat - 4) / 24), 2.4);
+   496→    if (s.rampP >= 0 && al < s.hw + 1) {
+   497→      const latFade = 1 - sstep(4.5, s.hw, al);
+   498→      h += 3.4 * sstep(0.1, 0.92, s.rampP) * latFade;
+   499→    }
+   500→    let onRoad = al <= s.hw;
+   501→    if (al > s.hw) {
+   502→      if (s.wallRideR && lat > 0) onRoad = true;
+   503→      else if (s.dualT > 0 && lat < 0 && lat > 3) onRoad = true;
+   504→      else {
+   505→        const sh = lat > 0 ? s.shoulderR : s.shoulderL;
+   506→        if (sh > 0) h -= 0.55 * Math.min(1, (al - s.hw) / Math.max(0.5, sh));
+   507→      }
+   508→    }
+   509→    const sHere = wrapIdx(i, this.N) * this.step;
+   510→    for (const k of this.kickers) {
+   511→      let ds = Math.abs(sHere - k.s);
+   512→      ds = Math.min(ds, this.length - ds);
+   513→      const dl = lat - k.lat;
+   514→      const d2 = ds * ds + dl * dl;
+   515→      if (d2 < k.r * k.r) {
+   516→        const q = Math.sqrt(d2) / k.r;
+   517→        h += k.h * (0.5 + 0.5 * Math.cos(Math.PI * q));
+   518→      }
+   519→    }
+   520→    out.h = h;
+   521→    out.onRoad = onRoad;
+   522→    return out;
+   523→  }
+   524→
+   525→  heightAt(i: number, lat: number): number {
+   526→    return this.groundAt(i, lat, TMP_GROUND).h;
+   527→  }
+   528→
+   529→  // ---- continuous (interpolated) sampling ----
+   530→  // The physics used to snap to the discrete 2 m sample grid, which made the
+   531→  // car's height (and everything derived from it) pop at every sample boundary
+   532→  // — a visible buzz/jiggle at speed. These queries blend adjacent samples so
+   533→  // the driven surface matches the rendered road exactly and stays smooth.
+   534→
+   535→  /** Ground query at a continuous sample coordinate p (= idx + fraction ahead). */
+   536→  groundAtP(p: number, lat: number, out: GroundInfo): GroundInfo {
+   537→    const i0 = Math.floor(p);
+   538→    const fr = clamp(p - i0, 0, 1);
+   539→    const a = this.groundAt(i0, lat, TMP_GA);
+   540→    const b = this.groundAt(i0 + 1, lat, TMP_GB);
+   541→    if (a.inPitZone !== b.inPitZone) {
+   542→      // cliff lip at the gap — keep the step crisp so launches still fire
+   543→      const use = fr < 0.5 ? a : b;
+   544→      out.h = use.h;
+   545→      out.onRoad = use.onRoad;
+   546→      out.inPitZone = use.inPitZone;
+   547→      return out;
+   548→    }
+   549→    out.h = a.h + (b.h - a.h) * fr;
+   550→    out.onRoad = fr < 0.5 ? a.onRoad : b.onRoad;
+   551→    out.inPitZone = a.inPitZone;
+   552→    return out;
+   553→  }
+   554→
+   555→  heightAtP(p: number, lat: number): number {
+   556→    return this.groundAtP(p, lat, TMP_GROUND).h;
+   557→  }
+   558→
+   559→  /** Lateral slope at a continuous sample coordinate. */
+   560→  slopeLatAtP(p: number, lat: number): number {
+   561→    return (this.heightAtP(p, lat + 0.9) - this.heightAtP(p, lat - 0.9)) / 1.8;
+   562→  }
+   563→
+   564→  /** Forward slope at a continuous sample coordinate. */
+   565→  slopeFwdAtP(p: number, lat: number): number {
+   566→    const d = 0.9 / this.step;
+   567→    return (this.heightAtP(p + d, lat) - this.heightAtP(p - d, lat)) / 1.8;
+   568→  }
+   569→
+   570→  slopeLatAt(i: number, lat: number): number {
+   571→    const a = this.heightAt(wrapIdx(i, this.N), lat + 0.9);
+   572→    const b = this.heightAt(wrapIdx(i, this.N), lat - 0.9);
+   573→    return (a - b) / 1.8;
+   574→  }
+   575→
+   576→  slopeFwdAt(i: number, lat: number): number {
+   577→    const a = this.heightAt(wrapIdx(i + 1, this.N), lat);
+   578→    const b = this.heightAt(wrapIdx(i - 1, this.N), lat);
+   579→    return (a - b) / (2 * this.step);
+   580→  }
+   581→
+   582→  wallDist(i: number, side: 1 | -1): number {
+   583→    const s = this.sample(i);
+   584→    return side > 0 ? s.hw + s.shoulderR + 0.3 : s.hw + s.shoulderL + 0.3;
+   585→  }
+   586→
+   587→  nearestIdx(x: number, z: number, hint: number): number {
+   588→    let best = hint;
+   589→    let bd = Infinity;
+   590→    for (let k = -35; k <= 95; k++) {
+   591→      const i = wrapIdx(hint + k, this.N);
+   592→      const s = this.samples[i];
+   593→      const d = (s.x - x) * (s.x - x) + (s.z - z) * (s.z - z);
+   594→      if (d < bd) {
+   595→        bd = d;
+   596→        best = i;
+   597→      }
+   598→    }
+   599→    if (bd > 90 * 90) best = this.idxNear(x, z);
+   600→    return best;
+   601→  }
+   602→
+   603→  lateralOf(i: number, x: number, z: number): number {
+   604→    const s = this.sample(i);
+   605→    return (x - s.x) * s.rx + (z - s.z) * s.rz;
+   606→  }
+   607→
+   608→  posAt(i: number, lat: number, y?: number): THREE.Vector3 {
+   609→    const s = this.sample(i);
+   610→    return new THREE.Vector3(s.x + s.rx * lat, y ?? s.y, s.z + s.rz * lat);
+   611→  }
+   612→
+   613→  // ============================================================
+   614→  // Meshes
+   615→  // ============================================================
+   616→
+   617→  private buildMeshes() {
+   618→    this.buildWalls();
+   619→    this.buildRoad();
+   620→    this.buildRouteMarks();
+   621→    this.buildPit();
+   622→    this.buildTunnel();
+   623→    this.buildArch();
+   624→    this.buildScenery();
+   625→    this.buildGates();
+   626→    // two BREAK barricades: one right after the first jump (you spot its
+   627→    // banner mid-air), one on the final arc — both with the full clarity kit
+   628→    this.buildBreakWall(5, 1_000_000);
+   629→    this.buildBreakWall(25, 1_000_001);
+   630→    this.buildStacks();
+   631→  }
+   632→
+   633→  private buildWalls() {
+   634→    const S = this.samples;
+   635→    const n = this.N;
+   636→    for (const side of [-1, 1] as const) {
+   637→      const pos: number[] = [];
+   638→      const col: number[] = [];
+   639→      const idx: number[] = [];
+   640→      const strata = PALETTE.rockStrata.map((c) => new THREE.Color(c));
+   641→      const cBase = new THREE.Color(PALETTE.rockBase);
+   642→      for (let i = 0; i < n; i++) {
+   643→        const s = S[i];
+   644→        const wd = this.wallDist(i, side) - 0.3;
+   645→        const bx = s.x + s.rx * wd * side;
+   646→        const bz = s.z + s.rz * wd * side;
+   647→        const wallH = side > 0 ? s.wallHR : s.wallHL;
+   648→        const lean = 7 + ((i * 37) % 5);
+   649→        const tx = s.x + (s.rx * wd + lean) * side;
+   650→        const tz = s.z + (s.rz * wd + lean) * side;
+   651→        const by = s.gap ? s.y + pitDepthAt(s.gapT) - 0.4 : this.heightAt(i, wd * side) - 0.2;
+   652→        const ty = s.y + wallH;
+   653→        pos.push(bx, by, bz, tx, ty, tz);
+   654→        for (const yv of [by, ty]) {
+   655→          const band = Math.floor((yv + Math.sin(i * 0.7 + side) * 1.4) / 4.2);
+   656→          const c = strata[((band % strata.length) + strata.length) % strata.length].clone();
+   657→          c.lerp(cBase, 0.25 + 0.2 * Math.abs(Math.sin(i * 0.13 + band)));
+   658→          col.push(c.r, c.g, c.b);
+   659→        }
+   660→      }
+   661→      for (let i = 0; i < n; i++) {
+   662→        const a = i * 2;
+   663→        const b = ((i + 1) % n) * 2;
+   664→        if (side > 0) {
+   665→          // normal faces the track (-right)
+   666→          idx.push(a, a + 1, b, a + 1, b + 1, b);
+   667→        } else {
+   668→          idx.push(a, b, a + 1, b, b + 1, a + 1);
+   669→        }
+   670→      }
+   671→      const g = new THREE.BufferGeometry();
+   672→      g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+   673→      g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+   674→      g.setIndex(idx);
+   675→      g.computeVertexNormals();
+   676→      const m = new THREE.MeshLambertMaterial({ vertexColors: true, flatShading: true });
+   677→      const mesh = new THREE.Mesh(g, m);
+   678→      mesh.castShadow = true;
+   679→      mesh.receiveShadow = true;
+   680→      this.group.add(mesh);
+   681→      this.disposables.push(g, m);
+   682→    }
+   683→  }
+   684→
+   685→  private ringLats(i: number): number[] {
+   686→    const s = this.sample(i);
+   687→    const wdL = -this.wallDist(i, -1);
+   688→    const wdR = this.wallDist(i, 1);
+   689→    const lats: number[] = [wdL];
+   690→    for (const l of ROAD_COLS) {
+   691→      if (l > wdL + 0.05 && l < wdR - 0.05) lats.push(l);
+   692→    }
+   693→    lats.push(wdR);
+   694→    return lats;
+   695→  }
+   696→
+   697→  private buildRoad() {
+   698→    const n = this.N;
+   699→    const pos: number[] = [];
+   700→    const col: number[] = [];
+   701→    const uv: number[] = [];
+   702→    const idx: number[] = [];
+   703→    const cRoad = new THREE.Color(PALETTE.road);
+   704→    const cRoadDust = new THREE.Color(PALETTE.roadDust);
+   705→    const cSand = new THREE.Color(PALETTE.sand);
+   706→    const cPit = new THREE.Color(PALETTE.pitSand);
+   707→    const cTerr = new THREE.Color(0xcf8a52);
+   708→    const gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+   709→
+   710→    const ringLats: number[][] = [];
+   711→    const ringStart: number[] = [];
+   712→    for (let i = 0; i < n; i++) {
+   713→      ringStart[i] = pos.length / 3;
+   714→      const s = this.samples[i];
+   715→      const lats = this.ringLats(i);
+   716→      ringLats.push(lats);
+   717→      for (const l of lats) {
+   718→        this.groundAt(i, l, gi);
+   719→        let c: THREE.Color;
+   720→        if (gi.inPitZone) c = cPit;
+   721→        else if (Math.abs(l) <= s.hw + 0.01) c = cRoad.clone().lerp(cRoadDust, 0.3 + 0.2 * Math.sin(i * 0.37));
+   722→        else if (s.dualT > 0 && l < -3) c = cTerr.clone();
+   723→        else if (s.wallRideR && l > s.hw) {
+   724→          const t = clamp((l - 4) / 24, 0, 1);
+   725→          c = cRoad.clone().lerp(cTerr, t * 0.8);
+   726→        } else c = cSand.clone().offsetHSL(0, 0, Math.sin(i * 0.53 + l) * 0.015);
+   727→        pos.push(s.x + s.rx * l, gi.h, s.z + s.rz * l);
+   728→        col.push(c.r, c.g, c.b);
+   729→        uv.push(l / 12, (i * this.step) / 7);
+   730→      }
+   731→    }
+   732→    for (let i = 0; i < n; i++) {
+   733→      const j = (i + 1) % n;
+   734→      if (this.samples[i].gap || this.samples[j].gap) continue;
+   735→      const a = ringStart[i];
+   736→      const b = ringStart[j];
+   737→      const m = ringLats[i].length; // stitch with ring i's column count on both rings
+   738→      for (let k = 0; k < m - 1; k++) {
+   739→        idx.push(a + k, a + k + 1, b + k, a + k + 1, b + k + 1, b + k);
+   740→      }
+   741→    }
+   742→    const g = new THREE.BufferGeometry();
+   743→    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+   744→    g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+   745→    g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+   746→    g.setIndex(idx);
+   747→    g.computeVertexNormals();
+   748→    const tex = makeSandNoiseTexture();
+   749→    const m = new THREE.MeshLambertMaterial({ vertexColors: true, map: tex, flatShading: true });
+   750→    const mesh = new THREE.Mesh(g, m);
+   751→    mesh.receiveShadow = true;
+   752→    this.group.add(mesh);
+   753→    this.disposables.push(g, m, tex);
+   754→  }
+   755→
+   756→  /** Painted route markings — edge lines + forward chevrons so the line is always readable. */
+   757→  private buildRouteMarks() {
+   758→    const n = this.N;
+   759→    const lineMat = new THREE.MeshBasicMaterial({
+   760→      color: 0xf7e7c3,
+   761→      fog: true,
+   762→      side: THREE.DoubleSide,
+   763→      polygonOffset: true,
+   764→      polygonOffsetFactor: -3,
+   765→      polygonOffsetUnits: -3,
+   766→    });
+   767→    const chevMat = new THREE.MeshBasicMaterial({
+   768→      color: 0xfffbe8,
+   769→      fog: true,
+   770→      side: THREE.DoubleSide,
+   771→      polygonOffset: true,
+   772→      polygonOffsetFactor: -4,
+   773→      polygonOffsetUnits: -4,
+   774→    });
+   775→
+   776→    // ---- continuous edge lines hugging the road edge ----
+   777→    const pos: number[] = [];
+   778→    const idx: number[] = [];
+   779→    const lineHalf = 0.19;
+   780→    for (const side of [-1, 1] as const) {
+   781→      const start = pos.length / 3;
+   782→      for (let i = 0; i < n; i++) {
+   783→        const s = this.samples[i];
+   784→        const latE = (s.hw - 0.85) * side;
+   785→        const y = this.heightAt(i, latE) + 0.05;
+   786→        pos.push(
+   787→          s.x + s.rx * (latE - lineHalf), y, s.z + s.rz * (latE - lineHalf),
+   788→          s.x + s.rx * (latE + lineHalf), y, s.z + s.rz * (latE + lineHalf)
+   789→        );
+   790→      }
+   791→      for (let i = 0; i < n; i++) {
+   792→        const j = (i + 1) % n;
+   793→        if (this.samples[i].gap || this.samples[j].gap) continue;
+   794→        const a = start + i * 2;
+   795→        const b = start + j * 2;
+   796→        idx.push(a, a + 1, b, a + 1, b + 1, b);
+   797→      }
+   798→    }
+   799→    const lineGeo = new THREE.BufferGeometry();
+   800→    lineGeo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+   801→    lineGeo.setIndex(idx);
+   802→    const lineMesh = new THREE.Mesh(lineGeo, lineMat);
+   803→    lineMesh.frustumCulled = false; // spans the whole loop
+   804→    this.group.add(lineMesh);
+   805→    this.disposables.push(lineGeo, lineMat);
+   806→
+   807→    // ---- forward-pointing chevrons along the centerline ----
+   808→    const gateBlocked = new Set<number>();
+   809→    for (const g of this.gates) {
+   810→      for (let k = -4; k <= 4; k++) gateBlocked.add(wrapIdx(g.idx + k, n));
+   811→    }
+   812→    const cpos: number[] = [];
+   813→    const cidx: number[] = [];
+   814→    const arm = (f0: number, l0: number, f1: number, l1: number, w: number, i: number) => {
+   815→      const df = f1 - f0;
+   816→      const dl = l1 - l0;
+   817→      const len = Math.hypot(df, dl);
+   818→      if (len < 1e-4) return;
+   819→      const px = (-dl / len) * (w * 0.5);
+   820→      const pl = (df / len) * (w * 0.5);
+   821→      const corners: [number, number][] = [
+   822→        [f0 + px, l0 + pl],
+   823→        [f1 + px, l1 + pl],
+   824→        [f1 - px, l1 - pl],
+   825→        [f0 - px, l0 - pl],
+   826→      ];
+   827→      const base = cpos.length / 3;
+   828→      const s = this.samples[i];
+   829→      for (const [f, l] of corners) {
+   830→        const x = s.x + s.dx * f + s.rx * l;
+   831→        const z = s.z + s.dz * f + s.rz * l;
+   832→        const y = this.heightAtP(i + f / this.step, l) + 0.07;
+   833→        cpos.push(x, y, z);
+   834→      }
+   835→      cidx.push(base, base + 1, base + 2, base, base + 2, base + 3);
+   836→    };
+   837→    for (let i = 6; i < n; i += 14) {
+   838→      const s = this.samples[i];
+   839→      if (s.gap || gateBlocked.has(i)) continue;
+   840→      arm(1.15, 0, -0.45, 1.35, 0.46, i);
+   841→      arm(1.15, 0, -0.45, -1.35, 0.46, i);
+   842→    }
+   843→    const chevGeo = new THREE.BufferGeometry();
+   844→    chevGeo.setAttribute("position", new THREE.Float32BufferAttribute(cpos, 3));
+   845→    chevGeo.setIndex(cidx);
+   846→    const chevMesh = new THREE.Mesh(chevGeo, chevMat);
+   847→    chevMesh.frustumCulled = false;
+   848→    this.group.add(chevMesh);
+   849→    this.disposables.push(chevGeo, chevMat);
+   850→  }
+   851→
+   852→  private buildPit() {
+   853→    const n = this.N;
+   854→    const pos: number[] = [];
+   855→    const idx: number[] = [];
+   856→    const col: number[] = [];
+   857→    const cPit = new THREE.Color(PALETTE.pitSand);
+   858→    const cDark = new THREE.Color(0xb08a58);
+   859→    let v = 0;
+   860→    const pushTri = (a: number[], b: number[], c: number[], shade: number) => {
+   861→      for (const p of [a, b, c]) pos.push(p[0], p[1], p[2]);
+   862→      const cc = cPit.clone().lerp(cDark, shade);
+   863→      col.push(cc.r, cc.g, cc.b, cc.r, cc.g, cc.b, cc.r, cc.g, cc.b);
+   864→      idx.push(v, v + 1, v + 2);
+   865→      v += 3;
+   866→    };
+   867→    const pushQuad = (a: number[], b: number[], c: number[], d: number[]) => {
+   868→      pushTri(a, b, c, 0);
+   869→      pushTri(a, c, d, 0.25);
+   870→    };
+   871→    const PL = 12.4;
+   872→    let i = 0;
+   873→    while (i < n) {
+   874→      if (!this.samples[i].gap) {
+   875→        i++;
+   876→        continue;
+   877→      }
+   878→      let j = i;
+   879→      while (j < n && this.samples[j].gap) j++;
+   880→      const jEnd = Math.min(j, n - 1); // gap never crosses the wrap in this track
+   881→      // smooth valley floor — follows the same profile the physics drives on,
+   882→      // so the rendered sand matches the collision surface exactly
+   883→      const floorY = (k: number) => {
+   884→        const sk = this.samples[wrapIdx(k, n)];
+   885→        return sk.y + pitDepthAt(sk.gapT);
+   886→      };
+   887→      for (let k = i; k < jEnd; k++) {
+   888→        const s0 = this.samples[k];
+   889→        const s1 = this.samples[k + 1];
+   890→        for (const [l0, l1] of [
+   891→          [-PL, -PL / 2],
+   892→          [-PL / 2, PL / 2],
+   893→          [PL / 2, PL],
+   894→        ] as [number, number][]) {
+   895→          pushQuad(
+   896→            [s0.x + s0.rx * l0, floorY(k), s0.z + s0.rz * l0],
+   897→            [s0.x + s0.rx * l1, floorY(k), s0.z + s0.rz * l1],
+   898→            [s1.x + s1.rx * l1, floorY(k + 1), s1.z + s1.rz * l1],
+   899→            [s1.x + s1.rx * l0, floorY(k + 1), s1.z + s1.rz * l0]
+   900→          );
+   901→        }
+   902→      }
+   903→      // near face: crisp cliff under the launch edge (keeps launches snappy)
+   904→      const sp = this.samples[wrapIdx(i - 1, n)];
+   905→      const sa = this.samples[i];
+   906→      for (const [l0, l1] of [
+   907→        [-PL, 0],
+   908→        [0, PL],
+   909→      ] as [number, number][]) {
+   910→        pushQuad(
+   911→          [sp.x + sp.rx * l0, this.heightAt(wrapIdx(i - 1, n), l0), sp.z + sp.rz * l0],
+   912→          [sp.x + sp.rx * l1, this.heightAt(wrapIdx(i - 1, n), l1), sp.z + sp.rz * l1],
+   913→          [sa.x + sa.rx * l1, floorY(i), sa.z + sa.rz * l1],
+   914→          [sa.x + sa.rx * l0, floorY(i), sa.z + sa.rz * l0]
+   915→        );
+   916→      }
+   917→      // far face: the valley floor has already climbed to road level here —
+   918→      // just a short skirt so there is no visible seam at the join
+   919→      const sf = this.samples[wrapIdx(jEnd, n)];
+   920→      const sl = this.samples[wrapIdx(jEnd - 1, n)];
+   921→      for (const [l0, l1] of [
+   922→        [-PL, 0],
+   923→        [0, PL],
+   924→      ] as [number, number][]) {
+   925→        pushQuad(
+   926→          [sl.x + sl.rx * l0, floorY(jEnd - 1), sl.z + sl.rz * l0],
+   927→          [sl.x + sl.rx * l1, floorY(jEnd - 1), sl.z + sl.rz * l1],
+   928→          [sf.x + sf.rx * l1, this.heightAt(wrapIdx(jEnd, n), l1), sf.z + sf.rz * l1],
+   929→          [sf.x + sf.rx * l0, this.heightAt(wrapIdx(jEnd, n), l0), sf.z + sf.rz * l0]
+   930→        );
+   931→      }
+   932→      i = j;
+   933→    }
+   934→    const g = new THREE.BufferGeometry();
+   935→    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+   936→    g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+   937→    g.setIndex(idx);
+   938→    g.computeVertexNormals();
+   939→    const m = new THREE.MeshLambertMaterial({
+   940→      vertexColors: true,
+   941→      flatShading: true,
+   942→      side: THREE.DoubleSide,
+   943→    });
+   944→    const mesh = new THREE.Mesh(g, m);
+   945→    mesh.receiveShadow = true;
+   946→    this.group.add(mesh);
+   947→    this.disposables.push(g, m);
+   948→  }
+   949→
+   950→  private buildTunnel() {
+   951→    const n = this.N;
+   952→    const tunnelIdx: number[] = [];
+   953→    for (let i = 0; i < n; i++) if (this.samples[i].tunnel) tunnelIdx.push(i);
+   954→    if (tunnelIdx.length < 8) return;
+   955→    const pos: number[] = [];
+   956→    const col: number[] = [];
+   957→    const idx: number[] = [];
+   958→    const strata = PALETTE.rockStrata.map((c) => new THREE.Color(c));
+   959→    const cDark = new THREE.Color(0x6e3524);
+   960→    const SEG = 7;
+   961→    const R = 12.2;
+   962→    for (let r = 0; r < tunnelIdx.length; r++) {
+   963→      const i = tunnelIdx[r];
+   964→      const s = this.samples[i];
+   965→      for (let k = 0; k <= SEG; k++) {
+   966→        const a = Math.PI * (k / SEG);
+   967→        const lx = -Math.cos(a) * R;
+   968→        const ly = Math.sin(a) * R * 0.92;
+   969→        pos.push(s.x + s.rx * lx, s.y + ly - 1.8, s.z + s.rz * lx);
+   970→        const band = Math.floor((k + i * 0.2) / 2);
+   971→        const c = strata[((band % strata.length) + strata.length) % strata.length].clone().lerp(cDark, 0.5);
+   972→        col.push(c.r, c.g, c.b);
+   973→      }
+   974→      if (r > 0) {
+   975→        for (let k = 0; k < SEG; k++) {
+   976→          const a = (r - 1) * (SEG + 1) + k;
+   977→          const b = r * (SEG + 1) + k;
+   978→          idx.push(a, a + 1, b, a + 1, b + 1, b);
+   979→        }
+   980→      }
+   981→    }
+   982→    const g = new THREE.BufferGeometry();
+   983→    g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+   984→    g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+   985→    g.setIndex(idx);
+   986→    g.computeVertexNormals();
+   987→    const m = new THREE.MeshLambertMaterial({
+   988→      vertexColors: true,
+   989→      flatShading: true,
+   990→      side: THREE.DoubleSide,
+   991→    });
+   992→    const mesh = new THREE.Mesh(g, m);
+   993→    mesh.castShadow = true;
+   994→    mesh.receiveShadow = true;
+   995→    this.group.add(mesh);
+   996→    this.disposables.push(g, m);
+   997→
+   998→    // amber light strips along the ceiling
+   999→    const stripGeo = new THREE.BoxGeometry(0.5, 0.15, 2.4);
+  1000→    const stripMat = new THREE.MeshBasicMaterial({ color: 0xffc766 });
+  1001→    for (let r = 5; r < tunnelIdx.length - 5; r += 10) {
+  1002→      const i = tunnelIdx[r];
+  1003→      const s = this.samples[i];
+  1004→      const strip = new THREE.Mesh(stripGeo, stripMat);
+  1005→      strip.position.set(s.x, s.y + R * 0.92 - 1.2, s.z);
+  1006→      strip.lookAt(s.x + s.dx, s.y + R * 0.92 - 1.2, s.z + s.dz);
+  1007→      this.group.add(strip);
+  1008→    }
+  1009→    this.disposables.push(stripGeo, stripMat);
+  1010→
+  1011→    // the mesa blob covering the tunnel
+  1012→    const mid = tunnelIdx[Math.floor(tunnelIdx.length / 2)];
+  1013→    const ms = this.samples[mid];
+  1014→    const mesaGeo = new THREE.SphereGeometry(1, 12, 8);
+  1015→    const mesaMat = new THREE.MeshLambertMaterial({ color: 0xb0532f, flatShading: true });
+  1016→    const mesa = new THREE.Mesh(mesaGeo, mesaMat);
+  1017→    mesa.scale.set(150, 40, 58);
+  1018→    mesa.position.set(ms.x, ms.y + 4, ms.z);
+  1019→    mesa.rotation.y = Math.atan2(ms.dx, ms.dz) + Math.PI / 2;
+  1020→    mesa.castShadow = true;
+  1021→    this.group.add(mesa);
+  1022→    this.disposables.push(mesaGeo, mesaMat);
+  1023→  }
+  1024→
+  1025→  private buildArch() {
+  1026→    const i = this.idxNear(CONTROL[6][0], CONTROL[6][2]);
+  1027→    const s = this.samples[i];
+  1028→    const geo = new THREE.TorusGeometry(30, 7.5, 8, 14, Math.PI);
+  1029→    const mat = new THREE.MeshLambertMaterial({ color: 0xb45a33, flatShading: true });
+  1030→    const arch = new THREE.Mesh(geo, mat);
+  1031→    arch.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), new THREE.Vector3(s.dx, 0, s.dz));
+  1032→    arch.scale.set(1, 0.78, 1);
+  1033→    arch.position.set(s.x, s.y + 1.2, s.z);
+  1034→    arch.castShadow = true;
+  1035→    this.group.add(arch);
+  1036→    this.disposables.push(geo, mat);
+  1037→
+  1038→    const rockGeo = new THREE.IcosahedronGeometry(2.4, 0);
+  1039→    const rockMat = new THREE.MeshLambertMaterial({ color: 0xa84c2c, flatShading: true });
+  1040→    for (const side of [-1, 1]) {
+  1041→      const lat = side * (s.hw + 2.2);
+  1042→      const pillar = new THREE.Mesh(rockGeo, rockMat);
+  1043→      pillar.position.set(s.x + s.rx * lat, this.heightAt(i, lat) + 1.6, s.z + s.rz * lat);
+  1044→      pillar.scale.set(1.1, 2.6, 1.1);
+  1045→      pillar.rotation.set(0.2 * side, side, 0.1);
+  1046→      pillar.castShadow = true;
+  1047→      this.group.add(pillar);
+  1048→    }
+  1049→    this.disposables.push(rockGeo, rockMat);
+  1050→  }
+  1051→
+  1052→  private buildScenery() {
+  1053→    const rockGeo = new THREE.IcosahedronGeometry(1, 0);
+  1054→    const posAttr = rockGeo.attributes.position as THREE.BufferAttribute;
+  1055→    for (let v = 0; v < posAttr.count; v++) {
+  1056→      const j = 1 + (Math.sin(v * 12.9) * 0.5 + Math.cos(v * 7.7) * 0.5) * 0.22;
+  1057→      posAttr.setXYZ(v, posAttr.getX(v) * j, posAttr.getY(v) * j * 0.8, posAttr.getZ(v) * j);
+  1058→    }
+  1059→    rockGeo.computeVertexNormals();
+  1060→    const rockMat = new THREE.MeshLambertMaterial({ flatShading: true });
+  1061→    const rocks = new THREE.InstancedMesh(rockGeo, rockMat, 150);
+  1062→    const rnd = mulberry32(777);
+  1063→    const m = new THREE.Matrix4();
+  1064→    const col = new THREE.Color();
+  1065→    let placed = 0;
+  1066→    let guard = 0;
+  1067→    while (placed < 150 && guard++ < 3000) {
+  1068→      const i = Math.floor(rnd() * this.N);
+  1069→      const s = this.samples[i];
+  1070→      const side = rnd() > 0.5 ? 1 : -1;
+  1071→      const wd = this.wallDist(i, side as 1 | -1);
+  1072→      const lat = wd + 2 + rnd() * 16;
+  1073→      const wallH = side > 0 ? s.wallHR : s.wallHL;
+  1074→      const y = s.y + wallH * (0.15 + rnd() * 0.6);
+  1075→      const sc = 1.4 + rnd() * 4.6;
+  1076→      m.makeRotationY(rnd() * Math.PI * 2);
+  1077→      m.scale(new THREE.Vector3(sc, sc * (0.7 + rnd() * 0.6), sc));
+  1078→      m.setPosition(s.x + s.rx * lat * side, y, s.z + s.rz * lat * side);
+  1079→      rocks.setMatrixAt(placed, m);
+  1080→      col.setHex(PALETTE.rockStrata[Math.floor(rnd() * PALETTE.rockStrata.length)]);
+  1081→      rocks.setColorAt(placed, col);
+  1082→      placed++;
+  1083→    }
+  1084→    rocks.castShadow = true;
+  1085→    this.group.add(rocks);
+  1086→    this.disposables.push(rockGeo, rockMat);
+  1087→
+  1088→    // boulders for registered obstacles
+  1089→    const obGeo = new THREE.IcosahedronGeometry(1, 0);
+  1090→    const obMat = new THREE.MeshLambertMaterial({ color: 0x9c4a2a, flatShading: true });
+  1091→    for (const ob of this.obstacles) {
+  1092→      const b = new THREE.Mesh(obGeo, obMat);
+  1093→      b.position.set(ob.x, ob.top - ob.r * 0.8, ob.z);
+  1094→      b.scale.set(ob.r, ob.r * 1.2, ob.r);
+  1095→      b.rotation.y = ob.x * 0.7;
+  1096→      b.castShadow = true;
+  1097→      this.group.add(b);
+  1098→    }
+  1099→    this.disposables.push(obGeo, obMat);
+  1100→
+  1101→    // cacti
+  1102→    const cactus = buildCactusGeometry();
+  1103→    const cacMat = new THREE.MeshLambertMaterial({ color: 0x4e7d4a, flatShading: true });
+  1104→    const cacti = new THREE.InstancedMesh(cactus, cacMat, 70);
+  1105→    let cp = 0;
+  1106→    let cg = 0;
+  1107→    while (cp < 70 && cg++ < 1500) {
+  1108→      const i = Math.floor(rnd() * this.N);
+  1109→      const s = this.samples[i];
+  1110→      const side = rnd() > 0.5 ? 1 : -1;
+  1111→      const wd = this.wallDist(i, side as 1 | -1);
+  1112→      const lat = wd + 3 + rnd() * 14;
+  1113→      const y = s.y + (side > 0 ? s.wallHR : s.wallHL) * (0.05 + rnd() * 0.4);
+  1114→      const sc = 0.8 + rnd() * 1.5;
+  1115→      m.makeRotationY(rnd() * Math.PI * 2);
+  1116→      m.scale(new THREE.Vector3(sc, sc, sc));
+  1117→      m.setPosition(s.x + s.rx * lat * side, y, s.z + s.rz * lat * side);
+  1118→      cacti.setMatrixAt(cp, m);
+  1119→      cp++;
+  1120→    }
+  1121→    cacti.castShadow = true;
+  1122→    this.group.add(cacti);
+  1123→    this.disposables.push(cactus, cacMat);
+  1124→
+  1125→    // distant mesa skyline
+  1126→    const skyGeo = new THREE.CylinderGeometry(0.55, 1, 1, 7, 1);
+  1127→    const skyMat = new THREE.MeshLambertMaterial({ color: 0xc98a63, flatShading: true });
+  1128→    const sky = new THREE.InstancedMesh(skyGeo, skyMat, 46);
+  1129→    const fogC = new THREE.Color(PALETTE.fog);
+  1130→    for (let k = 0; k < 46; k++) {
+  1131→      const ang = (k / 46) * Math.PI * 2 + rnd() * 0.1;
+  1132→      const rad = 850 + rnd() * 550;
+  1133→      const h = 70 + rnd() * 150;
+  1134→      const w = 70 + rnd() * 140;
+  1135→      m.makeRotationY(rnd() * Math.PI);
+  1136→      m.scale(new THREE.Vector3(w, h, w));
+  1137→      m.setPosition(Math.cos(ang) * rad, h * 0.5 - 18, Math.sin(ang) * rad);
+  1138→      sky.setMatrixAt(k, m);
+  1139→      col.copy(skyMat.color).lerp(fogC, 0.55 + rnd() * 0.2);
+  1140→      sky.setColorAt(k, col);
+  1141→    }
+  1142→    this.group.add(sky);
+  1143→    this.disposables.push(skyGeo, skyMat);
+  1144→
+  1145→    // giant ground disc
+  1146→    const gg = new THREE.CircleGeometry(3200, 40);
+  1147→    const gm = new THREE.MeshLambertMaterial({ color: 0xd8ad74 });
+  1148→    const ground = new THREE.Mesh(gg, gm);
+  1149→    ground.rotation.x = -Math.PI / 2;
+  1150→    ground.position.y = -14.4;
+  1151→    this.group.add(ground);
+  1152→    this.disposables.push(gg, gm);
+  1153→  }
+  1154→
+  1155→  private buildGates() {
+  1156→    const stripeTex = makeStripeTexture();
+  1157→    const pylonGeo = new THREE.CylinderGeometry(0.42, 0.55, 5.4, 8);
+  1158→    const pylonMat = new THREE.MeshLambertMaterial({ map: stripeTex });
+  1159→    const capGeo = new THREE.SphereGeometry(0.62, 8, 6);
+  1160→    const chevGeo = new THREE.ConeGeometry(0.85, 1.5, 4);
+  1161→    const beamGeo = new THREE.BoxGeometry(1, 0.5, 0.5);
+  1162→    const UP = new THREE.Vector3(0, 1, 0);
+  1163→    for (const gate of this.gates) {
+  1164→      const s = this.sample(gate.idx);
+  1165→      const grp = new THREE.Group();
+  1166→      const glowMat = new THREE.MeshStandardMaterial({
+  1167→        color: PALETTE.checkpoint,
+  1168→        emissive: new THREE.Color(gate.isFinish ? 0xffcf3f : 0xff9a1f),
+  1169→        emissiveIntensity: 1.4,
+  1170→        roughness: 0.4,
+  1171→      });
+  1172→      for (const side of [-1, 1]) {
+  1173→        const lat = side * (s.hw + 1.2);
+  1174→        const pylon = new THREE.Mesh(pylonGeo, pylonMat);
+  1175→        pylon.position.set(s.x + s.rx * lat, this.heightAt(gate.idx, lat) + 2.6, s.z + s.rz * lat);
+  1176→        pylon.castShadow = true;
+  1177→        grp.add(pylon);
+  1178→        const cap = new THREE.Mesh(capGeo, glowMat);
+  1179→        cap.position.set(s.x + s.rx * lat, this.heightAt(gate.idx, lat) + 5.6, s.z + s.rz * lat);
+  1180→        grp.add(cap);
+  1181→      }
+  1182→      const beam = new THREE.Mesh(beamGeo, glowMat);
+  1183→      beam.scale.x = s.hw * 2 + 3.2;
+  1184→      beam.position.set(s.x, s.y + 7.6, s.z);
+  1185→      beam.rotation.y = Math.atan2(-s.rz, s.rx);
+  1186→      grp.add(beam);
+  1187→
+  1188→      const chev = new THREE.Mesh(chevGeo, glowMat);
+  1189→      chev.quaternion.setFromUnitVectors(UP, new THREE.Vector3(s.dx, 0, s.dz));
+  1190→      chev.position.set(s.x + s.dx * 2.2, s.y + 6.3, s.z + s.dz * 2.2);
+  1191→      grp.add(chev);
+  1192→
+  1193→      if (gate.isFinish) {
+  1194→        const bannerTex = makeBannerTexture();
+  1195→        const bannerGeo = new THREE.PlaneGeometry(s.hw * 2 + 2, 2.6);
+  1196→        const banner = new THREE.Mesh(
+  1197→          bannerGeo,
+  1198→          new THREE.MeshBasicMaterial({ map: bannerTex, side: THREE.DoubleSide })
+  1199→        );
+  1200→        banner.position.set(s.x, s.y + 9.4, s.z);
+  1201→        banner.rotation.y = Math.atan2(-s.dx, -s.dz);
+  1202→        grp.add(banner);
+  1203→        this.disposables.push(bannerTex, bannerGeo, banner.material as THREE.Material);
+  1204→
+  1205→        const lineTex = makeCheckerTexture();
+  1206→        const lineGeo = new THREE.PlaneGeometry(s.hw * 2, 3);
+  1207→        lineGeo.rotateX(-Math.PI / 2);
+  1208→        const line = new THREE.Mesh(
+  1209→          lineGeo,
+  1210→          new THREE.MeshBasicMaterial({ map: lineTex, transparent: true, depthWrite: false })
+  1211→        );
+  1212→        line.rotation.y = Math.atan2(-s.rz, s.rx);
+  1213→        line.position.set(s.x, this.heightAt(gate.idx, 0) + 0.08, s.z);
+  1214→        grp.add(line);
+  1215→        this.disposables.push(lineTex, lineGeo, line.material as THREE.Material);
+  1216→      }
+  1217→      gate.glow = glowMat;
+  1218→      this.group.add(grp);
+  1219→      this.disposables.push(glowMat);
+  1220→    }
+  1221→    this.disposables.push(pylonGeo, pylonMat, stripeTex, capGeo, chevGeo, beamGeo);
+  1222→  }
+  1223→
+  1224→  /** Activate the first `stacks` crate stacks (difficulty setting) — the break wall is always live. */
+  1225→  setActiveStacks(stacks: number) {
+  1226→    for (const b of this.boxes) {
+  1227→      b.enabled = b.wall || b.cluster < stacks;
+  1228→      b.active = b.enabled;
+  1229→      b.respawnAt = 0;
+  1230→      b.mesh.visible = b.enabled;
+  1231→    }
+  1232→  }
+  1233→
+  1234→  /** Bring every enabled crate back for a new race. */
+  1235→  resetBoxes() {
+  1236→    for (const b of this.boxes) {
+  1237→      if (!b.enabled) continue;
+  1238→      b.active = true;
+  1239→      b.respawnAt = 0;
+  1240→      b.mesh.visible = true;
+  1241→    }
+  1242→  }
+  1243→
+  1244→  /** Respawn smashed crates whose timeout has elapsed (game-time ms). */
+  1245→  updateBoxes(nowMs: number) {
+  1246→    for (const b of this.boxes) {
+  1247→      if (b.enabled && !b.active && b.respawnAt <= nowMs) {
+  1248→        b.active = true;
+  1249→        b.mesh.visible = true;
+  1250→      }
+  1251→    }
+  1252→  }
+  1253→
+  1254→  /**
+  1255→   * The BREAK barricade: a full-width plank wall that is MEANT to be smashed.
+  1256→   * Full clarity kit so no rider can miss it at 180 km/h:
+  1257→   *  - giant unlit gantry banner overhead: "BREAK" with hazard borders + down arrows
+  1258→   *  - pulsing amber glow strip along the wall top + beacon lamps on the gantry
+  1259→   *  - two roadside "BREAK AHEAD" diamond signs (56 m + 28 m) with beacons
+  1260→   *  - triple chevron decals painted onto the approach road
+  1261→   * One cluster id = the whole wall chain-breaks when you hit it.
+  1262→   */
+  1263→  private buildBreakWall(controlIdx: number, cluster: number) {
+  1264→    const idx = this.idxNear(CONTROL[controlIdx][0], CONTROL[controlIdx][2]);
+  1265→    this.breakWallIdxs.push(idx);
+  1266→    const s = this.samples[idx];
+  1267→    const yaw = Math.atan2(-s.rz, s.rx); // local +X along the road's right vector
+  1268→    const faceBack = Math.atan2(-s.dx, -s.dz); // plane normal toward oncoming riders
+  1269→
+  1270→    const span = s.hw + 1.6; // road + shoulders — nowhere to sneak around
+  1271→    const segW = 2.0;
+  1272→    const segH = 2.6;
+  1273→
+  1274→    const tex = makeWallTexture();
+  1275→    const geo = new THREE.BoxGeometry(segW, segH, 0.18);
+  1276→    const mat = new THREE.MeshLambertMaterial({ map: tex });
+  1277→    const postMat = new THREE.MeshLambertMaterial({ color: 0x6e4523 });
+  1278→    this.disposables.push(geo, mat, tex, postMat);
+  1279→
+  1280→    // ---- glow group: amber top strip + beacon lamps (engine pulses them) ----
+  1281→    const glow = new THREE.Group();
+  1282→    const glowMat = new THREE.MeshBasicMaterial({
+  1283→      color: 0xffb020,
+  1284→      transparent: true,
+  1285→      opacity: 0.95,
+  1286→      depthWrite: false,
+  1287→    });
+  1288→    this.wallGlowMats.push(glowMat);
+  1289→    const stripGeo = new THREE.BoxGeometry(span * 2 + 0.4, 0.12, 0.12);
+  1290→    const strip = new THREE.Mesh(stripGeo, glowMat);
+  1291→    strip.position.set(s.x, this.heightAt(idx, 0) + segH + 0.16, s.z);
+  1292→    strip.rotation.y = yaw;
+  1293→    glow.add(strip);
+  1294→    const beaconGeo = new THREE.SphereGeometry(0.26, 10, 8);
+  1295→    this.disposables.push(stripGeo, beaconGeo, glowMat);
+  1296→
+  1297→    // ---- gantry: posts + crossbeam + the big BREAK banner ----
+  1298→    const postH = 7.3;
+  1299→    const gLat = span + 1.0;
+  1300→    const postGeo = new THREE.BoxGeometry(0.32, postH, 0.32);
+  1301→    this.disposables.push(postGeo);
+  1302→    for (const e of [-gLat, gLat]) {
+  1303→      const post = new THREE.Mesh(postGeo, postMat);
+  1304→      post.position.set(s.x + s.rx * e, this.heightAt(idx, e) + postH / 2, s.z + s.rz * e);
+  1305→      post.rotation.y = yaw;
+  1306→      post.castShadow = true;
+  1307→      this.group.add(post);
+  1308→      const beacon = new THREE.Mesh(beaconGeo, glowMat);
+  1309→      beacon.position.set(s.x + s.rx * e, this.heightAt(idx, e) + postH + 0.28, s.z + s.rz * e);
+  1310→      glow.add(beacon);
+  1311→    }
+  1312→    const beamGeo = new THREE.BoxGeometry(gLat * 2 + 0.32, 0.36, 0.36);
+  1313→    const beam = new THREE.Mesh(beamGeo, postMat);
+  1314→    beam.position.set(s.x, this.heightAt(idx, 0) + postH, s.z);
+  1315→    beam.rotation.y = yaw;
+  1316→    this.group.add(beam);
+  1317→    this.disposables.push(beamGeo);
+  1318→
+  1319→    const banW = Math.min(gLat * 2 - 0.5, 14);
+  1320→    const banH = 2.5;
+  1321→    const banTex = makeBreakBannerTexture();
+  1322→    const banGeo = new THREE.PlaneGeometry(banW, banH);
+  1323→    const banMat = new THREE.MeshBasicMaterial({
+  1324→      map: banTex,
+  1325→      side: THREE.DoubleSide,
+  1326→      transparent: true,
+  1327→      fog: true,
+  1328→    });
+  1329→    const banner = new THREE.Mesh(banGeo, banMat);
+  1330→    banner.position.set(s.x, this.heightAt(idx, 0) + postH - banH / 2 - 0.4, s.z);
+  1331→    banner.rotation.y = faceBack;
+  1332→    this.group.add(banner);
+  1333→    this.disposables.push(banTex, banGeo, banMat);
+  1334→
+  1335→    // ---- the wall itself ----
+  1336→    let firstBox: TrackBox | null = null;
+  1337→    for (let lat = -span; lat <= span + 0.01; lat += segW) {
+  1338→      const l = Math.min(lat, span);
+  1339→      const x = s.x + s.rx * l;
+  1340→      const z = s.z + s.rz * l;
+  1341→      const y = this.heightAt(idx, l) + segH / 2 + 0.06;
+  1342→      const mesh = new THREE.Mesh(geo, mat);
+  1343→      mesh.position.set(x, y, z);
+  1344→      mesh.rotation.y = yaw;
+  1345→      mesh.castShadow = true;
+  1346→      this.group.add(mesh);
+  1347→      const box: TrackBox = {
+  1348→        x,
+  1349→        z,
+  1350→        y,
+  1351→        idx,
+  1352→        lat: l,
+  1353→        cluster,
+  1354→        halfH: segH / 2,
+  1355→        wall: true,
+  1356→        enabled: true,
+  1357→        active: true,
+  1358→        respawnAt: 0,
+  1359→        mesh,
+  1360→      };
+  1361→      this.boxes.push(box);
+  1362→      if (!firstBox) firstBox = box;
+  1363→    }
+  1364→
+  1365→    this.group.add(glow);
+  1366→    this.breakWalls.push({ idx, cluster, firstBox: firstBox!, glow });
+  1367→    this.wallPts.push({ x: s.x, z: s.z });
+  1368→
+  1369→    // ---- roadside warning signs (56 m + 28 m out, alternating sides) ----
+  1370→    const signTex = makeSignTexture();
+  1371→    const signGeo = new THREE.PlaneGeometry(2.9, 2.9);
+  1372→    const signMat = new THREE.MeshBasicMaterial({
+  1373→      map: signTex,
+  1374→      transparent: true,
+  1375→      side: THREE.DoubleSide,
+  1376→    });
+  1377→    const signPostGeo = new THREE.BoxGeometry(0.16, 3.0, 0.16);
+  1378→    this.disposables.push(signTex, signGeo, signMat, signPostGeo);
+  1379→    for (const [back, side] of [
+  1380→      [56, 1],
+  1381→      [28, -1],
+  1382→    ] as const) {
+  1383→      const si = wrapIdx(idx - back, this.N);
+  1384→      const ss = this.samples[si];
+  1385→      const slat = (ss.hw + 2.6) * side;
+  1386→      const sy = this.heightAt(si, slat) + 3.1;
+  1387→      const sign = new THREE.Mesh(signGeo, signMat);
+  1388→      sign.position.set(ss.x + ss.rx * slat, sy, ss.z + ss.rz * slat);
+  1389→      sign.rotation.y = Math.atan2(-ss.dx, -ss.dz); // face oncoming riders
+  1390→      const signPost = new THREE.Mesh(signPostGeo, postMat);
+  1391→      signPost.position.set(ss.x + ss.rx * slat, sy - 1.55, ss.z + ss.rz * slat);
+  1392→      signPost.castShadow = true;
+  1393→      this.group.add(sign);
+  1394→      this.group.add(signPost);
+  1395→      const beacon = new THREE.Mesh(beaconGeo, glowMat);
+  1396→      beacon.position.set(ss.x + ss.rx * slat, sy + 1.8, ss.z + ss.rz * slat);
+  1397→      glow.add(beacon);
+  1398→    }
+  1399→
+  1400→    // ---- chevron decals painted onto the approach road ----
+  1401→    const chevTex = makeChevronTexture();
+  1402→    const chevGeo = new THREE.PlaneGeometry(4.8, 3.4);
+  1403→    chevGeo.rotateX(-Math.PI / 2);
+  1404→    const chevMat = new THREE.MeshBasicMaterial({ map: chevTex, transparent: true, depthWrite: false });
+  1405→    this.disposables.push(chevTex, chevGeo, chevMat);
+  1406→    for (const back of [26, 17, 8]) {
+  1407→      const ci = wrapIdx(idx - back, this.N);
+  1408→      const cs = this.samples[ci];
+  1409→      const m = new THREE.Mesh(chevGeo, chevMat);
+  1410→      m.position.set(cs.x, this.heightAt(ci, 0) + 0.09, cs.z);
+  1411→      m.rotation.y = Math.atan2(-cs.dx, -cs.dz); // chevrons point toward the wall
+  1412→      m.renderOrder = 1;
+  1413→      this.group.add(m);
+  1414→    }
+  1415→  }
+  1416→
+  1417→  /**
+  1418→   * Breakable wooden crates arranged in STACKS — pyramids, pairs, blocks and
+  1419→   * firing lines on the racing line. Smash one crate and the whole stack
+  1420→   * chain-breaks into flying pieces. The full candidate set is generated once
+  1421→   * (max count); difficulty decides how many stacks go live.
+  1422→   */
+  1423→  private buildStacks() {
+  1424→    const n = this.N;
+  1425→    const MAX_STACKS = 14;
+  1426→    const rnd = mulberry32(9155);
+  1427→
+  1428→    // zones to keep clear: gates, ramps, the gap, the tunnel, the start grid, the break wall
+  1429→    const blocked = new Uint8Array(n);
+  1430→    for (const g of this.gates) {
+  1431→      for (let k = -8; k <= 8; k++) blocked[wrapIdx(g.idx + k, n)] = 1;
+  1432→    }
+  1433→    for (let i = 0; i < n; i++) {
+  1434→      if (this.samples[i].gap || this.samples[i].tunnel || this.samples[i].rampP >= 0) {
+  1435→        for (let k = -7; k <= 7; k++) blocked[wrapIdx(i + k, n)] = 1;
+  1436→      }
+  1437→    }
+  1438→    for (let k = -60; k <= 60; k++) blocked[wrapIdx(k, n)] = 1; // start/finish + grid
+  1439→    for (const wi of this.breakWallIdxs) {
+  1440→      for (let k = -16; k <= 16; k++) blocked[wrapIdx(wi + k, n)] = 1;
+  1441→    }
+  1442→
+  1443→    const crateTex = makeCrateTexture();
+  1444→    const crateGeo = new THREE.BoxGeometry(1.24, 1.24, 1.24);
+  1445→    const crateMat = new THREE.MeshLambertMaterial({ map: crateTex });
+  1446→    this.disposables.push(crateGeo, crateMat, crateTex);
+  1447→
+  1448→    // stack layout patterns: [lateral cell offset, stack level]
+  1449→    const PATTERNS: [number, number][][] = [
+  1450→      [
+  1451→        [-1.32, 0],
+  1452→        [0, 0],
+  1453→        [1.32, 0],
+  1454→        [-0.66, 1],
+  1455→        [0.66, 1],
+  1456→        [0, 2],
+  1457→      ], // pyramid
+  1458→      [
+  1459→        [-0.65, 0],
+  1460→        [0.65, 0],
+  1461→        [0, 1],
+  1462→      ], // pair + top
+  1463→      [
+  1464→        [-1.35, 0],
+  1465→        [0, 0],
+  1466→        [1.35, 0],
+  1467→      ], // firing line across the road
+  1468→      [
+  1469→        [-0.66, 0],
+  1470→        [0.66, 0],
+  1471→        [-0.66, 1],
+  1472→        [0.66, 1],
+  1473→      ], // 2×2 block
+  1474→    ];
+  1475→
+  1476→    const used: number[] = [];
+  1477→    let cluster = 0;
+  1478→    let placed = 0;
+  1479→    let guard = 0;
+  1480→    while (placed < MAX_STACKS && guard++ < 9000) {
+  1481→      const idx = 60 + Math.floor(rnd() * (n - 120));
+  1482→      if (blocked[idx]) continue;
+  1483→      // stack spacing — each stack reads as its own little event on approach
+  1484→      let tooClose = false;
+  1485→      for (const u of used) {
+  1486→        let d = Math.abs(idx - u);
+  1487→        d = Math.min(d, n - d);
+  1488→        if (d < 26) {
+  1489→          tooClose = true;
+  1490→          break;
+  1491→        }
+  1492→      }
+  1493→      if (tooClose) continue;
+  1494→      const s = this.samples[idx];
+  1495→      // bias stacks toward the middle of the road
+  1496→      const u = rnd() * 2 - 1;
+  1497→      const lat = Math.sign(u) * Math.pow(Math.abs(u), 1.35) * Math.max(1.2, s.hw - 4.5);
+  1498→      // keep clear of registered boulders / pillars
+  1499→      let clash = false;
+  1500→      for (const ob of this.obstacles) {
+  1501→        const dx = ob.x - (s.x + s.rx * lat);
+  1502→        const dz = ob.z - (s.z + s.rz * lat);
+  1503→        if (dx * dx + dz * dz < 34) {
+  1504→          clash = true;
+  1505→          break;
+  1506→        }
+  1507→      }
+  1508→      if (clash) continue;
+  1509→      const pattern = PATTERNS[Math.floor(rnd() * PATTERNS.length)];
+  1510→      const count = Math.min(pattern.length, 3 + Math.floor(rnd() * (pattern.length - 2)));
+  1511→      for (let c = 0; c < count; c++) {
+  1512→        const [cl, lvl] = pattern[c];
+  1513→        const blat = lat + cl;
+  1514→        const x = s.x + s.rx * blat;
+  1515→        const z = s.z + s.rz * blat;
+  1516→        const y = this.heightAt(idx, blat) + 0.62 + lvl * 1.24;
+  1517→        const mesh = new THREE.Mesh(crateGeo, crateMat);
+  1518→        mesh.position.set(x, y, z);
+  1519→        mesh.rotation.y = (rnd() - 0.5) * 0.55;
+  1520→        mesh.castShadow = true;
+  1521→        this.group.add(mesh);
+  1522→        this.boxes.push({
+  1523→          x,
+  1524→          z,
+  1525→          y,
+  1526→          idx,
+  1527→          lat: blat,
+  1528→          cluster,
+  1529→          halfH: 0.62,
+  1530→          wall: false,
+  1531→          enabled: false,
+  1532→          active: false,
+  1533→          respawnAt: 0,
+  1534→          mesh,
+  1535→        });
+  1536→      }
+  1537→      used.push(idx);
+  1538→      cluster++;
+  1539→      placed++;
+  1540→    }
+  1541→  }
+  1542→
+  1543→  dispose() {
+  1544→    for (const d of this.disposables) d.dispose();
+  1545→  }
+  1546→}
+  1547→
+  1548→const TMP_GROUND: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+  1549→const TMP_GA: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+  1550→const TMP_GB: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
+  1551→
+  1552→// ---------------- helpers & textures ----------------
+  1553→
+  1554→function mulberry32(seed: number) {
+  1555→  let a = seed >>> 0;
+  1556→  return () => {
+  1557→    a |= 0;
+  1558→    a = (a + 0x6d2b79f5) | 0;
+  1559→    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+  1560→    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  1561→    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  1562→  };
+  1563→}
+  1564→
+  1565→function makeSandNoiseTexture(): THREE.Texture {
+  1566→  const c = document.createElement("canvas");
+  1567→  c.width = c.height = 128;
+  1568→  const ctx = c.getContext("2d")!;
+  1569→  ctx.fillStyle = "#ffffff";
+  1570→  ctx.fillRect(0, 0, 128, 128);
+  1571→  const rnd = mulberry32(42);
+  1572→  for (let i = 0; i < 2600; i++) {
+  1573→    const v = 200 + Math.floor(rnd() * 55);
+  1574→    ctx.fillStyle = `rgba(${v},${v - 14},${v - 30},${0.16 + rnd() * 0.2})`;
+  1575→    const s = 1 + rnd() * 3;
+  1576→    ctx.fillRect(rnd() * 128, rnd() * 128, s, s);
+  1577→  }
+  1578→  const tex = new THREE.CanvasTexture(c);
+  1579→  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  1580→  return tex;
+  1581→}
+  1582→
+  1583→function makeStripeTexture(): THREE.Texture {
+  1584→  const c = document.createElement("canvas");
+  1585→  c.width = 64;
+  1586→  c.height = 128;
+  1587→  const ctx = c.getContext("2d")!;
+  1588→  ctx.fillStyle = "#f3e6cc";
+  1589→  ctx.fillRect(0, 0, 64, 128);
+  1590→  ctx.fillStyle = "#d64530";
+  1591→  for (let y = 0; y < 8; y++) {
+  1592→    if (y % 2 === 0) continue;
+  1593→    ctx.save();
+  1594→    ctx.translate(0, y * 16);
+  1595→    ctx.transform(1, 0, -0.35, 1, 0, 0);
+  1596→    ctx.fillRect(0, 0, 64, 16);
+  1597→    ctx.restore();
+  1598→  }
+  1599→  const tex = new THREE.CanvasTexture(c);
+  1600→  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  1601→  return tex;
+  1602→}
+  1603→
+  1604→function makeBannerTexture(): THREE.Texture {
+  1605→  const c = document.createElement("canvas");
+  1606→  c.width = 512;
+  1607→  c.height = 96;
+  1608→  const ctx = c.getContext("2d")!;
+  1609→  ctx.fillStyle = "#f0641e";
+  1610→  ctx.fillRect(0, 0, 512, 96);
+  1611→  ctx.fillStyle = "#2b1c12";
+  1612→  for (let x = 0; x < 512; x += 32) {
+  1613→    ctx.globalAlpha = 0.22;
+  1614→    ctx.fillRect(x, 0, 16, 96);
+  1615→  }
+  1616→  ctx.globalAlpha = 1;
+  1617→  ctx.font = "bold 52px system-ui, sans-serif";
+  1618→  ctx.textAlign = "center";
+  1619→  ctx.textBaseline = "middle";
+  1620→  ctx.fillStyle = "#fff6e6";
+  1621→  ctx.fillText("CANYON RUSH", 256, 50);
+  1622→  return new THREE.CanvasTexture(c);
+  1623→}
+  1624→
+  1625→function makeCheckerTexture(): THREE.Texture {
+  1626→  const c = document.createElement("canvas");
+  1627→  c.width = 256;
+  1628→  c.height = 48;
+  1629→  const ctx = c.getContext("2d")!;
+  1630→  ctx.clearRect(0, 0, 256, 48);
+  1631→  const sq = 12;
+  1632→  for (let y = 0; y < 48 / sq; y++) {
+  1633→    for (let x = 0; x < 256 / sq; x++) {
+  1634→      if ((x + y) % 2 === 0) {
+  1635→        ctx.fillStyle = "rgba(43,28,18,0.85)";
+  1636→        ctx.fillRect(x * sq, y * sq, sq, sq);
+  1637→      }
+  1638→    }
+  1639→  }
+  1640→  const tex = new THREE.CanvasTexture(c);
+  1641→  tex.wrapS = THREE.RepeatWrapping;
+  1642→  return tex;
+  1643→}
+  1644→
+  1645→function makeCrateTexture(): THREE.Texture {
+  1646→  const c = document.createElement("canvas");
+  1647→  c.width = c.height = 128;
+  1648→  const ctx = c.getContext("2d")!;
+  1649→  // base weathered wood
+  1650→  ctx.fillStyle = "#a9713d";
+  1651→  ctx.fillRect(0, 0, 128, 128);
+  1652→  // plank seams (horizontal boards)
+  1653→  ctx.fillStyle = "#7c4e26";
+  1654→  for (const y of [31, 63, 95]) ctx.fillRect(0, y, 128, 3);
+  1655→  // grain streaks
+  1656→  const rnd = mulberry32(313);
+  1657→  for (let i = 0; i < 90; i++) {
+  1658→    ctx.fillStyle = `rgba(${90 + rnd() * 60},${50 + rnd() * 35},${20 + rnd() * 20},${0.12 + rnd() * 0.18})`;
+  1659→    ctx.fillRect(rnd() * 128, rnd() * 128, 8 + rnd() * 34, 1 + rnd() * 2);
+  1660→  }
+  1661→  // frame border
+  1662→  ctx.strokeStyle = "#8a5a2e";
+  1663→  ctx.lineWidth = 7;
+  1664→  ctx.strokeRect(3.5, 3.5, 121, 121);
+  1665→  // diagonal cross plank
+  1666→  ctx.save();
+  1667→  ctx.strokeStyle = "#93602f";
+  1668→  ctx.lineWidth = 10;
+  1669→  ctx.beginPath();
+  1670→  ctx.moveTo(8, 8);
+  1671→  ctx.lineTo(120, 120);
+  1672→  ctx.moveTo(120, 8);
+  1673→  ctx.lineTo(8, 120);
+  1674→  ctx.stroke();
+  1675→  ctx.restore();
+  1676→  // corner nails
+  1677→  ctx.fillStyle = "#4c2f16";
+  1678→  for (const [x, y] of [
+  1679→    [14, 14],
+  1680→    [114, 14],
+  1681→    [14, 114],
+  1682→    [114, 114],
+  1683→  ]) {
+  1684→    ctx.beginPath();
+  1685→    ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+  1686→    ctx.fill();
+  1687→  }
+  1688→  const tex = new THREE.CanvasTexture(c);
+  1689→  tex.colorSpace = THREE.SRGBColorSpace;
+  1690→  return tex;
+  1691→}
+  1692→
+  1693→/** Plank barricade segment — pale weathered timber (reads man-made against the
+  1694→ *  red rock), cross braces, hazard stripes and a big amber-on-dark BREAK! stencil. */
+  1695→function makeWallTexture(): THREE.Texture {
+  1696→  const W = 256;
+  1697→  const H = 340;
+  1698→  const c = document.createElement("canvas");
+  1699→  c.width = W;
+  1700→  c.height = H;
+  1701→  const ctx = c.getContext("2d")!;
+  1702→  const rnd = mulberry32(777);
+  1703→
+  1704→  // vertical planks — pale timber so the wall pops from the canyon
+  1705→  const plankW = W / 4;
+  1706→  for (let p = 0; p < 4; p++) {
+  1707→    const shade = 0.9 + rnd() * 0.2;
+  1708→    const r = Math.floor(0xc9 * shade);
+  1709→    const g = Math.floor(0xa6 * shade);
+  1710→    const b = Math.floor(0x70 * shade);
+  1711→    ctx.fillStyle = `rgb(${r},${g},${b})`;
+  1712→    ctx.fillRect(p * plankW, 0, plankW, H);
+  1713→    // seam
+  1714→    ctx.fillStyle = "rgba(84,52,22,0.85)";
+  1715→    ctx.fillRect(p * plankW, 0, 3, H);
+  1716→    // grain
+  1717→    for (let i = 0; i < 14; i++) {
+  1718→      ctx.fillStyle = `rgba(${96 + rnd() * 46},${64 + rnd() * 24},${28 + rnd() * 12},${0.14 + rnd() * 0.16})`;
+  1719→      ctx.fillRect(p * plankW + 4 + rnd() * (plankW - 10), rnd() * H, 2, 18 + rnd() * 60);
+  1720→    }
+  1721→    // nails top & bottom
+  1722→    ctx.fillStyle = "#4c2f16";
+  1723→    for (const y of [14, H - 14]) {
+  1724→      ctx.beginPath();
+  1725→      ctx.arc(p * plankW + plankW / 2, y, 3.4, 0, Math.PI * 2);
+  1726→      ctx.fill();
+  1727→    }
+  1728→  }
+  1729→
+  1730→  // horizontal cross braces
+  1731→  for (const by of [64, H - 88]) {
+  1732→    ctx.fillStyle = "#a87c48";
+  1733→    ctx.fillRect(0, by, W, 26);
+  1734→    ctx.fillStyle = "rgba(255,232,196,0.16)";
+  1735→    ctx.fillRect(0, by, W, 5);
+  1736→    ctx.fillStyle = "rgba(50,28,10,0.4)";
+  1737→    ctx.fillRect(0, by + 22, W, 4);
+  1738→  }
+  1739→
+  1740→  // hazard stripes along the bottom
+  1741→  ctx.save();
+  1742→  ctx.beginPath();
+  1743→  ctx.rect(0, H - 46, W, 46);
+  1744→  ctx.clip();
+  1745→  ctx.fillStyle = "#ffb020";
+  1746→  ctx.fillRect(0, H - 46, W, 46);
+  1747→  ctx.fillStyle = "#2b1c12";
+  1748→  for (let x = -46; x < W + 46; x += 46) {
+  1749→    ctx.beginPath();
+  1750→    ctx.moveTo(x, H);
+  1751→    ctx.lineTo(x + 23, H);
+  1752→    ctx.lineTo(x + 23 + 46, H - 46);
+  1753→    ctx.lineTo(x + 46, H - 46);
+  1754→    ctx.closePath();
+  1755→    ctx.fill();
+  1756→  }
+  1757→  ctx.restore();
+  1758→
+  1759→  // big painted stencil: BREAK! — dark plate + amber letters (matches the
+  1760→  // gantry banner & beacons so the whole hazard kit reads as one system)
+  1761→  ctx.save();
+  1762→  ctx.translate(W / 2, H / 2 - 16);
+  1763→  ctx.rotate(-0.06);
+  1764→  ctx.textAlign = "center";
+  1765→  ctx.textBaseline = "middle";
+  1766→  let fontSize = 96;
+  1767→  do {
+  1768→    ctx.font = `900 ${fontSize}px system-ui, sans-serif`;
+  1769→    fontSize -= 3;
+  1770→  } while (ctx.measureText("BREAK!").width > W - 26 && fontSize > 40);
+  1771→  const tw = ctx.measureText("BREAK!").width;
+  1772→  ctx.fillStyle = "rgba(30,16,7,0.85)";
+  1773→  if (typeof ctx.roundRect === "function") {
+  1774→    ctx.beginPath();
+  1775→    ctx.roundRect(-tw / 2 - 12, -fontSize * 0.62, tw + 24, fontSize * 1.2, 8);
+  1776→    ctx.fill();
+  1777→  } else {
+  1778→    ctx.fillRect(-tw / 2 - 12, -fontSize * 0.62, tw + 24, fontSize * 1.2);
+  1779→  }
+  1780→  ctx.lineJoin = "round";
+  1781→  ctx.strokeStyle = "#2b1c12";
+  1782→  ctx.lineWidth = Math.max(7, fontSize * 0.13);
+  1783→  ctx.strokeText("BREAK!", 0, 0);
+  1784→  ctx.fillStyle = "#ffb020";
+  1785→  ctx.fillText("BREAK!", 0, 0);
+  1786→  ctx.restore();
+  1787→
+  1788→  // impact crack lines
+  1789→  ctx.strokeStyle = "rgba(40,22,8,0.55)";
+  1790→  ctx.lineWidth = 2;
+  1791→  for (let i = 0; i < 5; i++) {
+  1792→    const x0 = 30 + rnd() * (W - 60);
+  1793→    const y0 = 30 + rnd() * (H - 120);
+  1794→    ctx.beginPath();
+  1795→    ctx.moveTo(x0, y0);
+  1796→    ctx.lineTo(x0 + (rnd() - 0.5) * 44, y0 + 16 + rnd() * 40);
+  1797→    ctx.stroke();
+  1798→  }
+  1799→
+  1800→  const tex = new THREE.CanvasTexture(c);
+  1801→  tex.colorSpace = THREE.SRGBColorSpace;
+  1802→  return tex;
+  1803→}
+  1804→
+  1805→/** Giant overhead gantry banner for the BREAK wall — unlit black/amber plate
+  1806→ *  with "BREAK", hazard borders, down-arrows pointing at the wall and a SMASH tagline. */
+  1807→function makeBreakBannerTexture(): THREE.Texture {
+  1808→  const W = 1024;
+  1809→  const H = 256;
+  1810→  const c = document.createElement("canvas");
+  1811→  c.width = W;
+  1812→  c.height = H;
+  1813→  const ctx = c.getContext("2d")!;
+  1814→
+  1815→  // dark plate
+  1816→  ctx.fillStyle = "#1d1108";
+  1817→  ctx.fillRect(0, 0, W, H);
+  1818→  // amber frame
+  1819→  ctx.strokeStyle = "#ffb020";
+  1820→  ctx.lineWidth = 8;
+  1821→  ctx.strokeRect(4, 4, W - 8, H - 8);
+  1822→
+  1823→  // hazard stripe bands top & bottom
+  1824→  const stripe = 30;
+  1825→  for (const y0 of [10, H - stripe - 10]) {
+  1826→    ctx.save();
+  1827→    ctx.beginPath();
+  1828→    ctx.rect(10, y0, W - 20, stripe);
+  1829→    ctx.clip();
+  1830→    ctx.fillStyle = "#ffb020";
+  1831→    ctx.fillRect(10, y0, W - 20, stripe);
+  1832→    ctx.fillStyle = "#1d1108";
+  1833→    for (let x = 8 - stripe * 2; x < W; x += stripe * 2) {
+  1834→      ctx.beginPath();
+  1835→      ctx.moveTo(x, y0 + stripe);
+  1836→      ctx.lineTo(x + stripe, y0 + stripe);
+  1837→      ctx.lineTo(x + stripe * 2, y0);
+  1838→      ctx.lineTo(x + stripe, y0);
+  1839→      ctx.closePath();
+  1840→      ctx.fill();
+  1841→    }
+  1842→    ctx.restore();
+  1843→  }
+  1844→
+  1845→  // stacked down-arrows flanking the word, pointing at the wall below
+  1846→  ctx.fillStyle = "#ffb020";
+  1847→  for (const cx of [W * 0.145, W * 0.855]) {
+  1848→    for (const dy of [0, 54]) {
+  1849→      ctx.beginPath();
+  1850→      ctx.moveTo(cx - 42, 86 + dy);
+  1851→      ctx.lineTo(cx + 42, 86 + dy);
+  1852→      ctx.lineTo(cx, 86 + dy + 44);
+  1853→      ctx.closePath();
+  1854→      ctx.fill();
+  1855→    }
+  1856→  }
+  1857→
+  1858→  // THE word
+  1859→  ctx.textAlign = "center";
+  1860→  ctx.textBaseline = "middle";
+  1861→  let f = 148;
+  1862→  do {
+  1863→    ctx.font = `900 ${f}px system-ui, sans-serif`;
+  1864→    f -= 4;
+  1865→  } while (ctx.measureText("BREAK").width > W * 0.55 && f > 60);
+  1866→  ctx.lineJoin = "round";
+  1867→  ctx.strokeStyle = "#1d1108";
+  1868→  ctx.lineWidth = 18;
+  1869→  ctx.strokeText("BREAK", W / 2, H / 2 - 10);
+  1870→  ctx.fillStyle = "#fff6e6";
+  1871→  ctx.fillText("BREAK", W / 2, H / 2 - 10);
+  1872→
+  1873→  // tagline
+  1874→  let f2 = 32;
+  1875→  ctx.font = `900 ${f2}px system-ui, sans-serif`;
+  1876→  while (ctx.measureText("SMASH THROUGH — FULL SEND").width > W * 0.46 && f2 > 16) {
+  1877→    f2 -= 2;
+  1878→    ctx.font = `900 ${f2}px system-ui, sans-serif`;
+  1879→  }
+  1880→  ctx.fillStyle = "#ffb020";
+  1881→  ctx.fillText("SMASH THROUGH — FULL SEND", W / 2, H - 58);
+  1882→
+  1883→  const tex = new THREE.CanvasTexture(c);
+  1884→  tex.colorSpace = THREE.SRGBColorSpace;
+  1885→  tex.anisotropy = 4;
+  1886→  return tex;
+  1887→}
+  1888→
+  1889→/** Road-paint chevron decal — twin amber arrows pointing toward the wall. */
+  1890→function makeChevronTexture(): THREE.Texture {
+  1891→  const S = 256;
+  1892→  const c = document.createElement("canvas");
+  1893→  c.width = c.height = S;
+  1894→  const ctx = c.getContext("2d")!;
+  1895→
+  1896→  ctx.lineJoin = "round";
+  1897→  for (const y0 of [158, 84]) {
+  1898→    ctx.beginPath();
+  1899→    ctx.moveTo(40, y0);
+  1900→    ctx.lineTo(S / 2, y0 - 52);
+  1901→    ctx.lineTo(S - 40, y0);
+  1902→    ctx.lineTo(S - 40, y0 + 26);
+  1903→    ctx.lineTo(S / 2, y0 - 26);
+  1904→    ctx.lineTo(40, y0 + 26);
+  1905→    ctx.closePath();
+  1906→    ctx.fillStyle = "#ffb020";
+  1907→    ctx.strokeStyle = "rgba(43,28,18,0.9)";
+  1908→    ctx.lineWidth = 10;
+  1909→    ctx.fill();
+  1910→    ctx.stroke();
+  1911→  }
+  1912→
+  1913→  const tex = new THREE.CanvasTexture(c);
+  1914→  tex.colorSpace = THREE.SRGBColorSpace;
+  1915→  return tex;
+  1916→}
+  1917→
+  1918→/** Diamond warning sign — "BREAK" with a smash burst, so riders know the wall is smashable. */
+  1919→function makeSignTexture(): THREE.Texture {
+  1920→  const S = 256;
+  1921→  const c = document.createElement("canvas");
+  1922→  c.width = c.height = S;
+  1923→  const ctx = c.getContext("2d")!;
+  1924→
+  1925→  // diamond plate
+  1926→  ctx.save();
+  1927→  ctx.translate(S / 2, S / 2);
+  1928→  ctx.rotate(Math.PI / 4);
+  1929→  ctx.fillStyle = "#ffb020";
+  1930→  ctx.strokeStyle = "#2b1c12";
+  1931→  ctx.lineWidth = 10;
+  1932→  const d = S * 0.36;
+  1933→  ctx.fillRect(-d, -d, d * 2, d * 2);
+  1934→  ctx.strokeRect(-d, -d, d * 2, d * 2);
+  1935→  ctx.restore();
+  1936→
+  1937→  // text (auto-fit inside the diamond)
+  1938→  ctx.fillStyle = "#2b1c12";
+  1939→  ctx.textAlign = "center";
+  1940→  ctx.textBaseline = "middle";
+  1941→  let f1 = 66;
+  1942→  do {
+  1943→    ctx.font = `900 ${f1}px system-ui, sans-serif`;
+  1944→    f1 -= 2;
+  1945→  } while (ctx.measureText("BREAK").width > S * 0.64 && f1 > 24);
+  1946→  ctx.fillText("BREAK", S / 2, S / 2 - 32);
+  1947→  let f2 = 42;
+  1948→  do {
+  1949→    ctx.font = `900 ${f2}px system-ui, sans-serif`;
+  1950→    f2 -= 2;
+  1951→  } while (ctx.measureText("AHEAD").width > S * 0.54 && f2 > 16);
+  1952→  ctx.fillText("AHEAD", S / 2, S / 2 + 16);
+  1953→
+  1954→  // little impact burst
+  1955→  ctx.strokeStyle = "#2b1c12";
+  1956→  ctx.lineWidth = 5;
+  1957→  ctx.beginPath();
+  1958→  for (let i = 0; i < 8; i++) {
+  1959→    const a = (i / 8) * Math.PI * 2;
+  1960→    const r0 = 46;
+  1961→    const r1 = 64;
+  1962→    ctx.moveTo(S / 2 + Math.cos(a) * r0, S / 2 + 62 + Math.sin(a) * r0 * 0.5);
+  1963→    ctx.lineTo(S / 2 + Math.cos(a) * r1, S / 2 + 62 + Math.sin(a) * r1 * 0.5);
+  1964→  }
+  1965→  ctx.stroke();
+  1966→
+  1967→  const tex = new THREE.CanvasTexture(c);
+  1968→  tex.colorSpace = THREE.SRGBColorSpace;
+  1969→  return tex;
+  1970→}
+  1971→
+  1972→function buildCactusGeometry(): THREE.BufferGeometry {
+  1973→  const geos: THREE.BufferGeometry[] = [];
+  1974→  const trunk = new THREE.CapsuleGeometry(0.5, 2.6, 4, 8);
+  1975→  trunk.translate(0, 1.9, 0);
+  1976→  geos.push(trunk);
+  1977→  const armL = new THREE.CapsuleGeometry(0.34, 1.2, 4, 6);
+  1978→  armL.rotateZ(0.5);
+  1979→  armL.translate(-0.85, 2.4, 0);
+  1980→  geos.push(armL);
+  1981→  const armR = new THREE.CapsuleGeometry(0.34, 1.0, 4, 6);
+  1982→  armR.rotateZ(-0.6);
+  1983→  armR.translate(0.85, 2.9, 0);
+  1984→  geos.push(armR);
+  1985→  const pos: number[] = [];
+  1986→  const norm: number[] = [];
+  1987→  for (const g0 of geos) {
+  1988→    const g = g0.index ? g0.toNonIndexed() : g0;
+  1989→    const p = g.attributes.position as THREE.BufferAttribute;
+  1990→    const nn = g.attributes.normal as THREE.BufferAttribute;
+  1991→    for (let i = 0; i < p.count; i++) {
+  1992→      pos.push(p.getX(i), p.getY(i), p.getZ(i));
+  1993→      norm.push(nn.getX(i), nn.getY(i), nn.getZ(i));
+  1994→    }
+  1995→  }
+  1996→  const out = new THREE.BufferGeometry();
+  1997→  out.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  1998→  out.setAttribute("normal", new THREE.Float32BufferAttribute(norm, 3));
+  1999→  return out;
+  2000→}
+
+[showing lines 1-2000 of 2001; use offset=2001 with limit to continue reading]
