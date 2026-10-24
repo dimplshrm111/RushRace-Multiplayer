@@ -37,11 +37,16 @@ const STATE_MIN_INTERVAL_MS = 40; // accept max 25 state updates / second
 const RELAY_INTERVAL_MS = 100; // 10 Hz aggregated broadcast
 const RESULTS_COMPILE_DELAY_MS = 10000; // wait for reconnectors after last finish
 const RESULTS_TO_LOBBY_MS = 15000; // auto return-to-lobby after results
-const RACE_TIMEOUT_PER_LAP_MS = 4 * 60 * 1000;
+/** hard race timeout per lap (env-tunable for testing) */
+const RACE_TIMEOUT_PER_LAP_MS =
+  Number.parseInt(process.env.RACING_TIMEOUT_PER_LAP_MS ?? "", 10) ||
+  4 * 60 * 1000;
 const ROOM_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const NAME_MAX = 14;
 
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const MAX_ROOMS = 100; // global room cap (memory safety)
+const CREATE_COOLDOWN_MS = 5000; // per-socket room-creation cooldown
 const PLAYER_COLORS = [
   "#f0641e",
   "#2f9e63",
@@ -85,6 +90,8 @@ interface Player {
   socketId: string | null;
   grid: number;
   racing: boolean;
+  /** forfeited this race (quit mid-race) — counted as done/DNF */
+  forfeit: boolean;
   lap: number;
   finishPos: number | null;
   finishMs: number | null;
@@ -121,6 +128,11 @@ interface Room {
   lobbyTimer: ReturnType<typeof setTimeout> | null;
   relayOn: boolean;
   createdAt: number;
+  /** last compiled results — re-emitted to late reconnectors during the results phase */
+  lastResults: MPResult[] | null;
+  /** results of players who FINISHED but left before compilation — they
+   *  earned their position, so the final table must keep them */
+  finishedLeft: MPResult[];
 }
 
 // ---------------------------------------------------------------------------
@@ -166,13 +178,26 @@ function genCode(): string {
   return code;
 }
 
+interface MPResult {
+  pid: string;
+  name: string;
+  color: string;
+  pos: number | null;
+  totalMs: number | null;
+  bestLapMs: number | null;
+  topSpeedKmh: number | null;
+  driftScore: number | null;
+  finished: boolean;
+}
+
 function genRoomCode(): string {
-  for (let tries = 0; tries < 50; tries++) {
+  // 32^4 ≈ 1M possible codes vs ≤ MAX_ROOMS live rooms — collisions are
+  // near-impossible; still, never fall back to an invalid-length code.
+  for (let tries = 0; tries < 500; tries++) {
     const code = genCode();
     if (!rooms.has(code)) return code;
   }
-  // astronomically unlikely fallback
-  return genCode() + Date.now().toString(36).slice(-2).toUpperCase();
+  throw new Error("room code space exhausted");
 }
 
 function num(v: unknown, fallback = 0): number {
@@ -262,13 +287,27 @@ function clearTimer(t: ReturnType<typeof setTimeout> | null): ReturnType<typeof 
   return null;
 }
 
-function stopRelayIfIdle(r: Room) {
-  if (r.phase === "lobby") r.relayOn = false;
+function playerResult(p: Player): MPResult {
+  return {
+    pid: p.id,
+    name: p.name,
+    color: p.color,
+    pos: p.finishPos,
+    totalMs: p.finishMs,
+    bestLapMs: p.bestLapMs,
+    topSpeedKmh: p.topSpeedKmh,
+    driftScore: p.driftScore,
+    finished: p.finishPos != null,
+  };
 }
 
 /** Remove a player entirely (grace expired or explicit leave). */
 function removePlayer(r: Room, p: Player, reason: "left" | "timeout") {
   if (!r.players.has(p.id)) return;
+  // a finisher leaving before results compile keeps their earned position
+  if (p.finishPos != null && (r.phase === "racing" || r.phase === "results")) {
+    r.finishedLeft.push(playerResult(p));
+  }
   if (p.removeTimer) clearTimeout(p.removeTimer);
   r.players.delete(p.id);
   r.order = r.order.filter((pid) => pid !== p.id);
@@ -280,17 +319,23 @@ function removePlayer(r: Room, p: Player, reason: "left" | "timeout") {
     deleteRoom(r);
     return;
   }
-  // host transfer
+  // host transfer — prefer a connected player; if everyone left is within
+  // their reconnect grace, still hand the crown to the earliest remaining
+  // player so the room can never end up hostless
   if (r.hostId === p.id) {
-    const next = r.order
+    const remaining = r.order
       .map((pid) => r.players.get(pid)!)
-      .find((pl) => pl.connected);
+      .filter(Boolean);
+    const next = remaining.find((pl) => pl.connected) ?? remaining[0];
     if (next) {
       r.hostId = next.id;
       systemChat(r, `${next.name} is now the host`);
     }
   }
   broadcastRoom(r);
+  // a racer leaving mid-race is "done" — re-check whether the field is
+  // complete now (no-ops outside the racing phase)
+  maybeScheduleCompile(r);
 }
 
 function deleteRoom(r: Room) {
@@ -321,10 +366,13 @@ function beginCountdown(r: Room) {
   r.phase = "countdown";
   r.startAt = Date.now() + COUNTDOWN_MS;
   r.finishCounter = 0;
+  r.lastResults = null;
+  r.finishedLeft = [];
   for (const p of r.players.values()) {
     // everyone present at start time races (even currently-disconnected
     // players keep their slot so they can rejoin in progress)
     p.racing = true;
+    p.forfeit = false;
     p.lap = 0;
     p.finishPos = null;
     p.finishMs = null;
@@ -349,6 +397,9 @@ function beginCountdown(r: Room) {
     r.raceStartedAt = r.startAt;
     io.to(r.code).emit("mp:go", { startAt: r.startAt });
     broadcastRoom(r);
+    // re-check completion: players may already have forfeited during the
+    // countdown (maybeScheduleCompile no-ops while phase !== "racing")
+    maybeScheduleCompile(r);
     // hard race timeout — force results so a room can never hang
     r.raceTimer = clearTimer(r.raceTimer);
     r.raceTimer = setTimeout(
@@ -370,24 +421,20 @@ function compileResults(r: Room, fromTimeout = false) {
   r.raceTimer = clearTimer(r.raceTimer);
   const racers = r.order
     .map((pid) => r.players.get(pid)!)
-    .filter((p) => p && p.racing);
+    .filter((p) => p && (p.racing || p.forfeit));
   const finished = racers
     .filter((p) => p.finishPos != null)
     .sort((a, b) => (a.finishPos ?? 0) - (b.finishPos ?? 0));
   const dnf = racers
     .filter((p) => p.finishPos == null)
     .sort((a, b) => b.lastProgress - a.lastProgress);
-  const results = [...finished, ...dnf].map((p) => ({
-    pid: p.id,
-    name: p.name,
-    color: p.color,
-    pos: p.finishPos,
-    totalMs: p.finishMs,
-    bestLapMs: p.bestLapMs,
-    topSpeedKmh: p.topSpeedKmh,
-    driftScore: p.driftScore,
-    finished: p.finishPos != null,
-  }));
+  const results: MPResult[] = [
+    ...[...finished.map(playerResult), ...r.finishedLeft].sort(
+      (a, b) => (a.pos ?? Infinity) - (b.pos ?? Infinity)
+    ),
+    ...dnf.map(playerResult),
+  ];
+  r.lastResults = results;
   r.phase = "results";
   io.to(r.code).emit("mp:results", { results });
   broadcastRoom(r);
@@ -403,9 +450,12 @@ function returnToLobby(r: Room) {
   if (r.phase !== "results") return;
   r.lobbyTimer = clearTimer(r.lobbyTimer);
   r.phase = "lobby";
+  r.lastResults = null;
+  r.finishedLeft = [];
   for (const p of r.players.values()) {
     p.ready = false;
     p.racing = false;
+    p.forfeit = false;
     p.lap = 0;
     p.finishPos = null;
     p.finishMs = null;
@@ -415,10 +465,11 @@ function returnToLobby(r: Room) {
   broadcastRoom(r);
 }
 
-/** Schedule result compilation once every connected racer has finished. */
+/** Schedule result compilation once every connected racer is done
+ *  (finished, forfeited or gone). */
 function maybeScheduleCompile(r: Room) {
   if (r.phase !== "racing") return;
-  const racers = [...r.players.values()].filter((p) => p.racing);
+  const racers = [...r.players.values()].filter((p) => p.racing || p.forfeit);
   const connectedRacers = racers.filter((p) => p.connected);
   if (connectedRacers.length === 0) {
     // everyone dropped — compile after the reconnect grace window
@@ -427,7 +478,7 @@ function maybeScheduleCompile(r: Room) {
     }
     return;
   }
-  const allDone = connectedRacers.every((p) => p.finishPos != null);
+  const allDone = connectedRacers.every((p) => p.finishPos != null || p.forfeit);
   if (allDone) {
     r.compileTimer = clearTimer(r.compileTimer);
     r.compileTimer = setTimeout(() => compileResults(r), RESULTS_COMPILE_DELAY_MS);
@@ -450,6 +501,7 @@ const io = new Server(httpServer, {
 interface SocketData {
   roomCode?: string;
   pid?: string;
+  lastCreateAt?: number;
 }
 
 function ctxOf(socket: Socket): { r: Room; p: Player } | null {
@@ -468,7 +520,8 @@ function detachSocket(socket: Socket, reason: "left" | "timeout") {
   const ctx = ctxOf(socket);
   if (!ctx) return;
   const { r, p } = ctx;
-  (socket.data as SocketData) = {};
+  const lastCreateAt = (socket.data as SocketData).lastCreateAt;
+  (socket.data as SocketData) = lastCreateAt ? { lastCreateAt } : {};
   socket.leave(r.code);
   removePlayer(r, p, reason);
 }
@@ -488,6 +541,17 @@ io.on("connection", (socket) => {
       const name = validName(body.name);
       if (!name) {
         ack?.({ ok: false, error: "Enter a name (1-14 characters)" });
+        return;
+      }
+      // abuse guards: global room cap + per-socket creation cooldown
+      if (rooms.size >= MAX_ROOMS) {
+        ack?.({ ok: false, error: "Server is full of rooms — try again in a moment" });
+        return;
+      }
+      const now = Date.now();
+      const data = socket.data as SocketData;
+      if (data.lastCreateAt && now - data.lastCreateAt < CREATE_COOLDOWN_MS) {
+        ack?.({ ok: false, error: "Slow down — wait a moment before creating another room" });
         return;
       }
       detachSocket(socket, "left");
@@ -510,6 +574,8 @@ io.on("connection", (socket) => {
         lobbyTimer: null,
         relayOn: false,
         createdAt: Date.now(),
+        lastResults: null,
+        finishedLeft: [],
       };
       const pid = "p" + room.nextPid++;
       const player: Player = {
@@ -522,6 +588,7 @@ io.on("connection", (socket) => {
         socketId: socket.id,
         grid: 0,
         racing: false,
+        forfeit: false,
         lap: 0,
         finishPos: null,
         finishMs: null,
@@ -541,7 +608,7 @@ io.on("connection", (socket) => {
       room.order.push(pid);
       room.hostId = pid;
       rooms.set(code, room);
-      (socket.data as SocketData) = { roomCode: code, pid };
+      (socket.data as SocketData) = { roomCode: code, pid, lastCreateAt: now };
       socket.join(code);
       console.log(`[room ${code}] created by ${name}`);
       ack?.({ ok: true, code, token: player.token, pid });
@@ -587,9 +654,20 @@ io.on("connection", (socket) => {
             }
             (socket.data as SocketData) = { roomCode: code, pid: p.id };
             socket.join(code);
+            // self-heal: if the host is gone (mass disconnect edge case),
+            // the returning player takes the crown
+            if (!room.players.has(room.hostId)) {
+              room.hostId = p.id;
+              console.log(`[room ${code}] host missing — ${p.name} promoted on rejoin`);
+            }
             console.log(`[room ${code}] ${p.name} reconnected`);
             ack?.({ ok: true, code, token: p.token, pid: p.id });
             socket.emit("mp:room", { room: roomState(room) });
+            // a reconnector during the results phase missed the broadcast —
+            // replay the stored table so they see how the race ended
+            if (room.phase === "results" && room.lastResults) {
+              socket.emit("mp:results", { results: room.lastResults });
+            }
             systemChat(room, `${p.name} reconnected`);
             broadcastRoom(room);
             return;
@@ -620,6 +698,7 @@ io.on("connection", (socket) => {
         socketId: socket.id,
         grid: room.players.size,
         racing: false,
+        forfeit: false,
         lap: 0,
         finishPos: null,
         finishMs: null,
@@ -947,6 +1026,36 @@ io.on("connection", (socket) => {
     }
   });
 
+  // ----- forfeit (player quits a live race — counted as DNF, room keeps flowing) ----
+  socket.on("mp:forfeit", (_payload: unknown, ack?: (res: unknown) => void) => {
+    try {
+      const ctx = ctxOf(socket);
+      if (!ctx) {
+        ack?.({ ok: false, error: "Not in a room" });
+        return;
+      }
+      const { r, p } = ctx;
+      if (r.phase !== "racing" && r.phase !== "countdown") {
+        ack?.({ ok: false, error: "No race to forfeit" });
+        return;
+      }
+      if (!p.racing || p.forfeit) {
+        ack?.({ ok: true });
+        return;
+      }
+      p.racing = false;
+      p.forfeit = true; // counted as DNF in results; done for compile purposes
+      console.log(`[room ${r.code}] ${p.name} forfeited`);
+      ack?.({ ok: true });
+      systemChat(r, `${p.name} forfeited this race`);
+      broadcastRoom(r);
+      maybeScheduleCompile(r);
+    } catch (err) {
+      console.error("mp:forfeit error", err);
+      ack?.({ ok: false, error: "Server error" });
+    }
+  });
+
   // ----- disconnect / graceful removal ----------------------------------------
   socket.on("disconnect", () => {
     try {
@@ -1031,11 +1140,15 @@ httpServer.listen(PORT, () => {
   console.log(`  max players/room: ${MAX_PLAYERS} · reconnect grace: ${RECONNECT_GRACE_MS}ms`);
 });
 
-process.on("SIGTERM", () => {
-  console.log("SIGTERM — shutting down");
+function shutdown() {
+  console.log("shutting down");
+  // close all sockets immediately so httpServer.close() can't hang on
+  // live connections, then exit hard as a safety net
+  io.close();
+  const force = setTimeout(() => process.exit(0), 1500);
+  force.unref();
   httpServer.close(() => process.exit(0));
-});
-process.on("SIGINT", () => {
-  console.log("SIGINT — shutting down");
-  httpServer.close(() => process.exit(0));
-});
+}
+
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);

@@ -641,6 +641,34 @@ export class GameEngine {
   /** Self-test helpers: deterministic stepping decoupled from rAF. */
   debugSelftestActive = false;
 
+  /** Server compiled the results while we were still driving (timeout /
+   *  everyone else finished / we were too slow) — end the local race as a
+   *  DNF and show the final table instead of driving on in a dead race. */
+  mpAbortRace() {
+    if (this.phase !== "racing" && this.phase !== "countdown") return;
+    this.pushStandings(true);
+    const position = this.playerPos;
+    this.nextGateK = this.track.gates.length;
+    this.nextGateAbs = Infinity;
+    this.setPhase("finished");
+    this.finishOrbitT = 0;
+    this.ghostCar.group.visible = false;
+    this.cbs.onFinish({
+      totalMs: this.raceTime,
+      bestLapMs: this.lapTimes.length ? Math.min(...this.lapTimes) : this.raceTime,
+      topSpeedKmh: Math.round(this.physics.topSpeed),
+      driftScore: Math.round(this.physics.driftScore),
+      nearMisses: this.physics.nearMisses,
+      bigAirCount: this.bigAirCount,
+      laps: this.totalLaps,
+      isNewRecord: false,
+      splits: [...this.splits],
+      position,
+      totalCars: this.mpActive ? 1 + this.remotes.length : 1 + this.opponents.length,
+      dnf: true,
+    });
+  }
+
   debugSkipCountdown() {
     this.countdownT = 0;
     this.countdownShown = 0;

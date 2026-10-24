@@ -67,9 +67,11 @@ export class NetClient {
       if (this.code && this.token) {
         void this.rawJoin(this.code, undefined, this.token).then((ok) => {
           if (!ok && !this.disposed) {
-            // room is gone (deleted while we were away)
+            // room is gone (deleted while we were away) — back to the
+            // multiplayer home screen, not the solo title
             mpStore.getState().showToast("error", "Room no longer exists");
             this.cleanupLocal();
+            mpStore.getState().setScreen("home");
           }
         });
       }
@@ -142,15 +144,30 @@ export class NetClient {
     });
     sock.on("mp:results", (p: { results: MPResultEntry[] }) => {
       mpStore.getState().setFinalResults(p.results);
+      // the server ended the race while we were still driving (timeout or
+      // the rest of the field finished) — stop the local car and show the
+      // final table instead of driving on in a dead race
+      const eng = this.engine;
+      if (eng && (eng.phase === "racing" || eng.phase === "countdown")) {
+        eng.mpAbortRace();
+      }
     });
     sock.on("mp:phase", (p: { phase: string }) => {
       if (p.phase === "lobby") {
         this.racedThisRound = false;
         const st = mpStore.getState();
         st.setFinalResults(null);
-        // if the local race view is still up, drop back to the lobby
+        // if any local race view is still up (finished screen, or a car
+        // still driving a race the server already closed), drop to the lobby
         const eng = this.engine;
-        if (eng && (eng.phase === "finished")) eng.toTitle();
+        if (
+          eng &&
+          (eng.phase === "finished" ||
+            eng.phase === "racing" ||
+            eng.phase === "countdown")
+        ) {
+          eng.toTitle();
+        }
       }
     });
 
@@ -251,10 +268,9 @@ export class NetClient {
     this.racedThisRound = false;
     this.engine?.setMultiplayerSession(false);
     mpStore.getState().reset();
-    if (this.stateTimer) {
-      clearInterval(this.stateTimer);
-      this.stateTimer = null;
-    }
+    // NOTE: the state-pump interval is intentionally left running — killing
+    // it here would silently break car sync in the NEXT room the player
+    // joins (nothing re-arms it). sendState() already no-ops outside a room.
   }
 
   private persist(name: string, code: string, token: string) {
@@ -332,6 +348,14 @@ export class NetClient {
   async rematch(): Promise<void> {
     const res = await this.call<{ ok: boolean; error?: string }>("mp:rematch", {});
     if (!res.ok) mpStore.getState().showToast("error", res.error ?? "Could not rematch");
+  }
+
+  /** Quit the current multiplayer race without leaving the room — the
+   *  server marks us DNF so the field isn't held up waiting for us. */
+  forfeit(): void {
+    if (this.socket?.connected) {
+      this.socket.emit("mp:forfeit", {}, () => undefined);
+    }
   }
 
   sendLap(lap: number, lapMs: number) {

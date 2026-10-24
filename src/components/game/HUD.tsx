@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import type { GameEngine } from "@/game/engine";
 import { useGameStore } from "@/game/store";
+import { useMPStore } from "@/game/net-store";
 import { DIFFICULTIES, formatDelta, formatTime, type Telemetry } from "@/game/types";
 
 interface MinimapData {
@@ -45,6 +46,9 @@ export function HUD({
   const prunePopups = useGameStore((s) => s.prunePopups);
   const bestTotalMs = useGameStore((s) => s.bestTotalMs);
   const difficulty = useGameStore((s) => s.settings.difficulty);
+  // online races force equal (medium) handling — the chip must not claim a
+  // solo difficulty there
+  const inMPRoom = useMPStore((s) => s.screen === "room" && s.room != null);
 
   const goFlashRef = useRef<HTMLDivElement>(null);
 
@@ -214,7 +218,7 @@ export function HUD({
           <div className="flex items-center rounded-md bg-[rgba(43,28,18,0.72)] px-2.5 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px]">
             <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">MODE</span>
             <span className="ml-1.5 font-[family-name:var(--font-bungee)] text-sm leading-none">
-              {DIFFICULTIES[difficulty].short}
+              {inMPRoom ? "ONLINE" : DIFFICULTIES[difficulty].short}
             </span>
           </div>
         </div>
@@ -235,8 +239,8 @@ export function HUD({
       <div className="absolute left-3 top-3 flex flex-col gap-1">
         <div className="relative rounded-lg bg-[rgba(255,246,230,0.82)] p-1 shadow-lg backdrop-blur-[2px]">
           <canvas ref={minimapRef} width={148} height={118} className="block h-[86px] w-[108px] sm:h-[118px] sm:w-[148px]" aria-label="Track minimap" />
-          {/* rival blips */}
-          {[0, 1, 2].map((i) => (
+          {/* rival blips — up to 9 network/AI rivals (10-car rooms) */}
+          {Array.from({ length: 9 }, (_, i) => (
             <div
               key={i}
               ref={(el) => {

@@ -217,13 +217,13 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
                     <input
                       ref={renameInputRef}
                       value={renameDraft}
-                      onChange={(e) => setRenameDraft(e.target.value.slice(0, 16))}
+                      onChange={(e) => setRenameDraft(e.target.value.slice(0, 14))}
                       onKeyDown={(e) => {
                         e.stopPropagation();
                         if (e.key === "Enter") void commitRename();
                         if (e.key === "Escape") setRenaming(false);
                       }}
-                      maxLength={16}
+                      maxLength={14}
                       className="w-32 rounded border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.96)] px-2 py-1 text-xs font-bold text-[#2b1c12] outline-none focus:border-[#ffb020]"
                       aria-label="New name"
                     />

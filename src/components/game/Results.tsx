@@ -98,8 +98,13 @@ export function Results({
               ★ NEW RECORD ★
             </div>
           )}
+          {data.dnf && (
+            <div className="mx-auto mb-2 inline-block -rotate-1 rounded bg-[#d64530] px-3 py-1 text-xs font-black tracking-[0.25em] text-[#fff6e6] shadow-lg">
+              DID NOT FINISH
+            </div>
+          )}
           <h2 className="font-[family-name:var(--font-bungee)] text-5xl leading-none text-[#f0641e] [text-shadow:0_3px_0_#2b1c12]">
-            {data.position === 1 ? "VICTORY!" : "FINISH!"}
+            {data.dnf ? "RACE OVER" : data.position === 1 ? "VICTORY!" : "FINISH!"}
           </h2>
           <div className="mt-1 flex items-center justify-center gap-2 text-[10px] font-black tracking-[0.3em] text-[#8a6a4e]">
             <span
@@ -146,7 +151,7 @@ export function Results({
           <Stat label="DRIFT SCORE" value={String(data.driftScore)} />
           <Stat label="NEAR MISSES" value={String(data.nearMisses)} />
           <Stat label="BIG AIRS" value={String(data.bigAirCount)} />
-          <Stat label="BEST SET" value={settings.laps === data.laps ? "THIS CLASS" : `${settings.laps}L`} />
+          <Stat label="BEST SET" value={isMP ? "ONLINE" : settings.laps === data.laps ? "THIS CLASS" : `${settings.laps}L`} />
         </div>
 
         <div className="mt-3 rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.82)] p-3 text-[#fff6e6]">

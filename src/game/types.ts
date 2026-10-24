@@ -222,6 +222,8 @@ export interface ResultsData {
   splits: number[];
   position: number; // 1-based final position
   totalCars: number;
+  /** race ended without a finish (server compiled results / timeout) — not leaderboard-eligible */
+  dnf?: boolean;
 }
 
 export interface RaceRecord {

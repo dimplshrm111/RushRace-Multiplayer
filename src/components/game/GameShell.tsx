@@ -104,10 +104,18 @@ export default function GameShell() {
     window.addEventListener("pointerdown", unlock, { once: true });
     window.addEventListener("keydown", unlock, { once: true });
 
-    // auto-pause on blur while racing
+    // auto-pause on blur while racing — never in a shared multiplayer race:
+    // the race keeps running server-side, so pausing would just freeze our
+    // car while everyone else drives on
     const onBlur = () => {
       const st = useGameStore.getState();
-      if ((st.phase === "racing" || st.phase === "countdown") && !st.paused) st.setPaused(true);
+      if (
+        (st.phase === "racing" || st.phase === "countdown") &&
+        !st.paused &&
+        !net.inRoom
+      ) {
+        st.setPaused(true);
+      }
     };
     window.addEventListener("blur", onBlur);
 
@@ -131,6 +139,7 @@ export default function GameShell() {
           onCountdown: (v) => setCountdown(v),
           onFinish: (r: ResultsData) => {
             setResults(r);
+            if (r.dnf) return; // DNF (server-ended race) — nothing to report
             // multiplayer: report the validated finish to the room server
             net.sendFinish(r);
             // persist to the local leaderboard backend (use the MP name when racing online)
@@ -369,6 +378,9 @@ export default function GameShell() {
               }}
               onQuit={() => {
                 setPaused(false);
+                // in a shared race, tell the server we're out so the field
+                // isn't held waiting (DNF) — then return to the lobby view
+                if (inMPRoom) net.forfeit();
                 engineRef.current?.toTitle();
               }}
               canRestart={!inMPRoom}

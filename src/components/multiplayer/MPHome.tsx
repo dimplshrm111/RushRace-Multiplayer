@@ -112,14 +112,14 @@ export function MPHome() {
           <span className="mb-1 block text-[10px] font-black tracking-[0.3em] text-[#ffb020]">YOUR NAME</span>
           <input
             value={name}
-            onChange={(e) => setName(e.target.value.slice(0, 16))}
+            onChange={(e) => setName(e.target.value.slice(0, 14))}
             onKeyDown={(e) => {
               e.stopPropagation();
               if (e.key === "Enter") void create();
               if (e.key === "Escape") setScreen("none");
             }}
             placeholder="DUST DEVIL"
-            maxLength={16}
+            maxLength={14}
             className="w-full rounded-md border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.96)] px-3 py-2.5 text-sm font-bold text-[#2b1c12] shadow-inner outline-none placeholder:text-[#b99a78] focus:border-[#f0641e]"
             aria-label="Your display name"
           />
