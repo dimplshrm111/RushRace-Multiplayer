@@ -263,3 +263,42 @@ Stage Summary:
 - The complete Task 17 upgrade is VERIFIED WORKING end-to-end: realistic car physics (suspension, weight transfer, surface-dependent grip), 9-surface terrain system, checkpoint recovery, X/Numpad0 nitro with exact 33/s drain + 10/s recharge, raised chase cam + live rear-view mirror, and full multiplayer (room/ready/countdown/race/forfeit/leave) — all with zero errors.
 - Test-harness gotchas documented: (1) debugSelftestActive freezes telemetry + rear-view rendering — always clear it before screenshotting the HUD; (2) MP testing MUST go through http://localhost:81/ (gateway), never localhost:3000 directly, or the socket.io connection fails; (3) module-scoped helpers like autopilotInput must be re-implemented inline in eval.
 - Leaderboard cleaned to 0 rows. Both services + gateway running. Production-ready.
+
+---
+Task ID: 19
+Agent: main agent (Z.ai Code)
+Task: Fix excessive car bouncing (cars bounce repeatedly over the track until they stop — diagnose the actual physics cause, no visual hiding) + fix race lag / slow feel
+
+Work Log:
+- DIAGNOSED the bounce loop in physics.ts (4 coupled flaws):
+  (1) The suspension spring/damper constants (STIFFNESS 38 / DAMPING 7.5) were DEAD CODE — computed then discarded (`void settleRate`); the chassis actually followed the ground via damp(pos.y, target, 9, dt), a fixed 111ms-time-constant exponential that cannot track downhills at speed (steady-state lag = fall-rate/9 → 0.89m on a 20% grade at 40 m/s, 1.5m on the 34% valley grade).
+  (2) The un-ground threshold was only 0.5m — ordinary downhills/crests at speed built enough lag to declare the car "airborne".
+  (3) The launch FABRICATED vy = clamp(climbRate, 0, 21) × 1.02 — climbRate is the smoothed rate still positive from the preceding UPHILL, so cresting fired the car skyward at up to 21.4 m/s (0.8–1.6s flights, 4–8m high, at GRAV=27).
+  (4) Landing TELEPORTED the chassis (pos.y = gi.h snap, vy zeroed, threshold BELOW ride height) — jarring pops, and on continued downhills the lag instantly rebuilt → launch→land→launch until speed dropped below ~4.5 m/s fall rate. Exactly "bouncing until they stop".
+- DIAGNOSED the lag/slow feel in engine.ts renderRearView: readRenderTargetPixels every other frame forces a full GPU pipeline flush (gl.readPixels, 3–10ms on many drivers) + putImageData + a separate 60Hz rAF HUD blit loop + a full second scene render → tanked FPS → input latency + floaty motion.
+- PHYSICS FIX (physics.ts):
+  • Real spring–damper suspension, semi-implicit Euler: susA = compression·K + (groundVy − vy)·C, with GROUND-VELOCITY FEEDFORWARD in the damper (the terrain contact-point rate is transmitted to the chassis almost instantly — downhills/uphills are tracked with no lag, so no spurious un-grounding).
+  • Retuned constants: K=140, C=22 (ω≈11.8 rad/s, ζ≈0.93 — settles in ~0.2s, at most one small rebound); SUS_REST 0.42 and SUS_TRAVEL 0.55 unchanged; new SUS_DROOP=0.42, SUS_MAX_ACCEL=300, SUS_MIN_CLEAR=0.06, GROUND_VY_CLAMP=30.
+  • Droop-limited un-grounding with VELOCITY CONTINUITY: the car only leaves the ground when the wheel would extend past droop (genuine cliff/gap lip/hard crest) and keeps its real vy — ramps still launch via actual spring compression velocity; the fabricated climbRate launch is deleted.
+  • Bump-stop bottoming: grounded chassis can never penetrate terrain (floor = ground + 0.06); bottoming kills residual downward vy (tire absorbs — metal-to-metal does NOT rebound); ceiling safety net above ride height.
+  • Landing at RIDE HEIGHT (not below it), absorbed by the spring over the following frames — no pos.y snap, no vy zeroing; events (onLanding/clean-land/big-air) preserved with impact = −vy at touchdown.
+  • place() now spawns AT ride height (was h+0.05, i.e. 0.37m into compression) and resets groundVyEst/vel.y.
+  • Frame-rate independence: update() substeps when dt > 1/45 (two half-steps) — PROVEN bit-identical: 1×(1/30) ≡ 2×(1/60) exact-double equality, and 130 sequential calls (4.3s) bit-identical vs 260×(1/60). Selftest (fixed 1/60) unchanged → determinism preserved.
+- REAR-VIEW FIX (engine.ts + HUD.tsx): replaced the render-target + readRenderTargetPixels + putImageData + blit-loop pipeline with a SCISSORED SECOND PASS rendered directly into the main canvas at the HUD slot's screen rect (#rear-view-slot, getBoundingClientRect → CSS px → GL y-flip, pixel-ratio handled internally by three.js). Zero CPU readback, zero stalls, inherits MSAA + ACES tone mapping. Alternate-frame cadence kept. Deleted rearTarget/rearCanvas/rearCtx/rearBuf/rearImg/rearViewCanvas getter. HUD: slot div is TRANSPARENT (first attempt had bg-[#241812] which covered the canvas behind it — the div sits ON TOP of the WebGL canvas; fixed by removing the background).
+- FEEL: STEER_ATTACK 7.5 → 9 (snappier turn-in).
+- VERIFICATION (deterministic eval stepping + browser + VLM):
+  • Full 1-lap race: exactly ONE air event (the intentional riverbed gap jump, 0.8s, natural vy −0.9 at launch) — ZERO fabricated launches (old code: up to 21 m/s repeatedly), lap finished, top speed 167 km/h.
+  • Landing absorption (3m drop): touchdown at ride height, 0.19m suspension compression, 0.08m rebound, ZERO repeated rebounds, settled — damper absorbs like real shocks.
+  • Hard braking from speed: 0 air transitions, Y range 0.117m (weight-transfer squat), stops in 0.85s. Low-speed driving: 0 air transitions. Rough off-road: 0 air transitions through an 8.4m elevation change (old code launched repeatedly).
+  • Render cost measured via monkey-patched renderer.render: avg 1.85ms/pass, P95 3.2ms (main + rear ≈ 3.7ms/frame total) — the 3–10ms readback stall is GONE.
+  • ?selftest=1: ok:true, 3-lap race finished 82.07s, top speed 174 km/h, 0 errors.
+  • MP E2E (gateway :81): room UTR4, ghost joined/readied, race started, MODE ONLINE POS 1/2, GHOST car visible IN THE REAR MIRROR (VLM-confirmed), car sitting flat on the road, forfeit→leave clean, ghost log clean.
+  • VLM screenshots: rear mirror shows rendered 3D road/canyon/tunnel behind (solo + MP), ground smooth under cars, no glitches, HUD intact (speed/gear/lap/pos/nitro/surface chips).
+  • Console 0 errors, browser errors 0, lint clean, dev.log clean. Deleted 3 selftest leaderboard rows (leaderboard fresh at 0).
+  • Test-harness note: comparing dt=1/60 vs dt=1/30 traces must sample at the SAME substep count (i % round(0.5/dt) samples after i+1 CALLS — off by one substep between the two runs; the physics itself is bit-identical).
+
+Stage Summary:
+- Bouncing ELIMINATED at the physics level: real spring–damper suspension with ground-rate feedforward replaces the dead-code constants + fixed-rate follower + fabricated launches + teleport landings. Cars absorb bumps, settle in ~0.2s, stay glued through slopes/crests/rough terrain, and only fly on genuine jumps (the riverbed gap) with natural velocity continuity.
+- Lag/slow feel fixed: the rear-view mirror's per-frame GPU readback stall is gone (scissored on-canvas pass, ~1.85ms); steering turn-in is snappier (attack 9); physics is frame-rate-independent (bit-identical 30↔60fps).
+- All cars identical (physics has zero car-model references — unchanged), nitro/surfaces/recovery/cameras/MP sync untouched and verified working; selftest determinism preserved.
+- Files: src/game/physics.ts (suspension rewrite + substepping + place() ride height), src/game/engine.ts (scissored rear-view, dead fields removed), src/components/game/HUD.tsx (transparent rear slot), src/game/input.ts (STEER_ATTACK).

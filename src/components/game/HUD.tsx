@@ -31,7 +31,6 @@ export function HUD({
   const nitroBtnRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
   const surfaceChipRef = useRef<HTMLDivElement>(null);
-  const rearViewRef = useRef<HTMLCanvasElement>(null);
   const driftRef = useRef<HTMLDivElement>(null);
   const lapRef = useRef<HTMLSpanElement>(null);
   const timeRef = useRef<HTMLDivElement>(null);
@@ -77,25 +76,9 @@ export function HUD({
     }
   }, [countdownValue]);
 
-  // rear-view mirror — copy the engine's low-res rear canvas onto the
-  // displayed canvas every frame (the engine renders at 30 Hz, we just blit)
-  useEffect(() => {
-    const engine = engineRef.current;
-    const dst = rearViewRef.current;
-    if (!engine || !dst) return;
-    const ctx = dst.getContext("2d");
-    if (!ctx) return;
-    let raf = 0;
-    const draw = () => {
-      raf = requestAnimationFrame(draw);
-      const src = engine.rearViewCanvas;
-      if (src) {
-        ctx.drawImage(src, 0, 0, dst.width, dst.height);
-      }
-    };
-    raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
-  }, [engineRef]);
+  // (rear-view mirror: the ENGINE paints this live view as a scissored pass
+  // directly into the WebGL canvas behind this HUD — no 2D canvas, no pixel
+  // readback, no blit loop. The slot below just marks the screen region.)
 
   // telemetry via direct DOM updates (no react re-render)
   useEffect(() => {
@@ -326,17 +309,21 @@ export function HUD({
       </div>
 
       {/* rear-view mirror — small live camera on the LEFT side, below the minimap.
-          Shows the road and approaching cars behind the player. */}
+          The engine renders this slot's screen region as a scissored second
+          pass on the main WebGL canvas (road + approaching cars behind you). */}
       <div className="absolute left-3 top-[200px] flex flex-col gap-0.5 sm:top-[260px]">
         <div className="flex items-center gap-1.5 rounded-t-md bg-[rgba(43,28,18,0.82)] px-2 py-0.5 text-[9px] font-black tracking-[0.25em] text-[#ffd23f] shadow-lg backdrop-blur-[2px]">
           <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#d64530]" />
           REAR
         </div>
-        <canvas
-          ref={rearViewRef}
-          width={256}
-          height={144}
-          className="block h-[72px] w-[128px] rounded-b-md border-2 border-t-0 border-[#2b1c12] bg-[#2b1c12] shadow-lg sm:h-[90px] sm:w-[160px]"
+        {/* TRANSPARENT slot — the engine's scissored pass paints the WebGL
+            canvas directly behind this element; any background here would
+            cover the mirror. The border frames it; rounded corners clip
+            nothing (the GL scissor is square — imperceptible at this size). */}
+        <div
+          id="rear-view-slot"
+          className="block h-[72px] w-[128px] rounded-b-md border-2 border-t-0 border-[#2b1c12] shadow-lg sm:h-[90px] sm:w-[160px]"
+          role="img"
           aria-label="Rear view mirror"
         />
       </div>

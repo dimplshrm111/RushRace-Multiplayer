@@ -182,12 +182,25 @@ const BRAKE_DECEL = 36;
 const REVERSE_MAX = 13;
 
 // --- suspension model ---
-// A simple critically-damped spring per axle; reacts to bumps, slopes,
-// curbs and weight transfer without bouncing the chassis around.
-const SUS_STIFFNESS = 38; // spring rate (per m of compression)
-const SUS_DAMPING = 7.5; // damper rate (per m/s of compression velocity)
+// A real per-chassis spring–damper, integrated with semi-implicit Euler.
+//   compression  = (ground + SUS_REST) − chassisY   (+ = compressed)
+//   susAccel     = compression·K + (groundVy − vy)·C
+// The damper acts on the velocity RELATIVE TO THE GROUND (feedforward):
+// on a slope the ground contact point moves vertically at groundVy, and the
+// damper transmits that motion to the chassis almost instantly — so the car
+// tracks uphills/downhills with essentially no lag and never "falls behind"
+// the terrain (which used to trigger spurious launches).
+//   ω = √K ≈ 11.8 rad/s, ζ = C/(2√K) ≈ 0.93 → critically-ish damped: one
+//   small rebound at most, settled within ~0.2 s. Hard landings hit the
+//   bump-stop (bottom out) — the tire absorbs the rest with NO rebound kick.
+const SUS_STIFFNESS = 140; // spring rate (per m of compression)
+const SUS_DAMPING = 22; // damper rate (per m/s of ground-relative velocity)
 const SUS_REST = 0.42; // rest ride height above ground (m)
 const SUS_TRAVEL = 0.55; // max compression before bottoming out (m)
+const SUS_DROOP = 0.42; // max wheel extension before the car un-grounds (m)
+const SUS_MAX_ACCEL = 300; // clamp on suspension acceleration (anti-spike)
+const SUS_MIN_CLEAR = 0.06; // chassis floor above terrain at full bottom-out (m)
+const GROUND_VY_CLAMP = 30; // clamp on the terrain-rate estimate (sample noise)
 
 // --- weight transfer ---
 // Longitudinal: weight shifts forward under braking, rearward under accel.
@@ -309,6 +322,10 @@ export class CarPhysics {
   /** Boost button currently held (X / Numpad0 / touch). */
   nitroActive = false;
 
+  /** Vertical velocity of the terrain under the car (m/s, smoothed estimate).
+   *  Used by the suspension damper as a feedforward target. */
+  groundVyEst = 0;
+
   private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
   private ev: PhysicsEvents;
   private track: Track;
@@ -340,7 +357,8 @@ export class CarPhysics {
     const t = this.track;
     const s = t.sample(idx);
     const h = t.heightAt(idx, lat);
-    this.pos.set(s.x + s.rx * lat, h + 0.05, s.z + s.rz * lat);
+    // spawn AT ride height so the suspension starts settled (no launch pop)
+    this.pos.set(s.x + s.rx * lat, h + SUS_REST, s.z + s.rz * lat);
     this.yaw = Math.atan2(s.dx, s.dz);
     this.vel.set(s.dx * speed, 0, s.dz * speed);
     this.yawRate = 0;
@@ -360,6 +378,8 @@ export class CarPhysics {
     this.bodyRoll = 0;
     this.loadLong = 0;
     this.loadLat = 0;
+    this.groundVyEst = 0;
+    this.vel.y = 0;
   }
 
   /** Re-sync unwrapped progress after a teleport. */
@@ -368,6 +388,16 @@ export class CarPhysics {
   }
 
   update(input: DriveInput, dt: number): void {
+    // ---- frame-rate independence ----
+    // The spring–damper suspension is conditionally stable in explicit
+    // integration; anything above ~22 ms is split into two half-steps so
+    // 30 fps and 60 fps produce identical vehicle behaviour (the deterministic
+    // selftest drives exactly 1/60 s steps → single step, bit-identical).
+    if (dt > 1 / 45 && dt <= 0.25) {
+      this.update(input, dt / 2);
+      this.update(input, dt / 2);
+      return;
+    }
     const t = this.track;
     // ---- track frame ----
     this.idx = t.nearestIdx(this.pos.x, this.pos.z, this.idx);
@@ -407,32 +437,34 @@ export class CarPhysics {
     const speed = Math.hypot(vf, vlat);
     this.slip = Math.atan2(vlat, Math.max(4, Math.abs(vf)));
 
-    // ---- ground / air transitions (with smooth suspension) ----
-    // The suspension absorbs small bumps and slope changes smoothly instead
-    // of teleporting the chassis onto the ground every frame (which was the
-    // source of the old "buzzing" and harsh launches off curbs).
+    // ---- ground / air transitions (real spring–damper suspension) ----
+    // The chassis is a mass on a spring resting on the moving terrain
+    // contact point. Slopes push it up / let it down through the damper
+    // feedforward (groundVy), bumps compress the spring, and the car only
+    // leaves the ground when the wheel would have to extend past its droop
+    // limit (a genuine cliff / gap lip / hard crest) — carrying its real
+    // vertical velocity with it (no fabricated launch impulse).
     if (this.grounded) {
-      const dh = gi.h - this.pos.y;
-      if (dh < -0.5) {
-        // ground fell away (cliff edge / gap lip / crest) — launch.
+      const target = gi.h + SUS_REST;
+      const gap = this.pos.y - target; // + = chassis above ride height (wheel extended)
+      if (gap > SUS_DROOP) {
+        // wheel has hung past full droop — the ground has genuinely fallen
+        // away (cliff edge / gap lip / sharp crest). Go airborne with
+        // VELOCITY CONTINUITY: vy already carries whatever the spring gave
+        // us on the preceding ramp/climb.
         this.grounded = false;
-        vy = clamp(this.climbRate, 0, 21) * 1.02;
         this.airTime = 0;
         if (vy > 3.2) this.ev.onJump();
       } else {
-        // suspension model: target ride height = gi.h + SUS_REST
-        // the chassis sits at this.pos.y; spring force pulls it toward the
-        // target, damper resists the velocity. This naturally absorbs bumps,
-        // curbs and slope changes without harsh pops.
-        const target = gi.h + SUS_REST;
-        const compression = clamp(target - this.pos.y, -SUS_TRAVEL, SUS_TRAVEL);
-        const springForce = compression * SUS_STIFFNESS;
-        const damperForce = -this.climbRate * SUS_DAMPING;
-        const susAccel = (springForce + damperForce) / 1.0; // m=s² toward target
-        // apply a damped settle toward the target — never overshoot
-        const settleRate = clamp(Math.abs(susAccel) * dt, 0, 1);
-        this.pos.y = damp(this.pos.y, target, 9, dt);
-        void settleRate;
+        // terrain vertical rate at the contact patch (feedforward for the
+        // damper). Rate-limited against single-sample noise.
+        const groundVy = clamp((gi.h - this.prevGroundY) / Math.max(dt, 1e-4), -GROUND_VY_CLAMP, GROUND_VY_CLAMP);
+        this.groundVyEst = groundVy;
+        // spring–damper (semi-implicit: accelerate vy first, then integrate)
+        const compression = -gap; // + = compressed (chassis low), − = extended
+        let susA = compression * SUS_STIFFNESS + (groundVy - vy) * SUS_DAMPING;
+        susA = clamp(susA, -SUS_MAX_ACCEL, SUS_MAX_ACCEL);
+        vy += susA * dt;
         // suspension compression for visual body pitch/roll (front & rear
         // axles sample the ground slightly ahead/behind the centre)
         const slopeF = t.slopeFwdAtP(this.groundP, this.lateral);
@@ -458,10 +490,9 @@ export class CarPhysics {
             1
           );
         }
-        const climb = (gi.h - this.prevGroundY) / Math.max(dt, 1e-4);
-        this.climbRate = damp(this.climbRate, clamp(climb, -10, 26), 9, dt);
+        this.climbRate = damp(this.climbRate, clamp(groundVy, -10, 26), 9, dt);
         this.prevGroundY = gi.h;
-        vy = 0;
+        // vy flows into vel.y below — the integration moves the chassis
       }
     }
     if (!this.grounded) {
@@ -777,28 +808,50 @@ export class CarPhysics {
     this.pos.x += this.vel.x * dt;
     this.pos.z += this.vel.z * dt;
     this.pos.y += this.vel.y * dt;
-    // anti-flip: clamp vertical position so a mis-sample can't launch the
-    // car into the sky (safety net; the suspension already prevents most pops)
-    if (this.grounded && this.pos.y > gi.h + SUS_REST + 1.2) {
-      this.pos.y = gi.h + SUS_REST + 1.2;
-      if (this.vel.y > 0) this.vel.y = 0;
+    // ---- suspension bump-stop (bottoming out) ----
+    // The chassis can never penetrate the terrain: at full compression it
+    // hits the bump-stop, which kills any remaining downward velocity
+    // (the tire absorbs it — metal-to-metal contact does NOT rebound).
+    if (this.grounded) {
+      const floor = gi.h + SUS_MIN_CLEAR;
+      if (this.pos.y < floor) {
+        this.pos.y = floor;
+        if (this.vel.y < this.groundVyEst) this.vel.y = this.groundVyEst;
+      }
+      // safety net: a mis-sample / collision pop can never leave the
+      // grounded chassis floating far above the ride height either
+      const ceil = gi.h + SUS_REST + SUS_DROOP + 0.25;
+      if (this.pos.y > ceil) {
+        this.pos.y = ceil;
+        if (this.vel.y > 0) this.vel.y = 0;
+      }
     }
 
     // ---- landing ----
+    // Touch down when the chassis descends to RIDE HEIGHT — the spring
+    // then compresses over the following frames to absorb the impact (hard
+    // landings bottom out against the bump-stop above). No teleport snap,
+    // no vy zeroing: energy is absorbed by the suspension, not deleted.
     if (!this.grounded) {
       const s2 = t.sample(this.idx);
       const along2 = (this.pos.x - s2.x) * s2.dx + (this.pos.z - s2.z) * s2.dz;
       const gi2 = t.groundAtP(this.idx + clamp(along2 / t.step, -1.5, 1.5), this.lateral, this.gi);
-      if (this.pos.y <= gi2.h + SUS_REST * 0.4 && this.vel.y <= 0.5) {
+      if (this.pos.y <= gi2.h + SUS_REST && this.vel.y <= 0) {
         const impact = -this.vel.y;
         const clean = this.slipAbsAtLanding(vf, vlat) && impact < 21;
         this.grounded = true;
-        this.pos.y = gi2.h;
         this.prevGroundY = gi2.h;
         this.climbRate = 0;
         this.lastAirTime = this.airTime;
         this.airTime = 0;
-        this.vel.y = 0;
+        // NOTE: pos.y and vel.y are kept — the spring absorbs the impact.
+        // A touchdown below the bump-stop floor (very fast fall) is clamped
+        // so the car can't clip into the terrain on the landing frame.
+        const floor2 = gi2.h + SUS_MIN_CLEAR;
+        if (this.pos.y < floor2) {
+          this.pos.y = floor2;
+          this.vel.y = Math.max(this.vel.y, 0);
+        }
         if (impact > 7) this.ev.onLanding(clamp(impact / 24, 0.1, 1), clean);
         if (clean && this.lastAirTime > 0.45) {
           this.boostMeter = clamp(

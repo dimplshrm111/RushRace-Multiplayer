@@ -129,15 +129,12 @@ export class GameEngine {
   private boostTrailTimer = 0;
 
   // --- rear-view mirror camera (small live view on the left of the screen) ---
+  // Rendered as a scissored second pass directly into the main canvas at the
+  // HUD's #rear-view-slot rect — no render target, no GPU→CPU pixel readback
+  // (the old readRenderTargetPixels forced a full pipeline flush every other
+  // frame, costing 3–10 ms and causing the game-wide lag/stutter).
   private rearCam: THREE.PerspectiveCamera | null = null;
-  private rearTarget: THREE.WebGLRenderTarget | null = null;
-  private rearCanvas: HTMLCanvasElement | null = null;
-  private rearCtx: CanvasRenderingContext2D | null = null;
   private rearSkipFrames = 0;
-  /** exposed for the HUD to read the rear-view canvas */
-  get rearViewCanvas(): HTMLCanvasElement | null {
-    return this.rearCanvas;
-  }
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -321,24 +318,14 @@ export class GameEngine {
   }
 
   /** Set up the rear-view mirror camera: a second perspective camera that
-   *  looks backward along the car's heading, rendered into a low-resolution
-   *  render target on alternate frames (cheap). The HUD overlays the canvas
-   *  in the bottom-left so the driver can see approaching cars behind them. */
+   *  looks backward along the car's heading. The mirror is painted straight
+   *  into the main canvas with a scissored pass (see renderRearView) — cheap,
+   *  tone-mapped, MSAA-antialiased, and free of any CPU pixel readback (the
+   *  old readRenderTargetPixels forced a full GPU pipeline flush every other
+   *  frame, costing 3–10 ms and causing the game-wide lag/stutter). */
   private initRearView() {
-    // low-res render target — keeps the second render pass cheap
-    this.rearTarget = new THREE.WebGLRenderTarget(256, 144, {
-      depthBuffer: true,
-      stencilBuffer: false,
-      type: THREE.UnsignedByteType,
-    });
-    this.rearTarget.texture.colorSpace = THREE.SRGBColorSpace;
-    this.rearCam = new THREE.PerspectiveCamera(58, 256 / 144, 0.3, 600);
+    this.rearCam = new THREE.PerspectiveCamera(58, 16 / 9, 0.3, 600);
     this.rearCam.up.set(0, 1, 0);
-    // canvas the HUD reads — same dimensions as the render target
-    this.rearCanvas = document.createElement("canvas");
-    this.rearCanvas.width = 256;
-    this.rearCanvas.height = 144;
-    this.rearCtx = this.rearCanvas.getContext("2d");
   }
 
   // ============================================================
@@ -755,7 +742,6 @@ export class GameEngine {
     for (const rp of this.remotes) rp.dispose();
     this.particles.dispose();
     this.debris.dispose();
-    this.rearTarget?.dispose();
     this.renderer.dispose();
   }
 
@@ -843,69 +829,61 @@ export class GameEngine {
     this.renderRearView();
   };
 
-  /** Render the rear-view camera into its canvas (low-res, every other frame). */
+  /** Render the rear-view mirror as a scissored pass directly into the main
+   *  canvas, inside the HUD's #rear-view-slot screen rect. Every other frame.
+   *  No render target, no readRenderTargetPixels (which stalled the GPU
+   *  pipeline), no 2D-canvas copy — just a small second render pass that
+   *  inherits the main canvas's MSAA + tone mapping. */
   private renderRearView() {
-    if (
-      !this.rearCam ||
-      !this.rearTarget ||
-      !this.rearCanvas ||
-      !this.rearCtx ||
-      this.phase === "title"
-    ) {
-      return;
-    }
+    if (!this.rearCam || this.phase === "title") return;
     // skip every other frame — half the cost, still smooth at 30 Hz
     this.rearSkipFrames = (this.rearSkipFrames + 1) % 2;
     if (this.rearSkipFrames !== 0) return;
+    // the HUD mounts a slot element where the mirror belongs; paint straight
+    // into that screen region (skip when the HUD is hidden / zero-sized)
+    const slot = document.getElementById("rear-view-slot");
+    if (!slot) return;
+    const rect = slot.getBoundingClientRect();
+    if (rect.width < 8 || rect.height < 8) return;
+    const canvas = this.renderer.domElement;
+    const cw = canvas.clientWidth;
+    const ch = canvas.clientHeight;
+    if (cw < 8 || ch < 8) return;
     const p = this.physics;
     // position the rear cam just behind & above the car, looking BACKWARDS
     // (yaw + PI = reverse direction). Slightly raised so the road behind is
     // visible over the car's roofline.
     const back = this.tmpV.set(-Math.sin(p.yaw), 0, -Math.cos(p.yaw)); // backward = -forward
-    const camX = p.pos.x + back.x * 5.5;
-    const camY = p.pos.y + 2.6;
-    const camZ = p.pos.z + back.z * 5.5;
-    this.rearCam.position.set(camX, camY, camZ);
+    this.rearCam.position.set(
+      p.pos.x + back.x * 5.5,
+      p.pos.y + 2.6,
+      p.pos.z + back.z * 5.5
+    );
     // look in the backward direction (toward where cars behind would be)
     this.rearCam.lookAt(p.pos.x + back.x * 50, p.pos.y + 0.5, p.pos.z + back.z * 50);
-    // render the scene from the rear cam into the render target
-    const prevTarget = this.renderer.getRenderTarget();
-    this.renderer.setRenderTarget(this.rearTarget);
+    // keep the projection matched to the slot's aspect
+    const aspect = rect.width / rect.height;
+    if (Math.abs(this.rearCam.aspect - aspect) > 0.01) {
+      this.rearCam.aspect = aspect;
+      this.rearCam.updateProjectionMatrix();
+    }
+    // three.js setViewport/setScissor take CSS pixels (scaled by the internal
+    // pixel ratio); the GL origin is bottom-left, the DOM origin top-left
+    const x = rect.left;
+    const y = ch - rect.bottom;
     // hide the player's own car so it doesn't block the rear view
     const wasVisible = this.car.group.visible;
     this.car.group.visible = false;
+    this.renderer.setScissorTest(true);
+    this.renderer.setScissor(x, y, rect.width, rect.height);
+    this.renderer.setViewport(x, y, rect.width, rect.height);
+    // autoClear only clears within the scissor box — the mirror region is
+    // wiped and re-drawn, the rest of the frame is untouched
     this.renderer.render(this.scene, this.rearCam);
+    this.renderer.setScissorTest(false);
+    this.renderer.setViewport(0, 0, cw, ch);
     this.car.group.visible = wasVisible;
-    this.renderer.setRenderTarget(prevTarget);
-    // copy the render target pixels into the 2D canvas (the HUD reads this)
-    // reading from a WebGLRenderTarget is expensive on some GPUs, but at
-    // 256x144 every other frame it's a few hundred microseconds — acceptable.
-    try {
-      const img = this.renderer.domElement; // not the target — read pixels directly
-      void img;
-      // Three.js: use readRenderTargetPixels into a Uint8ClampedArray, then
-      // putImageData onto the canvas. We allocate the buffer once.
-      if (!this.rearBuf || this.rearBuf.length !== 256 * 144 * 4) {
-        this.rearBuf = new Uint8ClampedArray(256 * 144 * 4);
-      }
-      this.renderer.readRenderTargetPixels(this.rearTarget, 0, 0, 256, 144, this.rearBuf);
-      // WebGL origin is bottom-left; canvas is top-left — flip vertically
-      if (!this.rearImg) {
-        this.rearImg = this.rearCtx.createImageData(256, 144);
-      }
-      const dst = this.rearImg.data;
-      for (let y = 0; y < 144; y++) {
-        const srcRow = (143 - y) * 256 * 4;
-        const dstRow = y * 256 * 4;
-        dst.set(this.rearBuf.subarray(srcRow, srcRow + 256 * 4), dstRow);
-      }
-      this.rearCtx.putImageData(this.rearImg, 0, 0);
-    } catch {
-      // readRenderTargetPixels can fail on context loss — silently skip
-    }
   }
-  private rearBuf: Uint8ClampedArray | null = null;
-  private rearImg: ImageData | null = null;
 
   private updateCountdown(dt: number) {
     this.countdownT -= dt;

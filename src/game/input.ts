@@ -12,7 +12,7 @@ interface TouchState {
   boost: boolean;
 }
 
-const STEER_ATTACK = 7.5;
+const STEER_ATTACK = 9; // snappier turn-in (was 7.5 — felt laggy at speed)
 const STEER_RELEASE = 12;
 
 /**
