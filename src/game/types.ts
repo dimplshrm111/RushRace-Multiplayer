@@ -35,14 +35,14 @@ export type GamePhase = "title" | "countdown" | "racing" | "finished";
 export type CameraMode = 0 | 1 | 2; // 0 chase near, 1 chase far, 2 hood
 export type Difficulty = "easy" | "medium" | "hard";
 
-/** Difficulty presets — crate traffic on the track + rival pace. */
+/** Difficulty presets — crate-stack traffic, rival pace, boost economy. */
 export const DIFFICULTIES: Record<
   Difficulty,
-  { label: string; short: string; boxes: number; aiSkill: number; hint: string }
+  { label: string; short: string; stacks: number; aiSkill: number; boostGain: number; hint: string }
 > = {
-  easy: { label: "EASY", short: "EASY", boxes: 16, aiSkill: 0.88, hint: "Light crate traffic · relaxed rivals" },
-  medium: { label: "MEDIUM", short: "MED", boxes: 32, aiSkill: 1.0, hint: "The standard canyon challenge" },
-  hard: { label: "HARD", short: "HARD", boxes: 48, aiSkill: 1.07, hint: "Crate-strewn racing line · hungry rivals" },
+  easy: { label: "EASY", short: "EASY", stacks: 5, aiSkill: 0.86, boostGain: 1.3, hint: "Few crate stacks · relaxed rivals · juicy boost" },
+  medium: { label: "MEDIUM", short: "MED", stacks: 9, aiSkill: 1.0, boostGain: 1.0, hint: "The standard canyon challenge" },
+  hard: { label: "HARD", short: "HARD", stacks: 14, aiSkill: 1.08, boostGain: 0.82, hint: "Crate-strewn racing line · hungry rivals" },
 };
 
 export const DIFFICULTY_ORDER: Difficulty[] = ["easy", "medium", "hard"];
@@ -118,7 +118,8 @@ export type UIEventType =
   | "wrongway"
   | "newrecord"
   | "recovery"
-  | "boost";
+  | "boost"
+  | "smash";
 
 export interface UIEvent {
   id: number;

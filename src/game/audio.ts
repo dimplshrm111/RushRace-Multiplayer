@@ -544,6 +544,19 @@ export class AudioSystem {
     this.tone(98, 0.2, 0.14, "sine", 0.02, 44);
   }
 
+  /** Big plank barricade smash — deep boom + a splintering crack cascade. */
+  wallSmash() {
+    if (!this.ctx) return;
+    const t = this.ctx.currentTime;
+    this.noiseBurst(this.sfxBus!, t, 0.5, 190, "lowpass", 0.55);
+    this.noiseBurst(this.sfxBus!, t, 0.3, 1900, "bandpass", 0.4, 900);
+    this.noiseBurst(this.sfxBus!, t + 0.07, 0.22, 3000, "bandpass", 0.3, 1400);
+    this.noiseBurst(this.sfxBus!, t + 0.16, 0.18, 2400, "bandpass", 0.22, 800);
+    this.tone(70, 0.42, 0.32, "square", 0, 40);
+    this.tone(110, 0.24, 0.2, "sawtooth", 0.02, 55);
+    this.tone(180, 0.12, 0.16, "triangle", 0.05, 80);
+  }
+
   driftBank(mult: number) {
     this.tone(660 + mult * 60, 0.08, 0.16, "square");
     this.tone(990 + mult * 90, 0.1, 0.16, "square", 0.07);

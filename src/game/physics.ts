@@ -105,6 +105,8 @@ export class CarPhysics {
   assist = true;
   /** Only the player's car counts near-misses / shared-obstacle cooldowns. */
   isPlayer = true;
+  /** Difficulty boost-economy multiplier (easy > 1, hard < 1). */
+  boostScale = 1;
 
   private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false };
   private ev: PhysicsEvents;
@@ -195,8 +197,10 @@ export class CarPhysics {
     // ---- ground / air transitions ----
     if (this.grounded) {
       const dh = gi.h - this.pos.y;
-      if (dh < -0.5 || gi.inPitZone) {
-        // ground fell away — launch
+      if (dh < -0.5) {
+        // ground fell away (cliff edge / gap lip / crest) — launch.
+        // NOTE: no pit-zone special case here — a car resting on the pit
+        // floor must STAY grounded so it can drive out of the valley.
         this.grounded = false;
         vy = clamp(this.climbRate, 0, 21) * 1.02;
         this.airTime = 0;
@@ -249,7 +253,7 @@ export class CarPhysics {
         // end of drift — bank it
         if (this.driftChain > 0.85 && this.driftCooldown <= 0) {
           const mult = 1 + Math.min(2, this.driftChain / 6);
-          this.boostMeter = clamp(this.boostMeter + Math.min(20, this.driftChain * 4), 0, 100);
+          this.boostMeter = clamp(this.boostMeter + Math.min(20, this.driftChain * 4) * this.boostScale, 0, 100);
           this.ev.onDriftBank(mult);
           this.driftCooldown = 0.7;
         }
@@ -316,7 +320,7 @@ export class CarPhysics {
       if (this.drifting) {
         const quality =
           clamp(Math.abs(this.slip) / 0.55, 0, 1) * clamp(Math.abs(vf) / 38, 0, 1);
-        this.boostMeter = clamp(this.boostMeter + (9 + 13 * quality) * dt, 0, 100);
+        this.boostMeter = clamp(this.boostMeter + (9 + 13 * quality) * dt * this.boostScale, 0, 100);
         this.driftScore += (10 + 18 * quality) * (1 + Math.min(2, this.driftChain / 6)) * dt;
       }
     }
@@ -328,13 +332,13 @@ export class CarPhysics {
     this.wallRiding = this.grounded && rideZone && Math.abs(vf) > 18;
     if (this.wallRiding && !wasRiding) this.ev.onWallRideStart();
     if (this.wallRiding) {
-      this.boostMeter = clamp(this.boostMeter + 15 * dt, 0, 100);
+      this.boostMeter = clamp(this.boostMeter + 15 * dt * this.boostScale, 0, 100);
       this.driftScore += 14 * dt;
     }
 
     // ---- airtime charge ----
     if (!this.grounded) {
-      this.boostMeter = clamp(this.boostMeter + 6 * dt, 0, 100);
+      this.boostMeter = clamp(this.boostMeter + 6 * dt * this.boostScale, 0, 100);
       this.driftScore += 8 * dt;
     }
 
@@ -412,27 +416,29 @@ export class CarPhysics {
         ) {
           ob.lastNear = now;
           this.nearMisses++;
-          this.boostMeter = clamp(this.boostMeter + 9, 0, 100);
+          this.boostMeter = clamp(this.boostMeter + 9 * this.boostScale, 0, 100);
           this.ev.onNearMiss();
         }
       }
     }
 
-    // ---- breakable crates ----
-    // Smash through: the crate explodes and the car sheds a little speed,
+    // ---- breakable crates & barricade ----
+    // Smash through: the crate/segment explodes and the car sheds a little
+    // speed (less for the barricade — it is meant to be smashed flat out),
     // then accelerates back up naturally. You can also jump clean over them.
     for (const b of t.boxes) {
       if (!b.active) continue;
       const dx = this.pos.x - b.x;
       const dz = this.pos.z - b.z;
       if (dx * dx + dz * dz > 3.6) continue; // (1.9 m)² — forgiving arcade radius
-      if (Math.abs(this.pos.y - b.y) > 1.7) continue; // sailed over it
+      if (Math.abs(this.pos.y - b.y) > b.halfH + 0.9) continue; // sailed over it
       b.active = false;
       b.mesh.visible = false;
       b.respawnAt = Infinity; // owner schedules the respawn via onBoxHit
-      // little slow-down + a sideways stagger
-      this.vel.x *= 0.78;
-      this.vel.z *= 0.78;
+      // little slow-down + a sideways stagger (barricades barely slow you)
+      const shed = b.wall ? 0.92 : 0.78;
+      this.vel.x *= shed;
+      this.vel.z *= shed;
       this.vel.x += rx * (Math.random() - 0.5) * 1.6;
       this.vel.z += rz * (Math.random() - 0.5) * 1.6;
       if (this.drifting) {
@@ -465,7 +471,7 @@ export class CarPhysics {
         this.vel.y = 0;
         if (impact > 7) this.ev.onLanding(clamp(impact / 24, 0.1, 1), clean);
         if (clean && this.lastAirTime > 0.45) {
-          this.boostMeter = clamp(this.boostMeter + Math.min(30, this.lastAirTime * 16), 0, 100);
+          this.boostMeter = clamp(this.boostMeter + Math.min(30, this.lastAirTime * 16) * this.boostScale, 0, 100);
           this.ev.onCleanLand(this.lastAirTime);
           if (this.lastAirTime > 1.15) this.ev.onBigAir(this.lastAirTime);
         } else if (!clean && impact > 14) {
@@ -478,7 +484,9 @@ export class CarPhysics {
     }
 
     // ---- pit fall ----
-    if (gi.inPitZone && this.pos.y < s.y - 9) {
+    // Only a genuine fall-through (below the valley floor itself) recovers;
+    // a car that landed in the pit stays put and drives out via the ramp.
+    if (gi.inPitZone && this.pos.y < gi.h - 3) {
       this.ev.requestRecovery();
     }
 

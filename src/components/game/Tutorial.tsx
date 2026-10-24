@@ -41,12 +41,22 @@ const STEPS: Step[] = [
     ),
   },
   {
+    title: "SMASH",
+    accent: "#a34e33",
+    body: (
+      <>
+        <p>Smash straight through <b>crate stacks</b> and the painted <b>BREAK barricade</b> — they explode into flying planks.</p>
+        <p className="mt-1 text-[#5a3c28]">Look for the <b>BREAK</b> sign — walls that carry it are fair game. Crates cost a little speed, the barricade barely slows you, and every smash feeds your boost.</p>
+      </>
+    ),
+  },
+  {
     title: "FLY & RIDE",
     accent: "#2f9e63",
     body: (
       <>
         <p>Hit the <b>big ramp</b> fast to clear the canyon gap. Keep speed high on the <b>banked carousel</b> to ride the wall.</p>
-        <p className="mt-1 text-[#5a3c28]">Land straight for a clean-landing bonus. Fall in the gap? You respawn — you only lose time.</p>
+        <p className="mt-1 text-[#5a3c28]">Land straight for a clean-landing bonus. Undershoot the jump and you land in the dry riverbed — floor it up the sand ramp to rejoin the race.</p>
       </>
     ),
   },

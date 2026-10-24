@@ -26,6 +26,7 @@ export interface TrackSample {
   shoulderR: number;
   bank: number; // meters raised at right edge
   gap: boolean;
+  gapT: number; // -1 = none, else 0..1 progress through the gap (for the smooth pit profile)
   rampP: number; // -1 = none, else 0..1 through the launch ramp
   dualT: number; // 0..1 terrace blend
   wallRideR: boolean;
@@ -58,6 +59,12 @@ export interface TrackBox {
   y: number; // center height
   idx: number;
   lat: number;
+  /** stack/cluster id — smash one crate and the whole stack goes (walls share one id) */
+  cluster: number;
+  /** vertical half-extent — cars can jump clean over low crates */
+  halfH: number;
+  /** true = barricade wall segment (plank FX + bigger smash) */
+  wall: boolean;
   /** crates beyond the difficulty limit are parked entirely */
   enabled: boolean;
   active: boolean;
@@ -115,12 +122,27 @@ interface Kicker {
   h: number;
 }
 
+/** How deep the dry-riverbed pit floor sits below road level at gap progress t (0..1). */
+const PIT_DEPTH = -9;
+export function pitDepthAt(gapT: number): number {
+  if (gapT < 0) return 0;
+  // flat landing floor under the cliff, then a smooth drivable climb back to road level
+  if (gapT < 0.12) return PIT_DEPTH;
+  if (gapT > 0.99) return 0;
+  const u = (gapT - 0.12) / 0.87; // 0..1 across the exit ramp
+  // smoothstep-blended ramp: gentle at both ends, steady grade in the middle
+  const s = u * u * (3 - 2 * u);
+  return PIT_DEPTH * (1 - s);
+}
+
 /** The Sunstone Circuit: one spectacular closed loop through a red-rock canyon. */
 export class Track {
   samples: TrackSample[] = [];
   gates: Gate[] = [];
   obstacles: Obstacle[] = [];
   boxes: TrackBox[] = [];
+  /** sample index of the BREAK barricade (-1 = none) */
+  breakWallIdx = -1;
   kickers: Kicker[] = [];
   N = 0;
   step = 2;
@@ -192,6 +214,7 @@ export class Track {
         shoulderR: 8,
         bank: sm[i],
         gap: false,
+        gapT: -1,
         rampP: -1,
         dualT: 0,
         wallRideR: false,
@@ -245,6 +268,9 @@ export class Track {
     });
 
     // --- the GAP over the dry riverbed canyon ---
+    // The pit is a smooth valley, not a box canyon: a short flat landing
+    // floor under the cliff, then a long drivable ramp that climbs back up
+    // to the landing road — undershoot the jump and you can still drive out.
     const crestI = this.idxNear(CONTROL[3][0], CONTROL[3][2]);
     const landI = this.idxNear(CONTROL[4][0], CONTROL[4][2]);
     const gapSpan = (landI - crestI + this.N) % this.N;
@@ -253,6 +279,7 @@ export class Track {
     for (let k = gapStart; k <= gapEnd; k++) {
       const s = S[wrapIdx(k, this.N)];
       s.gap = true;
+      s.gapT = (k - gapStart) / Math.max(1, gapEnd - gapStart);
       s.shoulderL = 3.2;
       s.shoulderR = 3.2;
       s.wallHL = 30;
@@ -434,7 +461,7 @@ export class Track {
     const s = this.sample(i);
     const al = Math.abs(lat);
     if (s.gap && al < s.hw + 3) {
-      out.h = s.y - 13;
+      out.h = s.y + pitDepthAt(s.gapT);
       out.onRoad = false;
       out.inPitZone = true;
       return out;
@@ -580,7 +607,8 @@ export class Track {
     this.buildArch();
     this.buildScenery();
     this.buildGates();
-    this.buildBoxes();
+    this.buildBreakWall();
+    this.buildStacks();
   }
 
   private buildWalls() {
@@ -601,7 +629,7 @@ export class Track {
         const lean = 7 + ((i * 37) % 5);
         const tx = s.x + (s.rx * wd + lean) * side;
         const tz = s.z + (s.rz * wd + lean) * side;
-        const by = s.gap ? s.y - 13.4 : this.heightAt(i, wd * side) - 0.2;
+        const by = s.gap ? s.y + pitDepthAt(s.gapT) - 0.4 : this.heightAt(i, wd * side) - 0.2;
         const ty = s.y + wallH;
         pos.push(bx, by, bz, tx, ty, tz);
         for (const yv of [by, ty]) {
@@ -831,7 +859,12 @@ export class Track {
       let j = i;
       while (j < n && this.samples[j].gap) j++;
       const jEnd = Math.min(j, n - 1); // gap never crosses the wrap in this track
-      // pit floor
+      // smooth valley floor — follows the same profile the physics drives on,
+      // so the rendered sand matches the collision surface exactly
+      const floorY = (k: number) => {
+        const sk = this.samples[wrapIdx(k, n)];
+        return sk.y + pitDepthAt(sk.gapT);
+      };
       for (let k = i; k < jEnd; k++) {
         const s0 = this.samples[k];
         const s1 = this.samples[k + 1];
@@ -841,14 +874,14 @@ export class Track {
           [PL / 2, PL],
         ] as [number, number][]) {
           pushQuad(
-            [s0.x + s0.rx * l0, s0.y - 13, s0.z + s0.rz * l0],
-            [s0.x + s0.rx * l1, s0.y - 13, s0.z + s0.rz * l1],
-            [s1.x + s1.rx * l1, s1.y - 13, s1.z + s1.rz * l1],
-            [s1.x + s1.rx * l0, s1.y - 13, s1.z + s1.rz * l0]
+            [s0.x + s0.rx * l0, floorY(k), s0.z + s0.rz * l0],
+            [s0.x + s0.rx * l1, floorY(k), s0.z + s0.rz * l1],
+            [s1.x + s1.rx * l1, floorY(k + 1), s1.z + s1.rz * l1],
+            [s1.x + s1.rx * l0, floorY(k + 1), s1.z + s1.rz * l0]
           );
         }
       }
-      // near face: road edge down into the pit
+      // near face: crisp cliff under the launch edge (keeps launches snappy)
       const sp = this.samples[wrapIdx(i - 1, n)];
       const sa = this.samples[i];
       for (const [l0, l1] of [
@@ -858,11 +891,12 @@ export class Track {
         pushQuad(
           [sp.x + sp.rx * l0, this.heightAt(wrapIdx(i - 1, n), l0), sp.z + sp.rz * l0],
           [sp.x + sp.rx * l1, this.heightAt(wrapIdx(i - 1, n), l1), sp.z + sp.rz * l1],
-          [sa.x + sa.rx * l1, sa.y - 13, sa.z + sa.rz * l1],
-          [sa.x + sa.rx * l0, sa.y - 13, sa.z + sa.rz * l0]
+          [sa.x + sa.rx * l1, floorY(i), sa.z + sa.rz * l1],
+          [sa.x + sa.rx * l0, floorY(i), sa.z + sa.rz * l0]
         );
       }
-      // far face: pit up to the landing road
+      // far face: the valley floor has already climbed to road level here —
+      // just a short skirt so there is no visible seam at the join
       const sf = this.samples[wrapIdx(jEnd, n)];
       const sl = this.samples[wrapIdx(jEnd - 1, n)];
       for (const [l0, l1] of [
@@ -870,8 +904,8 @@ export class Track {
         [0, PL],
       ] as [number, number][]) {
         pushQuad(
-          [sl.x + sl.rx * l0, sl.y - 13, sl.z + sl.rz * l0],
-          [sl.x + sl.rx * l1, sl.y - 13, sl.z + sl.rz * l1],
+          [sl.x + sl.rx * l0, floorY(jEnd - 1), sl.z + sl.rz * l0],
+          [sl.x + sl.rx * l1, floorY(jEnd - 1), sl.z + sl.rz * l1],
           [sf.x + sf.rx * l1, this.heightAt(wrapIdx(jEnd, n), l1), sf.z + sf.rz * l1],
           [sf.x + sf.rx * l0, this.heightAt(wrapIdx(jEnd, n), l0), sf.z + sf.rz * l0]
         );
@@ -1168,11 +1202,10 @@ export class Track {
     this.disposables.push(pylonGeo, pylonMat, stripeTex, capGeo, chevGeo, beamGeo);
   }
 
-  /** Activate the first `count` crates (difficulty setting) and park the rest. */
-  setActiveBoxes(count: number) {
-    for (let i = 0; i < this.boxes.length; i++) {
-      const b = this.boxes[i];
-      b.enabled = i < count;
+  /** Activate the first `stacks` crate stacks (difficulty setting) — the break wall is always live. */
+  setActiveStacks(stacks: number) {
+    for (const b of this.boxes) {
+      b.enabled = b.wall || b.cluster < stacks;
       b.active = b.enabled;
       b.respawnAt = 0;
       b.mesh.visible = b.enabled;
@@ -1200,15 +1233,100 @@ export class Track {
   }
 
   /**
-   * Breakable wooden crates scattered on the racing line. Full candidate set
-   * is generated once (max count); difficulty decides how many go live.
+   * The BREAK barricade: a plank wall spanning the whole canyon floor with
+   * "BREAK!" painted across every board (plus a warning sign on the approach)
+   * so riders know they can smash straight through — and they should, because
+   * it explodes into flying planks. One cluster id = the whole wall goes at once.
    */
-  private buildBoxes() {
+  private buildBreakWall() {
+    const WALL_CLUSTER = 1_000_000;
+    const idx = this.idxNear(CONTROL[25][0], CONTROL[25][2]);
+    this.breakWallIdx = idx;
+    const s = this.samples[idx];
+    const yaw = Math.atan2(-s.rz, s.rx); // local +X along the road's right vector
+
+    const span = s.hw + 1.6; // road + shoulders — nowhere to sneak around
+    const segW = 2.0;
+    const segH = 2.6;
+
+    const tex = makeWallTexture();
+    const geo = new THREE.BoxGeometry(segW, segH, 0.18);
+    const mat = new THREE.MeshLambertMaterial({ map: tex });
+    const postGeo = new THREE.BoxGeometry(0.26, 3.2, 0.26);
+    const postMat = new THREE.MeshLambertMaterial({ color: 0x6e4523 });
+    this.disposables.push(geo, mat, tex, postGeo, postMat);
+
+    for (let lat = -span; lat <= span + 0.01; lat += segW) {
+      const l = Math.min(lat, span);
+      const x = s.x + s.rx * l;
+      const z = s.z + s.rz * l;
+      const y = this.heightAt(idx, l) + segH / 2 + 0.06;
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x, y, z);
+      mesh.rotation.y = yaw;
+      mesh.castShadow = true;
+      this.group.add(mesh);
+      this.boxes.push({
+        x,
+        z,
+        y,
+        idx,
+        lat: l,
+        cluster: WALL_CLUSTER,
+        halfH: segH / 2,
+        wall: true,
+        enabled: true,
+        active: true,
+        respawnAt: 0,
+        mesh,
+      });
+    }
+
+    // scaffold posts at the ends (static scenery, off the driving line)
+    for (const e of [-(span + 0.55), span + 0.55]) {
+      const post = new THREE.Mesh(postGeo, postMat);
+      post.position.set(s.x + s.rx * e, this.heightAt(idx, e) + 1.6, s.z + s.rz * e);
+      post.rotation.y = yaw;
+      post.castShadow = true;
+      this.group.add(post);
+    }
+
+    // warning sign on the approach: "BREAK AHEAD" diamond, facing oncoming riders
+    const signIdx = wrapIdx(idx - 16, this.N);
+    const ss = this.samples[signIdx];
+    const signTex = makeSignTexture();
+    const signGeo = new THREE.PlaneGeometry(2.4, 2.4);
+    const signMat = new THREE.MeshBasicMaterial({
+      map: signTex,
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    const slat = ss.hw + 2.4;
+    const signPostGeo = new THREE.BoxGeometry(0.14, 2.4, 0.14);
+    const sign = new THREE.Mesh(signGeo, signMat);
+    const signPost = new THREE.Mesh(signPostGeo, postMat);
+    const sy = this.heightAt(signIdx, slat) + 2.55;
+    sign.position.set(ss.x + ss.rx * slat, sy, ss.z + ss.rz * slat);
+    sign.rotation.y = Math.atan2(-ss.dx, -ss.dz); // face backwards along the track
+    signPost.position.set(ss.x + ss.rx * slat, sy - 1.25, ss.z + ss.rz * slat);
+    signPost.castShadow = true;
+    this.group.add(sign);
+    this.group.add(signPost);
+    this.disposables.push(signTex, signGeo, signMat, signPostGeo);
+  }
+
+  /**
+   * Breakable wooden crates arranged in STACKS — pyramids, pairs, blocks and
+   * firing lines on the racing line. Smash one crate and the whole stack
+   * chain-breaks into flying pieces. The full candidate set is generated once
+   * (max count); difficulty decides how many stacks go live.
+   */
+  private buildStacks() {
     const n = this.N;
-    const MAX = 48;
+    const MAX_STACKS = 14;
     const rnd = mulberry32(9155);
 
-    // zones to keep clear: gates, ramps, the gap, the tunnel, the start grid
+    // zones to keep clear: gates, ramps, the gap, the tunnel, the start grid, the break wall
     const blocked = new Uint8Array(n);
     for (const g of this.gates) {
       for (let k = -8; k <= 8; k++) blocked[wrapIdx(g.idx + k, n)] = 1;
@@ -1219,54 +1337,106 @@ export class Track {
       }
     }
     for (let k = -60; k <= 60; k++) blocked[wrapIdx(k, n)] = 1; // start/finish + grid
+    if (this.breakWallIdx >= 0) {
+      for (let k = -14; k <= 14; k++) blocked[wrapIdx(this.breakWallIdx + k, n)] = 1;
+    }
 
     const crateTex = makeCrateTexture();
     const crateGeo = new THREE.BoxGeometry(1.24, 1.24, 1.24);
     const crateMat = new THREE.MeshLambertMaterial({ map: crateTex });
     this.disposables.push(crateGeo, crateMat, crateTex);
 
+    // stack layout patterns: [lateral cell offset, stack level]
+    const PATTERNS: [number, number][][] = [
+      [
+        [-1.32, 0],
+        [0, 0],
+        [1.32, 0],
+        [-0.66, 1],
+        [0.66, 1],
+        [0, 2],
+      ], // pyramid
+      [
+        [-0.65, 0],
+        [0.65, 0],
+        [0, 1],
+      ], // pair + top
+      [
+        [-1.35, 0],
+        [0, 0],
+        [1.35, 0],
+      ], // firing line across the road
+      [
+        [-0.66, 0],
+        [0.66, 0],
+        [-0.66, 1],
+        [0.66, 1],
+      ], // 2×2 block
+    ];
+
     const used: number[] = [];
+    let cluster = 0;
     let placed = 0;
     let guard = 0;
-    while (placed < MAX && guard++ < 6000) {
+    while (placed < MAX_STACKS && guard++ < 9000) {
       const idx = 60 + Math.floor(rnd() * (n - 120));
       if (blocked[idx]) continue;
-      // spacing — no two crates close together
+      // stack spacing — each stack reads as its own little event on approach
       let tooClose = false;
       for (const u of used) {
         let d = Math.abs(idx - u);
         d = Math.min(d, n - d);
-        if (d < 12) {
+        if (d < 26) {
           tooClose = true;
           break;
         }
       }
       if (tooClose) continue;
       const s = this.samples[idx];
-      // bias positions toward the middle of the road
+      // bias stacks toward the middle of the road
       const u = rnd() * 2 - 1;
-      const lat = Math.sign(u) * Math.pow(Math.abs(u), 1.5) * Math.max(1.5, s.hw - 3);
-      const x = s.x + s.rx * lat;
-      const z = s.z + s.rz * lat;
+      const lat = Math.sign(u) * Math.pow(Math.abs(u), 1.35) * Math.max(1.2, s.hw - 4.5);
       // keep clear of registered boulders / pillars
       let clash = false;
       for (const ob of this.obstacles) {
-        const dx = ob.x - x;
-        const dz = ob.z - z;
-        if (dx * dx + dz * dz < 16) {
+        const dx = ob.x - (s.x + s.rx * lat);
+        const dz = ob.z - (s.z + s.rz * lat);
+        if (dx * dx + dz * dz < 34) {
           clash = true;
           break;
         }
       }
       if (clash) continue;
-      const y = this.heightAt(idx, lat) + 0.62;
-      const mesh = new THREE.Mesh(crateGeo, crateMat);
-      mesh.position.set(x, y, z);
-      mesh.rotation.y = rnd() * Math.PI;
-      mesh.castShadow = true;
-      this.group.add(mesh);
-      this.boxes.push({ x, z, y, idx, lat, enabled: false, active: false, respawnAt: 0, mesh });
+      const pattern = PATTERNS[Math.floor(rnd() * PATTERNS.length)];
+      const count = Math.min(pattern.length, 3 + Math.floor(rnd() * (pattern.length - 2)));
+      for (let c = 0; c < count; c++) {
+        const [cl, lvl] = pattern[c];
+        const blat = lat + cl;
+        const x = s.x + s.rx * blat;
+        const z = s.z + s.rz * blat;
+        const y = this.heightAt(idx, blat) + 0.62 + lvl * 1.24;
+        const mesh = new THREE.Mesh(crateGeo, crateMat);
+        mesh.position.set(x, y, z);
+        mesh.rotation.y = (rnd() - 0.5) * 0.55;
+        mesh.castShadow = true;
+        this.group.add(mesh);
+        this.boxes.push({
+          x,
+          z,
+          y,
+          idx,
+          lat: blat,
+          cluster,
+          halfH: 0.62,
+          wall: false,
+          enabled: false,
+          active: false,
+          respawnAt: 0,
+          mesh,
+        });
+      }
       used.push(idx);
+      cluster++;
       placed++;
     }
   }
@@ -1416,6 +1586,161 @@ function makeCrateTexture(): THREE.Texture {
     ctx.arc(x, y, 3.2, 0, Math.PI * 2);
     ctx.fill();
   }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Plank barricade segment — vertical boards, cross braces and a big painted BREAK! stencil. */
+function makeWallTexture(): THREE.Texture {
+  const W = 256;
+  const H = 340;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d")!;
+  const rnd = mulberry32(777);
+
+  // vertical planks
+  const plankW = W / 4;
+  for (let p = 0; p < 4; p++) {
+    const shade = 0.9 + rnd() * 0.2;
+    const r = Math.floor(0xa9 * shade);
+    const g = Math.floor(0x71 * shade);
+    const b = Math.floor(0x3d * shade);
+    ctx.fillStyle = `rgb(${r},${g},${b})`;
+    ctx.fillRect(p * plankW, 0, plankW, H);
+    // seam
+    ctx.fillStyle = "rgba(64,38,16,0.85)";
+    ctx.fillRect(p * plankW, 0, 3, H);
+    // grain
+    for (let i = 0; i < 14; i++) {
+      ctx.fillStyle = `rgba(${70 + rnd() * 50},${42 + rnd() * 26},${18 + rnd() * 14},${0.14 + rnd() * 0.16})`;
+      ctx.fillRect(p * plankW + 4 + rnd() * (plankW - 10), rnd() * H, 2, 18 + rnd() * 60);
+    }
+    // nails top & bottom
+    ctx.fillStyle = "#4c2f16";
+    for (const y of [14, H - 14]) {
+      ctx.beginPath();
+      ctx.arc(p * plankW + plankW / 2, y, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  // horizontal cross braces
+  for (const by of [64, H - 88]) {
+    ctx.fillStyle = "#8a5a2e";
+    ctx.fillRect(0, by, W, 26);
+    ctx.fillStyle = "rgba(255,232,196,0.16)";
+    ctx.fillRect(0, by, W, 5);
+    ctx.fillStyle = "rgba(50,28,10,0.4)";
+    ctx.fillRect(0, by + 22, W, 4);
+  }
+
+  // hazard stripes along the bottom
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, H - 46, W, 46);
+  ctx.clip();
+  ctx.fillStyle = "#ffb020";
+  ctx.fillRect(0, H - 46, W, 46);
+  ctx.fillStyle = "#2b1c12";
+  for (let x = -46; x < W + 46; x += 46) {
+    ctx.beginPath();
+    ctx.moveTo(x, H);
+    ctx.lineTo(x + 23, H);
+    ctx.lineTo(x + 23 + 46, H - 46);
+    ctx.lineTo(x + 46, H - 46);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+
+  // big painted stencil: BREAK! (font auto-shrinks to fit the board)
+  ctx.save();
+  ctx.translate(W / 2, H / 2 - 16);
+  ctx.rotate(-0.1);
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.lineJoin = "round";
+  let fontSize = 78;
+  do {
+    ctx.font = `900 ${fontSize}px system-ui, sans-serif`;
+    fontSize -= 2;
+  } while (ctx.measureText("BREAK!").width > W - 34 && fontSize > 30);
+  ctx.strokeStyle = "#fff6e6";
+  ctx.lineWidth = Math.max(8, fontSize * 0.16);
+  ctx.strokeText("BREAK!", 0, 0);
+  ctx.fillStyle = "#2b1c12";
+  ctx.fillText("BREAK!", 0, 0);
+  ctx.restore();
+
+  // impact crack lines
+  ctx.strokeStyle = "rgba(40,22,8,0.55)";
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 5; i++) {
+    const x0 = 30 + rnd() * (W - 60);
+    const y0 = 30 + rnd() * (H - 120);
+    ctx.beginPath();
+    ctx.moveTo(x0, y0);
+    ctx.lineTo(x0 + (rnd() - 0.5) * 44, y0 + 16 + rnd() * 40);
+    ctx.stroke();
+  }
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+/** Diamond warning sign — "BREAK" with a smash burst, so riders know the wall is smashable. */
+function makeSignTexture(): THREE.Texture {
+  const S = 256;
+  const c = document.createElement("canvas");
+  c.width = c.height = S;
+  const ctx = c.getContext("2d")!;
+
+  // diamond plate
+  ctx.save();
+  ctx.translate(S / 2, S / 2);
+  ctx.rotate(Math.PI / 4);
+  ctx.fillStyle = "#ffb020";
+  ctx.strokeStyle = "#2b1c12";
+  ctx.lineWidth = 10;
+  const d = S * 0.36;
+  ctx.fillRect(-d, -d, d * 2, d * 2);
+  ctx.strokeRect(-d, -d, d * 2, d * 2);
+  ctx.restore();
+
+  // text (auto-fit inside the diamond)
+  ctx.fillStyle = "#2b1c12";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  let f1 = 60;
+  do {
+    ctx.font = `900 ${f1}px system-ui, sans-serif`;
+    f1 -= 2;
+  } while (ctx.measureText("BREAK").width > S * 0.62 && f1 > 24);
+  ctx.fillText("BREAK", S / 2, S / 2 - 30);
+  let f2 = 40;
+  do {
+    ctx.font = `900 ${f2}px system-ui, sans-serif`;
+    f2 -= 2;
+  } while (ctx.measureText("AHEAD").width > S * 0.52 && f2 > 16);
+  ctx.fillText("AHEAD", S / 2, S / 2 + 18);
+
+  // little impact burst
+  ctx.strokeStyle = "#2b1c12";
+  ctx.lineWidth = 5;
+  ctx.beginPath();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    const r0 = 46;
+    const r1 = 64;
+    ctx.moveTo(S / 2 + Math.cos(a) * r0, S / 2 + 62 + Math.sin(a) * r0 * 0.5);
+    ctx.lineTo(S / 2 + Math.cos(a) * r1, S / 2 + 62 + Math.sin(a) * r1 * 0.5);
+  }
+  ctx.stroke();
+
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;

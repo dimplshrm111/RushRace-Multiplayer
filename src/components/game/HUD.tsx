@@ -3,7 +3,7 @@
 import { useEffect, useRef } from "react";
 import type { GameEngine } from "@/game/engine";
 import { useGameStore } from "@/game/store";
-import { formatDelta, formatTime, type Telemetry } from "@/game/types";
+import { DIFFICULTIES, formatDelta, formatTime, type Telemetry } from "@/game/types";
 
 interface MinimapData {
   canvas: HTMLCanvasElement;
@@ -44,6 +44,7 @@ export function HUD({
   const countdownValue = useGameStore((s) => s.countdownValue);
   const prunePopups = useGameStore((s) => s.prunePopups);
   const bestTotalMs = useGameStore((s) => s.bestTotalMs);
+  const difficulty = useGameStore((s) => s.settings.difficulty);
 
   const goFlashRef = useRef<HTMLDivElement>(null);
 
@@ -195,6 +196,12 @@ export function HUD({
             <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">POS</span>
             <span ref={posRef} className="font-[family-name:var(--font-bungee)] text-lg leading-none">4/4</span>
           </div>
+          <div className="flex items-center rounded-md bg-[rgba(43,28,18,0.72)] px-2.5 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px]">
+            <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">MODE</span>
+            <span className="ml-1.5 font-[family-name:var(--font-bungee)] text-sm leading-none">
+              {DIFFICULTIES[difficulty].short}
+            </span>
+          </div>
         </div>
         <div ref={timeRef} className="font-[family-name:var(--font-bungee)] text-2xl leading-none text-[#2b1c12] [text-shadow:0_2px_0_rgba(255,246,230,0.65)] sm:text-3xl">
           0:00.00
@@ -281,7 +288,9 @@ export function HUD({
                   ? "bg-[rgba(43,28,18,0.85)] text-[#fff6e6]"
                   : p.type === "newrecord"
                     ? "bg-[#2f9e63] text-[#fff6e6]"
-                    : "bg-[rgba(255,246,230,0.94)] text-[#2b1c12]"
+                    : p.type === "smash"
+                      ? "bg-[#f0641e] text-[#fff6e6]"
+                      : "bg-[rgba(255,246,230,0.94)] text-[#2b1c12]"
             }`}
           >
             {p.text}

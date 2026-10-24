@@ -3,7 +3,13 @@
 import { useEffect, useRef, useState } from "react";
 import type { GameEngine } from "@/game/engine";
 import { useGameStore } from "@/game/store";
-import { formatTime, type RaceRecord } from "@/game/types";
+import {
+  DIFFICULTIES,
+  DIFFICULTY_ORDER,
+  formatTime,
+  type Difficulty,
+  type RaceRecord,
+} from "@/game/types";
 import { SettingsPanel } from "./SettingsPanel";
 
 function useRecords(laps: number) {
@@ -36,6 +42,7 @@ export function TitleScreen({
 }) {
   const [tab, setTab] = useState<"main" | "settings" | "controls">("main");
   const settings = useGameStore((s) => s.settings);
+  const setSettings = useGameStore((s) => s.setSettings);
   const bestTotalMs = useGameStore((s) => s.bestTotalMs);
   const bestLapMs = useGameStore((s) => s.bestLapMs);
   const records = useRecords(settings.laps);
@@ -64,21 +71,21 @@ export function TitleScreen({
       />
       <div className="absolute inset-0 bg-gradient-to-b from-[rgba(43,28,18,0.25)] via-[rgba(43,28,18,0.45)] to-[rgba(43,28,18,0.82)]" aria-hidden />
 
-      <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-1 flex-col items-center px-4 py-6 sm:py-10">
+      <div className="relative z-10 mx-auto flex w-full max-w-5xl flex-1 flex-col items-center px-4 py-3 sm:py-10 [@media(max-height:560px)]:py-2">
         {/* logo */}
-        <div className="mt-2 text-center sm:mt-6">
-          <div className="font-[family-name:var(--font-bungee)] text-[13vw] leading-[0.95] tracking-tight text-[#ffb020] [text-shadow:0_4px_0_#2b1c12,0_10px_30px_rgba(0,0,0,0.45)] sm:text-7xl">
+        <div className="mt-1 text-center sm:mt-6 [@media(max-height:560px)]:mt-0">
+          <div className="font-[family-name:var(--font-bungee)] text-[13vw] leading-[0.95] tracking-tight text-[#ffb020] [text-shadow:0_4px_0_#2b1c12,0_10px_30px_rgba(0,0,0,0.45)] sm:text-7xl [@media(max-height:560px)]:text-[46px]">
             CANYON
             <br />
             <span className="text-[#fff6e6]">RUSH</span>
           </div>
-          <div className="mt-2 inline-block -rotate-1 rounded bg-[#f0641e] px-3 py-1 text-[11px] font-black tracking-[0.3em] text-[#fff6e6] shadow-lg sm:text-xs">
+          <div className="mt-2 inline-block -rotate-1 rounded bg-[#f0641e] px-3 py-1 text-[11px] font-black tracking-[0.3em] text-[#fff6e6] shadow-lg sm:text-xs [@media(max-height:560px)]:mt-1 [@media(max-height:560px)]:text-[9px]">
             SUNSTONE CANYON · STUNT RACING
           </div>
         </div>
 
         {tab === "main" && (
-          <div className="mt-6 flex w-full max-w-3xl flex-1 flex-col items-center gap-5 sm:mt-10">
+          <div className="mt-4 flex w-full max-w-3xl flex-1 flex-col items-center gap-4 sm:mt-10 sm:gap-5 [@media(max-height:560px)]:mt-2 [@media(max-height:560px)]:gap-2">
             <div className="flex w-full flex-col items-center gap-3">
               <button
                 type="button"
@@ -91,6 +98,46 @@ export function TitleScreen({
                   {settings.laps} LAP{settings.laps > 1 ? "S" : ""}
                 </span>
               </button>
+              <div
+                className="mt-1 flex w-72 flex-col items-center gap-1.5 sm:w-80"
+                role="radiogroup"
+                aria-label="Race mode"
+              >
+                <span className="text-[10px] font-black tracking-[0.35em] text-[#ffb020] [text-shadow:0_1px_2px_rgba(43,28,18,0.8)]">
+                  SELECT MODE
+                </span>
+                <div className="flex w-full gap-2">
+                  {DIFFICULTY_ORDER.map((d: Difficulty) => {
+                    const diff = DIFFICULTIES[d];
+                    const selected = settings.difficulty === d;
+                    return (
+                      <button
+                        key={d}
+                        type="button"
+                        role="radio"
+                        aria-checked={selected}
+                        onClick={() => setSettings({ difficulty: d })}
+                        className={`flex-1 -skew-x-6 rounded-md border-2 px-2 py-2 font-[family-name:var(--font-bungee)] text-sm tracking-wide transition-all active:translate-y-0.5 ${
+                          selected
+                            ? "border-[#2b1c12] text-[#fff6e6] shadow-[0_4px_0_#2b1c12] " +
+                              (d === "easy"
+                                ? "bg-[#2f9e63]"
+                                : d === "medium"
+                                  ? "bg-[#ffb020] text-[#2b1c12]"
+                                  : "bg-[#d64530]")
+                            : "border-[rgba(43,28,18,0.55)] bg-[rgba(255,246,230,0.14)] text-[#f6e3c2] backdrop-blur-[2px] hover:bg-[rgba(255,246,230,0.28)]"
+                        }`}
+                      >
+                        <span className="block skew-x-6">{diff.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <p className="text-center text-[11px] font-semibold text-[#f6e3c2]/90">
+                  {DIFFICULTIES[settings.difficulty].hint}
+                </p>
+              </div>
+
               <div className="flex gap-3">
                 <button
                   type="button"

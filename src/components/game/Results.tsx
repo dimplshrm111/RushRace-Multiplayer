@@ -2,7 +2,13 @@
 
 import { useEffect, useState } from "react";
 import { useGameStore } from "@/game/store";
-import { formatTime, type RaceRecord, type ResultsData, type StandingEntry } from "@/game/types";
+import {
+  DIFFICULTIES,
+  formatTime,
+  type RaceRecord,
+  type ResultsData,
+  type StandingEntry,
+} from "@/game/types";
 
 function Stat({ label, value, big = false }: { label: string; value: string; big?: boolean }) {
   return (
@@ -69,7 +75,7 @@ export function Results({ data, onRetry, onTitle }: { data: ResultsData; onRetry
             >
               P{data.position}/{data.totalCars}
             </span>
-            <span>SUNSTONE CANYON · {data.laps} LAP{data.laps > 1 ? "S" : ""}</span>
+            <span>SUNSTONE CANYON · {DIFFICULTIES[settings.difficulty].label} · {data.laps} LAP{data.laps > 1 ? "S" : ""}</span>
           </div>
         </div>
 

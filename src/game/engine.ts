@@ -1,10 +1,11 @@
 "use client";
 
 import * as THREE from "three";
-import { Track, SUN_DIR } from "./track";
+import { Track, SUN_DIR, type TrackBox } from "./track";
 import { CarVisual } from "./car";
 import { CarPhysics } from "./physics";
 import { ParticleSystem } from "./particles";
+import { DebrisSystem } from "./debris";
 import { AudioSystem } from "./audio";
 import { InputManager } from "./input";
 import { gameStore } from "./store";
@@ -49,6 +50,7 @@ export class GameEngine {
   ghostCar: CarVisual;
   physics: CarPhysics;
   particles = new ParticleSystem();
+  debris: DebrisSystem;
   private audio: AudioSystem;
   private input: InputManager;
   private cbs: EngineCallbacks;
@@ -166,6 +168,8 @@ export class GameEngine {
     this.track = new Track();
     this.scene.add(this.track.group);
     this.scene.add(this.particles.group);
+    this.debris = new DebrisSystem(isMobile);
+    this.scene.add(this.debris.group);
 
     // cars
     this.car = new CarVisual(false);
@@ -179,11 +183,23 @@ export class GameEngine {
       const op = new Opponent(OPPONENTS[i], this.track, OPPONENT_GRID_LAT[i]);
       // rival crate smashes shatter too (debris + a soft distant crack)
       op.boxHitHook = (box) => {
-        box.respawnAt = this.time * 1000 + BOX_RESPAWN_MS;
-        this.particles.emitShards(box.x, box.y, box.z, 9);
+        const v = op.physics.vel;
+        const sp = Math.hypot(v.x, v.z);
+        const dirX = sp > 2 ? v.x / sp : 0;
+        const dirZ = sp > 2 ? v.z / sp : 1;
+        const power = clamp(6 + sp * 0.5, 7, 20);
+        let n = 0;
+        for (const b of this.track.boxes) {
+          if (b.cluster !== box.cluster || (!b.active && b !== box)) continue;
+          this.smashBox(b, dirX, dirZ, power, n * 0.045);
+          n++;
+        }
         const d = box.x - this.physics.pos.x;
         const dz = box.z - this.physics.pos.z;
-        if (d * d + dz * dz < 70 * 70) this.audio.boxHit();
+        if (d * d + dz * dz < 70 * 70) {
+          if (box.wall) this.audio.wallSmash();
+          else this.audio.boxHit();
+        }
       };
       this.scene.add(op.visual.group);
       this.opponents.push(op);
@@ -229,12 +245,34 @@ export class GameEngine {
         this.input.rumble(0.25, 90);
       },
       onBoxHit: (box) => {
-        // crate shattered under the player — schedule respawn, breakables FX
-        box.respawnAt = this.time * 1000 + BOX_RESPAWN_MS;
-        this.audio.boxHit();
-        this.particles.emitShards(box.x, box.y, box.z, 14);
-        this.trauma = Math.min(1, this.trauma + 0.16);
-        this.input.rumble(0.3, 130);
+        // the whole stack / barricade shatters — chain-break every piece of
+        // the cluster, with a tiny stagger so the break ripples outward
+        const v = this.physics.vel;
+        const sp = Math.hypot(v.x, v.z);
+        const dirX = sp > 2 ? v.x / sp : Math.sin(this.physics.yaw);
+        const dirZ = sp > 2 ? v.z / sp : Math.cos(this.physics.yaw);
+        const power = clamp(6 + sp * 0.55, 7, 24);
+        let n = 0;
+        for (const b of this.track.boxes) {
+          if (b.cluster !== box.cluster || (!b.active && b !== box)) continue;
+          this.smashBox(b, dirX, dirZ, power, n * 0.045);
+          n++;
+        }
+        if (box.wall) {
+          this.audio.wallSmash();
+          this.trauma = Math.min(1, this.trauma + 0.38);
+          this.input.rumble(0.55, 240);
+          this.physics.boostMeter = clamp(this.physics.boostMeter + 15, 0, 100);
+          gameStore.getState().pushPopup("smash", "BREAK THROUGH! +15");
+        } else {
+          this.audio.boxHit();
+          this.trauma = Math.min(1, this.trauma + 0.16);
+          this.input.rumble(0.3, 130);
+          if (n > 1) {
+            this.physics.boostMeter = clamp(this.physics.boostMeter + 6, 0, 100);
+            gameStore.getState().pushPopup("smash", "CRATES SMASHED +6");
+          }
+        }
       },
       requestRecovery: () => this.startRecovery(),
     });
@@ -329,11 +367,13 @@ export class GameEngine {
     this.settings = { ...s };
     this.physics.assist = s.assist;
     this.particles.setHighDensity(s.highParticles);
+    this.debris.setHighDensity(s.highParticles);
     this.audio.setVolumes(s.musicVol, s.sfxVol);
     this.input.setMouseSteer(s.mouseSteer);
-    // difficulty: crate traffic + rival pace
+    // difficulty: crate traffic, rival pace, boost economy
     const diff = DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
-    this.track.setActiveBoxes(diff.boxes);
+    this.track.setActiveStacks(diff.stacks);
+    this.physics.boostScale = diff.boostGain;
     for (const op of this.opponents) op.skillScale = diff.aiSkill;
     if (prevShadows !== s.shadows) {
       this.renderer.shadowMap.enabled = s.shadows;
@@ -363,7 +403,7 @@ export class GameEngine {
     this.physics.topSpeed = 0;
     this.placeRaceGrid();
     // fresh crates for the new race (respecting the difficulty limit)
-    this.track.setActiveBoxes((DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium).boxes);
+    this.track.setActiveStacks((DIFFICULTIES[this.settings.difficulty] ?? DIFFICULTIES.medium).stacks);
     this.particles.clearSkids(this.time);
     this.ghostRec = [];
     this.ghostRecT = 0;
@@ -453,6 +493,7 @@ export class GameEngine {
     this.ghostCar.dispose();
     for (const op of this.opponents) op.dispose();
     this.particles.dispose();
+    this.debris.dispose();
     this.renderer.dispose();
   }
 
@@ -501,6 +542,7 @@ export class GameEngine {
     this.updateCamera(dt);
     this.updateSun();
     this.particles.update(dt, this.time);
+    this.debris.update(dt);
     this.updateGateGlow();
     this.track.updateBoxes(this.time * 1000); // smashed crates come back
     this.emitTelemetry();
@@ -854,6 +896,20 @@ export class GameEngine {
   // ============================================================
   // visuals sync & effects
   // ============================================================
+
+  /** Hide one crate/wall segment, schedule its respawn and spray wooden debris. */
+  private smashBox(b: TrackBox, dirX: number, dirZ: number, power: number, delay: number) {
+    b.active = false;
+    b.mesh.visible = false;
+    b.respawnAt = this.time * 1000 + BOX_RESPAWN_MS;
+    this.particles.emitShards(b.x, b.y, b.z, b.wall ? 9 : 7);
+    const groundY = b.y - b.halfH - 0.05;
+    if (b.wall) {
+      this.debris.spawnWallBurst(b.x, b.y, b.z, groundY, dirX, dirZ, power, delay);
+    } else {
+      this.debris.spawnCrateBurst(b.x, b.y, b.z, groundY, dirX, dirZ, power, delay);
+    }
+  }
 
   private syncCarVisual(dt: number) {
     const p = this.physics;
