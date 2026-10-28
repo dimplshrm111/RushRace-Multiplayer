@@ -62,13 +62,17 @@ export class NetClient {
     // unless NEXT_PUBLIC_MP_URL names the public Socket.IO address.
     const configured = process.env.NEXT_PUBLIC_MP_URL;
     const port = typeof window !== "undefined" ? window.location.port : "";
+    const usingVercel = process.env.NEXT_PUBLIC_MP_MODE === "vercel";
     const serverUrl = configured
       ? configured
+      : usingVercel
+        ? window.location.origin
       : port === "81"
         ? "/?XTransformPort=3003"
         : `${window.location.protocol}//${window.location.hostname}:3003`;
 
     const sock = io(serverUrl, {
+      path: usingVercel ? "/api/racing" : "/socket.io/",
       transports: ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: Infinity,
