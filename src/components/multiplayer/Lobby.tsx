@@ -79,6 +79,9 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
   const room = useMPStore((s) => s.room);
   const myId = useMPStore((s) => s.myId);
   const connection = useMPStore((s) => s.connection);
+  const health = useMPStore((s) => s.networkHealth);
+  const age = useMPStore((s) => s.networkAgeMs);
+  const ping = useMPStore((s) => s.ping);
   const [copied, setCopied] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameDraft, setRenameDraft] = useState("");
@@ -200,6 +203,7 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
           </div>
         </div>
 
+        <div role="status" title="UPLINK means this device; REMOTE UPLINK means the other player; DOWNLINK means incoming updates" className="text-center text-[10px] font-bold text-[#f6e3c2]/85">NETWORK: {health.toUpperCase().replaceAll("-", " ")} · {ping || "--"} ms{age >= 0 ? ` · RX ${age} ms` : ""}</div>
         {/* spectate banner */}
         {spectating && (
           <div className="flex items-center gap-2 rounded-lg border-2 border-[#ffb020] bg-[rgba(255,176,32,0.15)] p-2.5 text-xs font-bold text-[#ffe9c9]">
