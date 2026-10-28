@@ -1200,6 +1200,22 @@ setInterval(() => {
   }
 }, RELAY_INTERVAL_MS);
 
+// Diagnostic heartbeat: distinguish a sender that stopped uploading from a
+// receiver whose downstream snapshots are missing. No names or tokens logged.
+setInterval(() => {
+  const now = Date.now();
+  for (const r of rooms.values()) {
+    if (!r.relayOn) continue;
+    const sources = r.order.flatMap((pid) => {
+      const p = r.players.get(pid);
+      return p && p.racing ? [{pid, connected:p.connected, lastInputAgeMs:p.lastStateAt ? now - p.lastStateAt : -1}] : [];
+    });
+    io.to(r.code).emit("mp:diag", {t:now,sources});
+    const stale = sources.filter(p => p.connected && p.lastInputAgeMs > 2000);
+    if (stale.length) console.warn("[mp:network] stale_source", {room:r.code,sources:stale.map(p => ({pid:p.pid,ageMs:p.lastInputAgeMs}))});
+  }
+}, 3000);
+
 // ---------------------------------------------------------------------------
 // housekeeping: abandoned rooms / stale rooms
 // ---------------------------------------------------------------------------
