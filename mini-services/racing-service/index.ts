@@ -520,7 +520,7 @@ function maybeScheduleCompile(r: Room) {
 // ---------------------------------------------------------------------------
 const httpServer = createServer();
 const io = new Server(httpServer, {
-  path: "/socket.io/",
+  path: process.env.VERCEL ? "/api/racing" : "/socket.io/",
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingTimeout: 60000,
   pingInterval: 25000,
