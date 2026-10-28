@@ -1193,7 +1193,9 @@ setInterval(() => {
       players.push({ pid, ...st });
     }
     if (players.length) {
-      io.to(r.code).emit("mp:update", { t: now, players });
+      // Superseded race snapshots are disposable: never queue stale positions
+      // behind slow clients while preserving reliable room/lap/results events.
+      io.to(r.code).volatile.emit("mp:update", { t: now, players });
     }
   }
 }, RELAY_INTERVAL_MS);
