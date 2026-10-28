@@ -8,6 +8,7 @@ import { create } from "zustand";
 import type { MPChatMessage, MPRemoteState, MPResultEntry, MPRoomState } from "./net-types";
 
 export type MPConnection = "offline" | "connecting" | "online";
+export type MPHealth = "offline" | "connecting" | "healthy" | "high-latency" | "downlink-stale" | "uplink-stale" | "remote-uplink-stale";
 /** "none" = multiplayer not open · "home" = create/join screen · "room" = inside a room */
 export type MPScreen = "none" | "home" | "room";
 
@@ -23,6 +24,9 @@ interface MPStore {
   lastChatAt: number;
   toast: { kind: "info" | "error" | "success"; text: string; at: number } | null;
   ping: number;
+  networkHealth: MPHealth;
+  networkAgeMs: number;
+  setNetworkHealth: (health: MPHealth, ageMs: number) => void;
 
   setScreen: (s: MPScreen) => void;
   setConnection: (c: MPConnection) => void;
@@ -50,6 +54,9 @@ export const useMPStore = create<MPStore>((set, get) => ({
   lastChatAt: 0,
   toast: null,
   ping: 0,
+  networkHealth: "offline",
+  networkAgeMs: -1,
+  setNetworkHealth: (health, ageMs) => set({networkHealth:health, networkAgeMs:ageMs}),
 
   setScreen: (s) => set({ screen: s }),
   setConnection: (c) => set({ connection: c }),
