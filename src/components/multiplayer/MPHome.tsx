@@ -12,6 +12,9 @@ import { useMPStore } from "@/game/net-store";
  */
 export function MPHome() {
   const connection = useMPStore((s) => s.connection);
+  const health = useMPStore((s) => s.networkHealth);
+  const age = useMPStore((s) => s.networkAgeMs);
+  const ping = useMPStore((s) => s.ping);
   const setScreen = useMPStore((s) => s.setScreen);
   const [name, setName] = useState(() => NetClient.loadName());
   const [code, setCode] = useState("");
@@ -107,6 +110,7 @@ export function MPHome() {
           {connection === "online" ? "SERVER ONLINE" : connection === "connecting" ? "CONNECTING…" : "SERVER OFFLINE"}
         </div>
 
+        <div role="status" title="Local network diagnosis" className="text-[10px] font-bold text-[#f6e3c2]/85">NETWORK: {health.toUpperCase().replaceAll("-", " ")} · {ping || "--"} ms{age >= 0 ? ` · RX ${age} ms` : ""}</div>
         {/* name */}
         <label className="w-full">
           <span className="mb-1 block text-[10px] font-black tracking-[0.3em] text-[#ffb020]">YOUR NAME</span>
