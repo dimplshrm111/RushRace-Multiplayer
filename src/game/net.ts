@@ -72,8 +72,8 @@ export class NetClient {
         : `${window.location.protocol}//${window.location.hostname}:3003`;
 
     const sock = io(serverUrl, {
-      path: usingVercel ? "/api/racing" : "/socket.io/",
-      transports: ["websocket", "polling"],
+      path: usingVercel ? "/api/racing/socket.io" : "/socket.io/",
+      transports: usingVercel ? ["websocket"] : ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 800,
