@@ -1,0 +1,36 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "services": {
+    "web": {
+      "root": ".",
+      "framework": "nextjs",
+      "buildCommand": "bun run build",
+      "installCommand": "bun install"
+    },
+    "racing": {
+      "root": "mini-services/racing-service",
+      "entrypoint": "index.ts",
+      "framework": "node"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/racing",
+      "destination": {
+        "service": "racing"
+      }
+    },
+    {
+      "source": "/api/racing/(.*)",
+      "destination": {
+        "service": "racing"
+      }
+    },
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "web"
+      }
+    }
+  ]
+}
