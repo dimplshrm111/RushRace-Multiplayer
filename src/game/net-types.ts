@@ -1,4 +1,5 @@
 /** Multiplayer protocol types shared by the net client + UI (server mirror). */
+import type { MapId } from "./types";
 
 export const MP_MAX_PLAYERS = 10;
 
@@ -25,6 +26,7 @@ export interface MPRoomState {
   hostId: string;
   phase: MPRoomPhase;
   laps: number;
+  map: MapId;
   maxPlayers: number;
   startAt: number | null;
   players: MPRoomPlayer[];

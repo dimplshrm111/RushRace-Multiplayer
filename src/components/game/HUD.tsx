@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 import type { GameEngine } from "@/game/engine";
 import { useGameStore } from "@/game/store";
 import { useMPStore } from "@/game/net-store";
-import { DIFFICULTIES, formatDelta, formatTime, type Telemetry } from "@/game/types";
+import { DIFFICULTIES, formatTime, type Telemetry } from "@/game/types";
 
 interface MinimapData {
   canvas: HTMLCanvasElement;
@@ -24,9 +24,6 @@ export function HUD({
 }) {
   const speedRef = useRef<HTMLDivElement>(null);
   const gearRef = useRef<HTMLSpanElement>(null);
-  const boostRef = useRef<HTMLDivElement>(null);
-  const boostLabelRef = useRef<HTMLSpanElement>(null);
-  const nitroRef = useRef<HTMLDivElement>(null);
   const nitroLabelRef = useRef<HTMLSpanElement>(null);
   const nitroBtnRef = useRef<HTMLDivElement>(null);
   const surfaceRef = useRef<HTMLDivElement>(null);
@@ -46,22 +43,12 @@ export function HUD({
   const posRef = useRef<HTMLSpanElement>(null);
   const posChipRef = useRef<HTMLDivElement>(null);
 
-  const popups = useGameStore((s) => s.popups);
   const countdownValue = useGameStore((s) => s.countdownValue);
-  const prunePopups = useGameStore((s) => s.prunePopups);
   const bestTotalMs = useGameStore((s) => s.bestTotalMs);
   const difficulty = useGameStore((s) => s.settings.difficulty);
-  // online races force equal (medium) handling — the chip must not claim a
-  // solo difficulty there
   const inMPRoom = useMPStore((s) => s.screen === "room" && s.room != null);
 
   const goFlashRef = useRef<HTMLDivElement>(null);
-
-  // prune old popups
-  useEffect(() => {
-    const iv = setInterval(() => prunePopups(Date.now()), 400);
-    return () => clearInterval(iv);
-  }, [prunePopups]);
 
   // GO! flash
   useEffect(() => {
@@ -76,11 +63,7 @@ export function HUD({
     }
   }, [countdownValue]);
 
-  // (rear-view mirror: the ENGINE paints this live view as a scissored pass
-  // directly into the WebGL canvas behind this HUD — no 2D canvas, no pixel
-  // readback, no blit loop. The slot below just marks the screen region.)
-
-  // telemetry via direct DOM updates (no react re-render)
+  // Telemetry updates directly into the DOM for 60fps performance without React re-renders
   useEffect(() => {
     const engine = engineRef.current;
     if (!engine) return;
@@ -88,43 +71,17 @@ export function HUD({
     const unsub = engine.onTelemetry((t: Telemetry) => {
       if (speedRef.current) speedRef.current.textContent = String(Math.max(0, Math.round(t.speedKmh)));
       if (gearRef.current) gearRef.current.textContent = t.speedKmh < 1 ? "N" : String(t.gear);
-      if (boostRef.current) {
-        boostRef.current.style.width = `${t.boostMeter}%`;
-        boostRef.current.style.background = t.boosting
-          ? "linear-gradient(90deg,#ffd23f,#ff6a2a)"
-          : t.boostMeter > 70
-            ? "linear-gradient(90deg,#ffb020,#ff8a1f)"
-            : "linear-gradient(90deg,#e8a04c,#d97a2e)";
-      }
-      if (boostLabelRef.current) boostLabelRef.current.textContent = t.boosting ? "BOOST!" : "BOOST";
-      // nitro meter (separate from the drift/near-miss boost bank)
-      if (nitroRef.current) {
-        nitroRef.current.style.width = `${t.nitro}%`;
-        nitroRef.current.style.background = t.nitroActive
-          ? "linear-gradient(90deg,#ffd23f,#ff3a1f)"
-          : t.nitro > 50
-            ? "linear-gradient(90deg,#ff8a3f,#f0641e)"
-            : t.nitro > 15
-              ? "linear-gradient(90deg,#d97a2e,#c45a1e)"
-              : "linear-gradient(90deg,#7a3a1e,#5a2810)";
-      }
       if (nitroLabelRef.current) {
-        nitroLabelRef.current.textContent = t.nitroActive
-          ? "NITRO!"
-          : t.nitro < 5
-            ? "EMPTY"
-            : t.nitro > 95
-              ? "READY"
-              : "NITRO";
+        nitroLabelRef.current.textContent = `${Math.round(t.nitro)}%`;
       }
       if (nitroBtnRef.current) {
-        // the on-screen NITRO key indicator pulses while active
         nitroBtnRef.current.style.boxShadow = t.nitroActive
           ? "0 0 18px 4px rgba(255,210,63,0.85)"
           : "0 0 0 0 rgba(255,210,63,0)";
         nitroBtnRef.current.style.borderColor = t.nitro > 15 ? "#ffd23f" : "#7a3a1e";
       }
-      // surface chip — shows the current driving surface (TARMAC/DIRT/SAND/…)
+
+      // surface chip
       if (surfaceRef.current) surfaceRef.current.textContent = t.surfaceLabel;
       if (surfaceChipRef.current) {
         surfaceChipRef.current.style.background = t.surfaceColour;
@@ -158,7 +115,8 @@ export function HUD({
         cpRef.current.textContent = `${d}m`;
         cpDotRef.current.style.left = `${Math.round(t.progressPct * 100)}%`;
       }
-      // minimap car dot + rival blips (percent-based so it tracks the CSS size)
+
+      // Minimap dots
       const mm = minimapDataRef.current;
       if (mm && engine) {
         const p = engine.physics.pos;
@@ -185,7 +143,7 @@ export function HUD({
     return unsub;
   }, [engineRef]);
 
-  // build the minimap path once
+  // Build minimap path once
   useEffect(() => {
     const engine = engineRef.current;
     const canvas = minimapRef.current;
@@ -224,7 +182,7 @@ export function HUD({
     ctx.strokeStyle = "rgba(240,100,30,0.9)";
     ctx.lineWidth = 2.5;
     ctx.stroke();
-    // BREAK barricades — amber hazard diamonds so you see them coming
+
     for (const w of walls) {
       const x = ox + w.x * scale;
       const y = oy + w.z * scale;
@@ -247,172 +205,168 @@ export function HUD({
     minimapDataRef.current = { canvas, scale, ox, oy, w: W, h: H };
   }, [engineRef]);
 
+  const cycleCamera = () => {
+    const st = useGameStore.getState();
+    const next = ((st.settings.cameraMode + 1) % 3) as 0 | 1 | 2;
+    st.setSettings({ cameraMode: next });
+  };
+
   return (
     <div className="pointer-events-none absolute inset-0 z-10 font-[family-name:var(--font-geist-sans)]">
-      {/* top center: lap + position + times */}
-      <div className="absolute left-1/2 top-3 flex -translate-x-1/2 flex-col items-center gap-1">
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-2 rounded-md bg-[rgba(43,28,18,0.72)] px-3 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px]">
-            <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">LAP</span>
-            <span ref={lapRef} className="font-[family-name:var(--font-bungee)] text-lg leading-none">1/3</span>
+      {/* ── TOP CENTER: Lap + Position + Times (safe-area aware) ── */}
+      <div
+        className="race-timing absolute left-1/2 flex -translate-x-1/2 flex-col items-center gap-0.5 sm:gap-1"
+        style={{ top: "max(6px, env(safe-area-inset-top, 6px))" }}
+      >
+        <div className="flex items-center gap-1 sm:gap-2">
+          <div className="flex items-center gap-1 sm:gap-2 rounded-md bg-[rgba(43,28,18,0.78)] px-2 py-0.5 sm:px-2.5 sm:py-1 text-[#fff6e6] shadow-lg backdrop-blur-sm">
+            <span className="text-[8px] sm:text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">LAP</span>
+            <span ref={lapRef} className="font-[family-name:var(--font-bungee)] text-sm sm:text-lg leading-none">1/3</span>
           </div>
-          <div ref={posChipRef} className="flex items-center gap-2 rounded-md bg-[rgba(43,28,18,0.72)] px-3 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px] transition-colors">
-            <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">POS</span>
-            <span ref={posRef} className="font-[family-name:var(--font-bungee)] text-lg leading-none">4/4</span>
+          <div ref={posChipRef} className="flex items-center gap-1 sm:gap-2 rounded-md bg-[rgba(43,28,18,0.78)] px-2 py-0.5 sm:px-2.5 sm:py-1 text-[#fff6e6] shadow-lg backdrop-blur-sm transition-colors">
+            <span className="text-[8px] sm:text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">POS</span>
+            <span ref={posRef} className="font-[family-name:var(--font-bungee)] text-sm sm:text-lg leading-none">4/4</span>
           </div>
-          <div className="flex items-center rounded-md bg-[rgba(43,28,18,0.72)] px-2.5 py-1 text-[#fff6e6] shadow-lg backdrop-blur-[2px]">
-            <span className="text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">MODE</span>
-            <span className="ml-1.5 font-[family-name:var(--font-bungee)] text-sm leading-none">
+          <div className="flex items-center rounded-md bg-[rgba(43,28,18,0.78)] px-1.5 sm:px-2.5 py-0.5 sm:py-1 text-[#fff6e6] shadow-lg backdrop-blur-sm">
+            <span className="text-[8px] sm:text-[10px] font-bold tracking-[0.2em] text-[#ffb020]">MODE</span>
+            <span className="ml-1 sm:ml-1.5 font-[family-name:var(--font-bungee)] text-[11px] sm:text-sm leading-none">
               {inMPRoom ? "ONLINE" : DIFFICULTIES[difficulty].short}
             </span>
           </div>
         </div>
-        <div ref={timeRef} className="font-[family-name:var(--font-bungee)] text-2xl leading-none text-[#2b1c12] [text-shadow:0_2px_0_rgba(255,246,230,0.65)] sm:text-3xl">
+        <div ref={timeRef} className="font-[family-name:var(--font-bungee)] text-xl leading-none text-[#2b1c12] [text-shadow:0_2px_0_rgba(255,246,230,0.75)] sm:text-3xl">
           0:00.00
         </div>
-        <div className="flex items-center gap-2 text-[11px] font-semibold text-[#5a3c28]">
+        <div className="flex items-center gap-1.5 sm:gap-2 text-[9px] sm:text-[11px] font-semibold text-[#5a3c28]">
           <span>TOTAL <span ref={totalRef} className="tabular-nums">0:00.00</span></span>
-          <span className="text-[#fff6e6] [text-shadow:0_1px_2px_rgba(43,28,18,0.7)]">BEST <span ref={bestRef} className="tabular-nums">{formatTime(bestTotalMs)}</span></span>
+          <span className="text-[#fff6e6] [text-shadow:0_1px_2px_rgba(43,28,18,0.8)]">BEST <span ref={bestRef} className="tabular-nums">{formatTime(bestTotalMs)}</span></span>
         </div>
-        {/* lap progress rail */}
-        <div className="relative h-1.5 w-40 rounded-full bg-[rgba(43,28,18,0.35)] sm:w-52">
-          <div ref={cpDotRef} className="absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#fff6e6] bg-[#f0641e] shadow" style={{ left: "0%" }} />
+        {/* Lap progress rail */}
+        <div className="relative h-1 sm:h-1.5 w-28 sm:w-52 rounded-full bg-[rgba(43,28,18,0.35)]">
+          <div ref={cpDotRef} className="absolute top-1/2 h-2 w-2 sm:h-2.5 sm:w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#fff6e6] sm:border-2 bg-[#f0641e] shadow" style={{ left: "0%" }} />
         </div>
       </div>
 
-      {/* top left: minimap + next checkpoint */}
-      <div className="absolute left-3 top-3 flex flex-col gap-1">
-        <div className="relative rounded-lg bg-[rgba(255,246,230,0.82)] p-1 shadow-lg backdrop-blur-[2px]">
-          <canvas ref={minimapRef} width={148} height={118} className="block h-[86px] w-[108px] sm:h-[118px] sm:w-[148px]" aria-label="Track minimap" />
-          {/* rival blips — up to 9 network/AI rivals (10-car rooms) */}
+      {/* ── TOP LEFT: Minimap + Next Checkpoint ── */}
+      <div
+        className="race-minimap pointer-events-none absolute flex flex-col gap-1"
+        style={{
+          top: "max(8px, env(safe-area-inset-top, 8px))",
+          left: "max(8px, env(safe-area-inset-left, 8px))",
+        }}
+      >
+        <div className="relative rounded-lg border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.88)] p-1 shadow-md backdrop-blur-sm">
+          <div className="relative">
+          <canvas ref={minimapRef} width={148} height={118} className="block h-[86px] w-[110px] sm:h-[118px] sm:w-[148px]" aria-label="Track minimap" />
+          {/* Rival blips */}
           {Array.from({ length: 9 }, (_, i) => (
             <div
               key={i}
               ref={(el) => {
                 aiDotsRef.current[i] = el;
               }}
-              className="absolute h-[7px] w-[7px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#fff6e6] opacity-0 shadow"
+              className="absolute h-[6px] w-[6px] sm:h-[7px] sm:w-[7px] -translate-x-1/2 -translate-y-1/2 rounded-full border border-[#fff6e6] opacity-0 shadow"
               style={{ left: "-20%", top: "-20%" }}
             />
           ))}
-          {/* player dot */}
+          {/* Player dot */}
           <div
             ref={carDotRef}
-            className="absolute h-[9px] w-[9px] -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#fff6e6] bg-[#f0641e] shadow"
+            className="absolute h-[8px] w-[8px] sm:h-[9px] sm:w-[9px] -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[#fff6e6] bg-[#f0641e] shadow"
             style={{ left: "-20%", top: "-20%" }}
           />
+          </div>
         </div>
-        <div className="flex w-fit items-center gap-1.5 self-start rounded bg-[rgba(43,28,18,0.72)] px-2 py-0.5 text-[10px] font-bold tracking-wider text-[#fff6e6]">
+        <div className="flex w-fit items-center gap-1 rounded bg-[rgba(43,28,18,0.85)] px-2 py-0.5 text-[9px] sm:text-[10px] font-bold tracking-wider text-[#fff6e6] shadow-sm">
           <span className="text-[#ffb020]">NEXT CP</span>
           <span ref={cpRef} className="tabular-nums">0m</span>
         </div>
       </div>
 
-      {/* rear-view mirror — small live camera on the LEFT side, below the minimap.
-          The engine renders this slot's screen region as a scissored second
-          pass on the main WebGL canvas (road + approaching cars behind you). */}
-      <div className="absolute left-3 top-[200px] flex flex-col gap-0.5 sm:top-[260px]">
-        <div className="flex items-center gap-1.5 rounded-t-md bg-[rgba(43,28,18,0.82)] px-2 py-0.5 text-[9px] font-black tracking-[0.25em] text-[#ffd23f] shadow-lg backdrop-blur-[2px]">
-          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#d64530]" />
-          REAR
+      {/* ── REAR-VIEW CAMERA & MIRROR:
+          Desktop: Bottom-Right corner
+          Mobile: Top-Right (tucked beside Pause button)
+          Live Three.js scissored pass paints directly into #rear-view-slot
+      ── */}
+      <div
+        className="race-mirror pointer-events-auto absolute flex flex-col gap-0.5 transition-all
+          /* Mobile layout: Top-Right corner next to pause */
+          top-2 sm:top-auto sm:right-4 sm:bottom-4"
+        style={{
+          top: "max(8px, env(safe-area-inset-top, 8px))",
+          right: "max(54px, calc(env(safe-area-inset-right, 10px) + 44px))",
+        }}
+      >
+        <div className="flex items-center justify-between rounded-t-md bg-[rgba(43,28,18,0.85)] px-1.5 py-0.5 text-[8px] sm:text-[9px] font-black tracking-[0.2em] text-[#ffd23f] shadow-lg backdrop-blur-sm">
+          <div className="flex items-center gap-1">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#d64530]" />
+            <span className="hidden xs:inline">REAR VIEW</span>
+            <span className="xs:hidden">REAR</span>
+          </div>
+          {/* Camera cycle button */}
+          <button
+            type="button"
+            onClick={cycleCamera}
+            className="ml-1.5 flex items-center gap-1 rounded bg-[rgba(255,255,255,0.18)] px-1.5 py-0.5 text-[8px] font-bold text-[#fff6e6] hover:bg-[rgba(255,255,255,0.3)] active:scale-95"
+            aria-label="Switch camera angle"
+            title="Switch camera angle (C)"
+          >
+            <span>📷</span>
+            <span className="hidden sm:inline">CAM [C]</span>
+          </button>
         </div>
-        {/* TRANSPARENT slot — the engine's scissored pass paints the WebGL
-            canvas directly behind this element; any background here would
-            cover the mirror. The border frames it; rounded corners clip
-            nothing (the GL scissor is square — imperceptible at this size). */}
+        {/* Scissored WebGL canvas viewport */}
         <div
           id="rear-view-slot"
-          className="block h-[72px] w-[128px] rounded-b-md border-2 border-t-0 border-[#2b1c12] shadow-lg sm:h-[90px] sm:w-[160px]"
-          role="img"
-          aria-label="Rear view mirror"
+          onClick={cycleCamera}
+          className="block h-[44px] w-[78px] cursor-pointer rounded-b-md border-2 border-t-0 border-[#2b1c12] bg-transparent shadow-lg sm:h-[86px] sm:w-[152px]"
+          role="button"
+          aria-label="Rear view mirror - Click to switch camera"
+          title="Click to switch camera angle"
         />
       </div>
 
-      {/* wrong way */}
+      {/* ── WRONG WAY WARNING ── */}
       <div ref={wrongRef} className="absolute left-1/2 top-1/3 -translate-x-1/2 rounded-md bg-[#d64530] px-5 py-2 font-[family-name:var(--font-bungee)] text-xl text-[#fff6e6] opacity-0 shadow-xl transition-opacity [text-shadow:0_2px_0_rgba(43,28,18,0.4)]">
         ⚠ WRONG WAY
       </div>
 
-      {/* bottom left: speed + boost */}
-      <div className="absolute bottom-3 left-3 flex flex-col gap-2">
-        <div className="flex items-end gap-2">
-          <div ref={speedRef} className="font-[family-name:var(--font-bungee)] text-5xl leading-none text-[#2b1c12] [text-shadow:0_3px_0_rgba(255,246,230,0.7)] sm:text-6xl">
+      {/* Speed sits above the steering controls on touch devices. */}
+      <div
+        className="race-speed pointer-events-none absolute flex flex-col items-center gap-1
+          bottom-2 left-[max(10px,env(safe-area-inset-left,10px))] items-start
+          sm:bottom-4 sm:left-[max(12px,env(safe-area-inset-left,12px))] sm:gap-2"
+      >
+        <div className="flex items-end gap-1.5 sm:gap-2 rounded-lg border border-[#2b1c12]/40 bg-[rgba(255,246,230,0.88)] px-2 py-0.5 shadow-sm backdrop-blur-sm sm:border-0 sm:bg-transparent sm:p-0 sm:shadow-none sm:backdrop-blur-none">
+          <div ref={speedRef} className="font-[family-name:var(--font-bungee)] text-3xl leading-none text-[#2b1c12] [text-shadow:0_2px_0_rgba(255,246,230,0.7)] sm:text-6xl">
             0
           </div>
-          <div className="mb-1 flex flex-col">
-            <span className="text-[10px] font-bold tracking-[0.25em] text-[#5a3c28]">KM/H</span>
-            <span className="text-xs font-bold text-[#5a3c28]">GEAR <span ref={gearRef} className="text-[#2b1c12]">N</span></span>
+          <div className="mb-0.5 sm:mb-1 flex flex-col">
+            <span className="text-[8px] sm:text-[10px] font-bold tracking-[0.25em] text-[#5a3c28]">KM/H</span>
+            <span className="text-[10px] sm:text-xs font-bold text-[#5a3c28]">GEAR <span ref={gearRef} className="text-[#2b1c12]">N</span></span>
+          </div>
+          {/* Desktop Nitro key hint */}
+          <div
+            ref={nitroBtnRef}
+            className="race-nitro-hint hidden sm:flex w-fit items-center gap-1 rounded border-2 bg-[rgba(43,28,18,0.72)] px-1.5 py-0.5 text-[9px] font-black tracking-[0.2em] text-[#ffd23f] transition-[box-shadow] duration-100"
+            style={{ borderColor: "#ffd23f" }}
+          >
+            <span>NITRO</span>
+            <span ref={nitroLabelRef} className="tabular-nums">100%</span>
+            <span className="text-[#fff6e6]">[X]</span>
           </div>
         </div>
-        {/* boost meter */}
-        <div className="w-44 sm:w-56">
-          <div className="mb-0.5 flex items-center justify-between">
-            <span ref={boostLabelRef} className="text-[10px] font-black tracking-[0.25em] text-[#2b1c12] [text-shadow:0_1px_0_rgba(255,246,230,0.6)]">BOOST</span>
-          </div>
-          <div className="h-3 overflow-hidden rounded-full border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.6)]">
-            <div ref={boostRef} className="h-full w-0 rounded-full transition-[width] duration-100" style={{ background: "linear-gradient(90deg,#e8a04c,#d97a2e)" }} />
-          </div>
-        </div>
-        {/* nitro meter — separate energy bar; recharges passively in 10s.
-            Bind: X / Numpad0 / Shift / K / touch NITRO button */}
-        <div className="w-44 sm:w-56">
-          <div className="mb-0.5 flex items-center justify-between">
-            <span ref={nitroLabelRef} className="text-[10px] font-black tracking-[0.25em] text-[#2b1c12] [text-shadow:0_1px_0_rgba(255,246,230,0.6)]">NITRO</span>
-            <span className="text-[9px] font-bold text-[#5a3c28]">X / NUM 0</span>
-          </div>
-          <div className="h-3 overflow-hidden rounded-full border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.6)]">
-            <div ref={nitroRef} className="h-full w-full rounded-full transition-[width] duration-100" style={{ background: "linear-gradient(90deg,#ff8a3f,#f0641e)" }} />
-          </div>
-        </div>
-        {/* surface chip — current driving surface (TARMAC / DIRT / SAND / …) */}
-        <div className="flex w-fit items-center gap-1.5 rounded border-2 border-[#2b1c12] bg-[rgba(255,246,230,0.82)] px-2 py-0.5">
-          <div ref={surfaceChipRef} className="h-2.5 w-2.5 rounded-sm" style={{ background: "#4a4640" }} />
-          <span ref={surfaceRef} className="text-[10px] font-black tracking-[0.2em] text-[#2b1c12]">TARMAC</span>
-        </div>
-        {/* nitro key indicator (keyboard hint + active glow) */}
-        <div
-          ref={nitroBtnRef}
-          className="flex w-fit items-center gap-1.5 rounded border-2 bg-[rgba(43,28,18,0.72)] px-2 py-0.5 text-[10px] font-black tracking-[0.2em] text-[#ffd23f] transition-[box-shadow] duration-100"
-          style={{ borderColor: "#ffd23f" }}
-        >
-          <span>NITRO</span>
-          <span className="text-[#fff6e6]">[X]</span>
-        </div>
+
       </div>
 
-      {/* drift chain chip */}
+      {/* ── DRIFT MULTIPLIER ── */}
       <div ref={driftRef} className="absolute bottom-24 left-1/2 -translate-x-1/2 rounded-md bg-[#ffb020] px-4 py-1.5 font-[family-name:var(--font-bungee)] text-lg text-[#2b1c12] opacity-0 shadow-xl transition-opacity [text-shadow:0_1px_0_rgba(255,246,230,0.6)]">
         DRIFT <b>x1.0</b>
       </div>
 
-      {/* event popups */}
-      <div className="absolute left-1/2 top-[22%] flex -translate-x-1/2 flex-col items-center gap-1.5">
-        {popups.map((p) => (
-          <div
-            key={p.id}
-            className={`popup-anim rounded-md px-4 py-1.5 font-[family-name:var(--font-bungee)] text-base shadow-xl [text-shadow:0_1px_0_rgba(43,28,18,0.35)] sm:text-lg ${
-              p.type === "wrongway"
-                ? "bg-[#d64530] text-[#fff6e6]"
-                : p.type === "checkpoint"
-                  ? "bg-[rgba(43,28,18,0.85)] text-[#fff6e6]"
-                  : p.type === "newrecord"
-                    ? "bg-[#2f9e63] text-[#fff6e6]"
-                    : p.type === "smash"
-                      ? "bg-[#f0641e] text-[#fff6e6]"
-                      : "bg-[rgba(255,246,230,0.94)] text-[#2b1c12]"
-            }`}
-          >
-            {p.text}
-            {p.type === "checkpoint" && p.deltaMs != null && (
-              <span className={`ml-2 ${p.deltaMs < 0 ? "text-[#7ee2a8]" : "text-[#ff9a8a]"}`}>
-                {formatDelta(p.deltaMs)}
-              </span>
-            )}
-          </div>
-        ))}
-      </div>
 
-      {/* countdown */}
+
+      {/* ── COUNTDOWN OVERLAY ── */}
       {countdownActive && countdownValue > 0 && (
         <div
           key={countdownValue}

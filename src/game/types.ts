@@ -34,6 +34,8 @@ export const PALETTE = {
 export type GamePhase = "title" | "countdown" | "racing" | "finished";
 export type CameraMode = 0 | 1 | 2; // 0 chase near, 1 chase far, 2 hood
 export type Difficulty = "easy" | "medium" | "hard";
+export type MapId = "canyon" | "city";
+export const MAP_NAMES: Record<MapId, string> = { canyon: "SUNSTONE CANYON", city: "NEON HARBOR" };
 
 /**
  * Difficulty presets.
@@ -86,32 +88,32 @@ export const DIFFICULTIES: Record<Difficulty, DifficultyPreset> = {
   medium: {
     label: "MEDIUM",
     short: "MED",
-    stacks: 9,
-    aiSkill: 1.0,
-    aiSpeedCap: 1.0,
-    boostGain: 1.0,
-    startBoost: 35,
-    aiMistakeEvery: 26,
-    rubberAhead: 0.05,
-    rubberBehind: 0.055,
-    aiBoostAggro: 0.55,
-    blocking: false,
-    hint: "The standard canyon challenge",
+    stacks: 11,
+    aiSkill: 1.22,
+    aiSpeedCap: 1.18,
+    boostGain: 0.7,
+    startBoost: 15,
+    aiMistakeEvery: 0,
+    rubberAhead: 0.22,
+    rubberBehind: 0.01,
+    aiBoostAggro: 0.85,
+    blocking: true,
+    hint: "Ruthless rivals · pro racing line · ~10% win rate",
   },
   hard: {
     label: "HARD",
     short: "HARD",
     stacks: 14,
-    aiSkill: 1.26,
-    aiSpeedCap: 1.21,
-    boostGain: 0.6,
-    startBoost: 22,
+    aiSkill: 1.44,
+    aiSpeedCap: 1.32,
+    boostGain: 0.4,
+    startBoost: 0,
     aiMistakeEvery: 0,
-    rubberAhead: 0.16,
-    rubberBehind: 0.01,
+    rubberAhead: 0.35,
+    rubberBehind: 0.0,
     aiBoostAggro: 1.0,
     blocking: true,
-    hint: "Flawless nitro-burning rivals block & out-run you · assists off",
+    hint: "Near-impossible machine pace · 300+ km/h nitro · only 5% win rate · assists off",
   },
 };
 
@@ -124,6 +126,7 @@ export const BOX_RESPAWN_MS = 15000;
 export const WALL_RESPAWN_MS = 30000;
 
 export interface GameSettings {
+  map: MapId;
   assist: boolean;
   mouseSteer: boolean;
   cameraMode: CameraMode;
@@ -136,6 +139,7 @@ export interface GameSettings {
 }
 
 export const DEFAULT_SETTINGS: GameSettings = {
+  map: "canyon",
   assist: true,
   mouseSteer: false,
   cameraMode: 0,

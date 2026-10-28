@@ -20,7 +20,7 @@ import { net } from "@/game/net";
 import { useMPStore } from "@/game/net-store";
 import { useGameStore } from "@/game/store";
 import { carModelName } from "@/game/cars";
-import { formatTime, type StandingEntry } from "@/game/types";
+import { formatTime, MAP_NAMES, type MapId, type StandingEntry } from "@/game/types";
 import type { GameEngine } from "@/game/engine";
 import { ChatPanel } from "./ChatPanel";
 
@@ -303,6 +303,12 @@ export function Lobby({ engineRef }: { engineRef: React.RefObject<GameEngine | n
             {/* race controls */}
             {room.phase === "lobby" ? (
               <div className="flex flex-col gap-2">
+                <div className="flex items-center justify-between gap-2 rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.88)] px-3 py-2">
+                  <span className="text-[10px] font-black tracking-[0.3em] text-[#ffb020]">TRACK</span>
+                  {isHost ? <div className="flex gap-1" role="radiogroup" aria-label="Race track">
+                    {(["canyon", "city"] as MapId[]).map((map) => <button key={map} type="button" role="radio" aria-checked={room.map === map} onClick={() => void net.setMap(map)} className={`rounded px-2 py-1 text-[10px] font-black ${room.map === map ? "bg-[#ffb020] text-[#2b1c12]" : "text-[#fff6e6]"}`}>{MAP_NAMES[map]}</button>)}
+                  </div> : <span className="text-xs font-bold text-[#fff6e6]">{MAP_NAMES[room.map]}</span>}
+                </div>
                 {/* laps (host) */}
                 <div className="flex items-center justify-between rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.88)] px-3 py-2 shadow-lg">
                   <span className="text-[10px] font-black tracking-[0.3em] text-[#ffb020]">RACE LENGTH</span>

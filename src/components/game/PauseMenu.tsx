@@ -26,7 +26,7 @@ export function PauseMenu({
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-[rgba(43,28,18,0.62)] p-4 backdrop-blur-[3px]">
-      <div className="w-full max-w-sm rounded-xl border-[3px] border-[#2b1c12] bg-[#fff6e6]/97 p-5 shadow-2xl">
+      <div className="w-full max-w-sm max-h-[92vh] overflow-y-auto settings-scroll rounded-xl border-[3px] border-[#2b1c12] bg-[#fff6e6]/97 p-4 sm:p-5 shadow-2xl">
         <h2 className="text-center font-[family-name:var(--font-bungee)] text-4xl text-[#2b1c12]">PAUSED</h2>
         <p className="mb-4 text-center text-[10px] font-black tracking-[0.3em] text-[#8a6a4e]">SUNSTONE CANYON</p>
 

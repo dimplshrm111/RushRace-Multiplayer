@@ -18,7 +18,7 @@ import type {
   MPRoomState,
 } from "./net-types";
 import type { GameEngine } from "./engine";
-import type { ResultsData } from "./types";
+import type { MapId, ResultsData } from "./types";
 
 const NAME_KEY = "canyonrush.mp.name";
 const TOKEN_KEY_PREFIX = "canyonrush.mp.token.";
@@ -40,6 +40,10 @@ export class NetClient {
   /** true once this client has entered the current race round */
   racedThisRound = false;
   private disposed = false;
+  private reports: { event: string; payload: unknown }[] = [];
+  private reporting = false;
+  private reportTimer: ReturnType<typeof setTimeout> | null = null;
+  private reportGeneration = 0;
 
   // ------------------------------------------------------------------ socket
   /** Open the connection early (multiplayer screen mount) so the status
@@ -50,7 +54,16 @@ export class NetClient {
 
   private ensureSocket(): Socket {
     if (this.socket) return this.socket;
-    const sock = io("/?XTransformPort=3003", {
+
+    // In direct dev mode (e.g. browsing port 3000 directly), connect directly to racing-service on port 3003.
+    // When behind gateway/Caddy (e.g. port 81 or production), route via /?XTransformPort=3003.
+    const isDirectDev = typeof window !== "undefined" && window.location.port === "3000";
+
+    const serverUrl = isDirectDev
+      ? `${window.location.protocol}//${window.location.hostname}:3003`
+      : window.location.port === "81" ? "/?XTransformPort=3003" : "/";
+
+    const sock = io(serverUrl, {
       transports: ["websocket", "polling"],
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -73,6 +86,8 @@ export class NetClient {
             mpStore.getState().showToast("error", "Room no longer exists");
             this.cleanupLocal();
             mpStore.getState().setScreen("home");
+          } else if (ok) {
+            void this.flushReports();
           }
         });
       }
@@ -266,6 +281,7 @@ export class NetClient {
   }
 
   private cleanupLocal() {
+    this.clearReports();
     this.code = null;
     this.token = null;
     this.racedThisRound = false;
@@ -348,6 +364,11 @@ export class NetClient {
     await this.call("mp:settings", { laps });
   }
 
+  async setMap(map: MapId): Promise<void> {
+    const res = await this.call<Ack>("mp:settings", { map });
+    if (!res.ok) mpStore.getState().showToast("error", res.error ?? "Could not change track");
+  }
+
   async sendChat(text: string): Promise<string | null> {
     const res = await this.call<{ ok: boolean; error?: string }>("mp:chat", { text });
     if (!res.ok) return res.error ?? "Message failed";
@@ -360,7 +381,6 @@ export class NetClient {
     if (!eng || !room) return;
     const res = await this.call<{ ok: boolean; error?: string }>("mp:start", {
       laps: room.laps,
-      trackLength: Math.round(eng.track.length),
     });
     if (!res.ok) mpStore.getState().showToast("error", res.error ?? "Could not start");
   }
@@ -379,22 +399,52 @@ export class NetClient {
   }
 
   sendLap(lap: number, lapMs: number) {
-    if (this.socket?.connected && this.racedThisRound) {
+    if (this.racedThisRound) {
       // include current progress so the server's distance validation never
       // races against the 15 Hz state stream
       const prog = this.engine ? +this.engine.physics.progressS.toFixed(1) : 0;
-      this.socket.emit("mp:lap", { lap, lapMs: Math.round(lapMs), prog });
+      this.reports.push({ event: "mp:lap", payload: { lap, lapMs: Math.round(lapMs), prog } });
+      void this.flushReports();
     }
   }
 
   sendFinish(r: ResultsData) {
-    if (this.socket?.connected && this.racedThisRound) {
-      this.socket.emit("mp:finish", {
+    if (this.racedThisRound) {
+      this.reports.push({ event: "mp:finish", payload: {
         totalMs: Math.round(r.totalMs),
         bestLapMs: Math.round(r.bestLapMs),
         topSpeedKmh: Math.round(r.topSpeedKmh),
         driftScore: Math.round(r.driftScore),
-      });
+      } });
+      void this.flushReports();
+    }
+  }
+
+  private clearReports() {
+    this.reportGeneration++;
+    this.reports = [];
+    if (this.reportTimer) clearTimeout(this.reportTimer);
+    this.reportTimer = null;
+  }
+
+  private async flushReports(): Promise<void> {
+    if (this.reporting || !this.socket?.connected || !this.code) return;
+    this.reporting = true;
+    const generation = this.reportGeneration;
+    try {
+      while (this.reports.length && this.socket?.connected && generation === this.reportGeneration) {
+        const report = this.reports[0];
+        const result = await this.call<Ack>(report.event, report.payload);
+        if (generation !== this.reportGeneration) break;
+        if (!result.ok) {
+          this.reportTimer = setTimeout(() => { this.reportTimer = null; void this.flushReports(); }, 2000);
+          break;
+        }
+        this.reports.shift();
+      }
+    } finally {
+      this.reporting = false;
+      if (generation !== this.reportGeneration && this.reports.length) void this.flushReports();
     }
   }
 
@@ -498,6 +548,12 @@ export class NetClient {
 
     const eng = this.engine;
     if (!eng) return;
+    const map = room.map === "city" ? "city" : "canyon";
+    if (gameStore.getState().settings.map !== map) {
+      gameStore.getState().setSettings({ map });
+      gameStore.getState().loadBest(gameStore.getState().settings.laps);
+    }
+    eng.setTrack(map);
     const my = room.players.find((p) => p.id === st.myId);
     if (my) {
       eng.mpMyName = my.name;
@@ -543,6 +599,7 @@ export class NetClient {
     const eng = this.engine;
     const st = mpStore.getState();
     if (!eng || !st.myId || !st.room) return;
+    this.clearReports();
     const my = st.room.players.find((p) => p.id === st.myId);
     st.setFinalResults(null);
     this.racedThisRound = false;
@@ -558,6 +615,7 @@ export class NetClient {
 
   dispose() {
     this.disposed = true;
+    this.clearReports();
     this.detachEngine();
     if (this.clockTimer) {
       clearInterval(this.clockTimer);

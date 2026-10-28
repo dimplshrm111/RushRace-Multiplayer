@@ -1,0 +1,62 @@
+{
+  "id": "/",
+  "name": "Canyon Rush",
+  "short_name": "Canyon Rush",
+  "description": "Blaze through a gigantic sunlit canyon. Drift chains, boosts, big air and wall-rides. An original 3D arcade stunt racer.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f3c98f",
+  "theme_color": "#f0641e",
+  "orientation": "landscape",
+  "icons": [
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/concept/title-canyon.png",
+      "sizes": "1344x768",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "Canyon Rush Sunstone Canyon Circuit"
+    },
+    {
+      "src": "/concept/title-canyon.png",
+      "sizes": "1344x768",
+      "type": "image/png",
+      "label": "Canyon Rush Stunt Racing"
+    },
+    {
+      "src": "/concept/car-buggy.png",
+      "sizes": "1344x768",
+      "type": "image/png",
+      "form_factor": "narrow",
+      "label": "Custom Garage & Stunt Buggy"
+    }
+  ],
+  "categories": ["games", "sports"],
+  "prefer_related_applications": false
+}

@@ -97,11 +97,11 @@ export class Opponent {
   /** exhaust-trail emit timer (engine drives the shared particle pool). */
   trailT = 0;
 
-  private mistakeT = 9;
-  private mistakeLeft = 0;
-  private readonly baseLat: number;
-  private readonly phase = Math.random() * Math.PI * 2;
-  private readonly track: Track;
+  mistakeT = 9;
+  mistakeLeft = 0;
+  readonly baseLat: number;
+  readonly phase = Math.random() * Math.PI * 2;
+  private track: Track;
   private readonly labelTex: THREE.CanvasTexture;
   private readonly labelMat: THREE.SpriteMaterial;
 
@@ -162,12 +162,18 @@ export class Opponent {
     return this.physics.progressS - this.startS;
   }
 
+  setTrack(track: Track) {
+    this.track = track;
+    this.physics.setTrack(track);
+  }
+
   /** Drop onto the grid / scatter point facing forward. */
   place(idx: number, lat: number, speed: number) {
     this.physics.place(idx, lat, speed);
-    // fresh energy every race — same rule as the player ("nitro starts full")
+    // fresh energy every race — on HARD mode rivals start with fully charged drift-boost bank
     this.physics.nitro = 100;
-    this.physics.boostMeter = 40;
+    this.physics.boostMeter =
+      this.brain.skillScale > 1.3 ? 100 : this.brain.skillScale > 1.1 ? 75 : 40;
     this.boostHold = false;
     this.startS = this.physics.progressS;
     this.finishMs = null;
@@ -263,14 +269,15 @@ export function opponentInput(
   const look = 11 + clamp(p.speed * 0.62, 7, 30) * (0.9 + 0.25 * op.def.skill);
   const li = wrapIdxLocal(p.idx + Math.round(look / track.step), track.N);
   const s = track.sample(li);
-  let lat = clamp(op.baseLat * 0.6 + Math.sin(t * 0.14) * 1.3, -4.5, 4.5);
+  const wanderAmp = brain.skillScale > 1.1 ? 0.35 : 1.3;
+  let lat = clamp(op.baseLat * (brain.skillScale > 1.1 ? 0.4 : 0.6) + Math.sin(t * 0.14) * wanderAmp, -4.5, 4.5);
 
   // HARD: defend the racing line — when this rival is just ahead of the
   // player, drift over onto the player's line so they have to out-brake it
   if (brain.blocking && mode === "race") {
     const gap = op.raceDist - ctx.playerDist; // >0 = rival ahead of player
-    if (gap > 0 && gap < 22) {
-      lat = clamp(lat * 0.35 + ctx.playerLat * 0.75, -(s.hw - 2.2), s.hw - 2.2);
+    if (gap > 0 && gap < 28) {
+      lat = clamp(lat * 0.15 + ctx.playerLat * 0.85, -(s.hw - 2.0), s.hw - 2.0);
     }
   }
 
@@ -293,7 +300,8 @@ export function opponentInput(
   const aimX = s.x + s.rx * lat;
   const aimZ = s.z + s.rz * lat;
   const err = angDiff(Math.atan2(aimX - p.pos.x, aimZ - p.pos.z), p.yaw);
-  let steer = clamp(-err * (2.0 + 1.0 * op.def.skill), -1, 1);
+  const steerSharpness = 2.0 + 1.0 * op.def.skill * Math.min(1.35, Math.max(1.0, brain.skillScale));
+  let steer = clamp(-err * steerSharpness, -1, 1);
   if (op.mistakeLeft > 0) steer = clamp(steer + Math.sin(t * 13) * 0.22, -1, 1);
 
   // corner severity ahead
@@ -305,38 +313,52 @@ export function opponentInput(
   // speed target: skill, asymmetric difficulty rubber-band, mistakes
   let speedFactor = op.def.skill * brain.skillScale;
   if (mode === "race") {
-    const band = clamp((ctx.playerDist - op.raceDist) / 200, -1, 1);
+    const gapM = ctx.playerDist - op.raceDist;
+    const band = clamp(gapM / 180, -1, 1.5);
     speedFactor *= 1 + (band >= 0 ? brain.rubberAhead : brain.rubberBehind) * band;
     if (op.mistakeLeft > 0) speedFactor *= 0.72;
   } else {
     speedFactor *= 0.6; // relaxed title-screen cruise
   }
-  speedFactor = clamp(speedFactor, 0.5, 1.42);
+  speedFactor = clamp(speedFactor, 0.5, 1.85);
 
+  const curveWeight = Math.max(3.8, 9.0 - 5.5 * Math.max(0, brain.skillScale - 1.0));
+  const cornerPace = (52 / (1 + dTheta * curveWeight)) * speedFactor;
+  const maxTarget = 52 * p.speedCapScale * Math.min(1.25, speedFactor);
   const target = fullSend
-    ? 55 * speedFactor
-    : clamp(clamp(52 / (1 + dTheta * 9), 15, 52) * speedFactor, 15, 58);
+    ? Math.max(55 * speedFactor, maxTarget)
+    : clamp(cornerPace, 18, Math.max(58, maxTarget));
 
   // --- nitro brain ---
   // Rivals run the SAME nitro system as the player (CarPhysics drains the
   // tank at 33/s while boost is held, refills 10/s when released). The brain
   // fires it on straights, holds while the tank lasts, then lifts to
-  // recharge. boostAggro sets the engagement point and the drain floor, so
-  // HARD rivals dump whole tanks on every straight while EASY ones only tap
-  // a near-full bar. The drift/near-miss bank rides along underneath (both
-  // drain while the button is held) — exactly like the player's controls.
+  // recharge. boostAggro sets the engagement point and the drain floor.
   const energy = p.nitro + p.boostMeter * 0.55;
-  const fireFrom = 100 - 31 * (1 - brain.boostAggro); // aggro 1→100 · .55→84 · .25→77
-  const fireFloor = 8 + 12 * (1 - brain.boostAggro); // aggro 1→8 · .55→13 · .25→17
+  // Dynamic engagement: high aggro fires readily and drains deep
+  const fireFrom = clamp(88 - 56 * brain.boostAggro, 30, 88);
+  const fireFloor = clamp(18 - 14 * brain.boostAggro, 4, 18);
+
   if (op.boostHold && energy < fireFloor) op.boostHold = false;
   else if (!op.boostHold && energy >= fireFrom) op.boostHold = true;
-  // HARD only: wheel-to-wheel defense — when the player is alongside, burn
-  // whatever is left in the tank instead of waiting for a refill.
+
+  // HARD only: wheel-to-wheel defense and hunter overtake
   if (brain.blocking && mode === "race" && !op.boostHold) {
-    const battle = op.raceDist - ctx.playerDist;
-    if (battle > -7 && battle < 7 && energy > fireFloor + 22) op.boostHold = true;
+    const battle = ctx.playerDist - op.raceDist; // >0 means player ahead
+    // Player leading within 65m — deploy nitro to hunt down and overtake!
+    if (battle > 0 && battle < 65 && energy > fireFloor + 12) {
+      op.boostHold = true;
+    }
+    // Player alongside or tailgating — burn nitro to defend position!
+    else if (battle >= -16 && battle <= 0 && energy > fireFloor + 12) {
+      op.boostHold = true;
+    }
   }
-  const straightEnough = dTheta < 0.042 + 0.03 * brain.boostAggro;
+
+  // Straight enough or corner exit: high aggro allows boosting through sweeping curves
+  const angleOk = Math.abs(err) < 0.32;
+  const straightThreshold = 0.045 + 0.11 * brain.boostAggro;
+  const straightEnough = dTheta < straightThreshold && angleOk;
   const wantsBoost =
     mode === "race" &&
     op.boostHold &&
@@ -344,13 +366,18 @@ export function opponentInput(
     p.grounded &&
     p.speed > 16;
 
+  const boostTopSpeed = BOOST_SPEED * p.speedCapScale;
+  const brakeThreshold = target * (1.28 + 0.15 * Math.max(0, brain.skillScale - 1.0));
+  const overspeed = p.speed - brakeThreshold;
+  const brakeAmount = overspeed > 0
+    ? clamp(overspeed * 0.04, 0.15, brain.skillScale > 1.1 ? 0.45 : 0.55)
+    : 0;
+
   return {
     steer,
-    // while burning nitro the rival holds the throttle open to the BOOST
-    // cap — boosting at target speed with a closed throttle wastes the tank
-    throttle: p.speed < (wantsBoost ? BOOST_SPEED : target) ? 1 : 0,
-    brake: p.speed > target * 1.3 ? 0.55 : 0,
-    handbrake: Math.abs(err) > 0.62 && p.speed > 21,
+    throttle: p.speed < (wantsBoost ? boostTopSpeed : target) ? 1 : 0,
+    brake: brakeAmount,
+    handbrake: Math.abs(err) > (brain.skillScale > 1.1 ? 0.52 : 0.62) && p.speed > 21,
     boost: wantsBoost,
   };
 }

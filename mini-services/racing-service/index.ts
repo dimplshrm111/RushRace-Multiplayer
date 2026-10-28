@@ -9,13 +9,12 @@
  *  - room-isolated real-time chat (validation + anti-spam)
  *  - server-authorized synchronized race countdown (3-2-1-GO)
  *  - 10Hz aggregated car-state relay with pre-GO movement lock
- *  - server-validated laps / finishes / final results + rematch
+ *  - plausibility-checked laps / finishes / final results + rematch
  *  - reconnection tokens, disconnect grace, abandoned-room cleanup
  *
  * All game physics run on each client; the server is authoritative for
  * everything social + race lifecycle + result ordering, and validates
- * lap/finish plausibility (distance + minimum-time gates) so results
- * cannot be manipulated with plain client-side requests.
+ * lap/finish plausibility; client-simulated races are not cheat-proof.
  */
 import { createServer } from "http";
 import { Server, type Socket } from "socket.io";
@@ -24,10 +23,14 @@ import { randomUUID } from "node:crypto";
 // ---------------------------------------------------------------------------
 // configuration
 // ---------------------------------------------------------------------------
-const PORT = 3003;
+const PORT = Number.parseInt(process.env.RACING_PORT ?? "3003", 10);
 const MAX_PLAYERS = 10;
 const COUNTDOWN_MS = 4200; // server-authorized GO moment
 const MIN_LAP_MS = 20000; // plausible minimum lap time
+// Sunstone Canyon spline length (track.ts); update when the track changes.
+const TRACK_LENGTH = 2298;
+const TRACK_LENGTHS = { canyon: TRACK_LENGTH, city: 2524 } as const;
+type MapId = keyof typeof TRACK_LENGTHS;
 const RECONNECT_GRACE_MS =
   Number.parseInt(process.env.RACING_GRACE_MS ?? "", 10) || 45000;
 const CHAT_MAX_LEN = 200;
@@ -132,6 +135,7 @@ interface Room {
   order: string[]; // join order (stable pids)
   nextPid: number;
   laps: number;
+  map: MapId;
   trackLength: number;
   startAt: number;
   raceStartedAt: number;
@@ -222,9 +226,8 @@ function num(v: unknown, fallback = 0): number {
 function sanitizeState(raw: unknown): RaceState | null {
   if (typeof raw !== "object" || raw === null) return null;
   const r = raw as Record<string, unknown>;
-  let yaw = num(r.yaw);
-  while (yaw > Math.PI) yaw -= Math.PI * 2;
-  while (yaw < -Math.PI) yaw += Math.PI * 2;
+  const rawYaw = num(r.yaw);
+  const yaw = ((rawYaw % (Math.PI * 2)) + Math.PI * 3) % (Math.PI * 2) - Math.PI;
   // surface whitelist — must be one of the known physics surfaces
   const SURFACES = new Set([
     "asphalt", "concrete", "dirt", "gravel", "grass", "sand", "mud", "wet", "rock",
@@ -264,6 +267,7 @@ function roomState(r: Room) {
     hostId: r.hostId,
     phase: r.phase,
     laps: r.laps,
+    map: r.map,
     maxPlayers: MAX_PLAYERS,
     startAt: r.phase === "countdown" ? r.startAt : null,
     players: r.order
@@ -516,8 +520,7 @@ function maybeScheduleCompile(r: Room) {
 // ---------------------------------------------------------------------------
 const httpServer = createServer();
 const io = new Server(httpServer, {
-  // DO NOT change the path — the gateway (Caddy) forwards /?XTransformPort=3003
-  path: "/",
+  path: "/socket.io/",
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingTimeout: 60000,
   pingInterval: 25000,
@@ -590,7 +593,8 @@ io.on("connection", (socket) => {
         order: [],
         nextPid: 1,
         laps: 3,
-        trackLength: 2600,
+        map: "canyon",
+        trackLength: TRACK_LENGTH,
         startAt: 0,
         raceStartedAt: 0,
         finishCounter: 0,
@@ -674,6 +678,11 @@ io.on("connection", (socket) => {
             }
             detachSocket(socket, "left");
             p.connected = true;
+            // A pending "everyone disconnected" result must not end a race
+            // after an unfinished racer successfully rejoins.
+            if (room.phase === "racing" && p.racing && p.finishPos == null) {
+              room.compileTimer = clearTimer(room.compileTimer);
+            }
             p.socketId = socket.id;
             p.disconnectAt = null;
             if (p.removeTimer) {
@@ -839,10 +848,19 @@ io.on("connection", (socket) => {
         ack?.({ ok: false, error: "Settings are locked outside the lobby" });
         return;
       }
-      const laps = Math.round(num((payload as { laps?: unknown })?.laps, 3));
+      const body = (payload ?? {}) as { laps?: unknown; map?: unknown };
+      const laps = Math.round(num(body.laps, r.laps));
       if (laps < 1 || laps > 5) {
         ack?.({ ok: false, error: "Laps must be 1-5" });
         return;
+      }
+      if (body.map !== undefined) {
+        if (body.map !== "canyon" && body.map !== "city") {
+          ack?.({ ok: false, error: "Unknown track" });
+          return;
+        }
+        r.map = body.map;
+        r.trackLength = TRACK_LENGTHS[r.map];
       }
       r.laps = laps;
       ack?.({ ok: true });
@@ -915,15 +933,14 @@ io.on("connection", (socket) => {
         ack?.({ ok: false, error: `Waiting for ${notReady.length} player(s) to ready up` });
         return;
       }
-      const body = (payload ?? {}) as { laps?: unknown; trackLength?: unknown };
+      const body = (payload ?? {}) as { laps?: unknown };
       const laps = Math.round(num(body.laps, r.laps));
       if (laps < 1 || laps > 5) {
         ack?.({ ok: false, error: "Laps must be 1-5" });
         return;
       }
-      const trackLength = num(body.trackLength, 2600);
       r.laps = laps;
-      r.trackLength = clampRange(trackLength, 500, 20000);
+      r.trackLength = TRACK_LENGTHS[r.map];
       ack?.({ ok: true });
       beginCountdown(r);
     } catch (err) {
@@ -997,7 +1014,7 @@ io.on("connection", (socket) => {
   });
 
   // ----- lap report (validated) ----------------------------------------------
-  socket.on("mp:lap", (payload: unknown) => {
+  socket.on("mp:lap", (payload: unknown, ack?: (res: unknown) => void) => {
     try {
       const ctx = ctxOf(socket);
       if (!ctx) return;
@@ -1006,8 +1023,11 @@ io.on("connection", (socket) => {
       const body = (payload ?? {}) as { lap?: unknown; lapMs?: unknown; prog?: unknown };
       const lap = Math.round(num(body.lap, -1));
       const lapMs = num(body.lapMs, 0);
+      // Acknowledgements may be lost during reconnect; duplicate reports are safe.
+      if (lap > 0 && lap <= p.lap) { ack?.({ ok: true }); return; }
       if (lap !== p.lap + 1) return; // out of order / duplicate
       if (lapMs < MIN_LAP_MS) return; // impossible lap time
+      if (Date.now() - r.raceStartedAt < lap * MIN_LAP_MS) return;
       if (lapMs > Date.now() - r.raceStartedAt + 3000) return; // faster than wall clock
       if (p.lapProgBase == null) return;
       // distance travelled this lap — the lap payload's own progress is merged
@@ -1018,6 +1038,7 @@ io.on("connection", (socket) => {
       p.lap++;
       p.lapProgBase = p.lastProgress;
       if (p.bestLapMs == null || lapMs < p.bestLapMs) p.bestLapMs = lapMs;
+      ack?.({ ok: true });
       io.to(r.code).emit("mp:lap", { pid: p.id, lap: p.lap, lapMs, name: p.name });
     } catch (err) {
       console.error("mp:lap error", err);
@@ -1025,24 +1046,25 @@ io.on("connection", (socket) => {
   });
 
   // ----- finish report (validated, position assigned server-side) -------------
-  socket.on("mp:finish", (payload: unknown) => {
+  socket.on("mp:finish", (payload: unknown, ack?: (res: unknown) => void) => {
     try {
       const ctx = ctxOf(socket);
       if (!ctx) return;
       const { r, p } = ctx;
       if (r.phase !== "racing" || !p.racing) return;
-      if (p.finishPos != null) return; // already finished
+      if (p.finishPos != null) { ack?.({ ok: true }); return; }
       const body = (payload ?? {}) as Record<string, unknown>;
       const totalMs = num(body.totalMs, -1);
-      if (totalMs < r.laps * MIN_LAP_MS * 0.5) return; // impossible total
+      if (totalMs < r.laps * MIN_LAP_MS) return; // impossible total
       const serverElapsed = Date.now() - r.raceStartedAt;
       if (totalMs > serverElapsed + 3000) return; // future time = reject
       if (p.lap < r.laps) return; // laps not validated yet
       p.finishMs = totalMs;
-      p.bestLapMs = clampRange(num(body.bestLapMs, 0), 0, 36e5);
+      // Keep the best lap accepted by the server rather than replacing it.
       p.topSpeedKmh = clampRange(num(body.topSpeedKmh, 0), 0, 500);
       p.driftScore = clampRange(num(body.driftScore, 0), 0, 1e7);
       p.finishPos = ++r.finishCounter;
+      ack?.({ ok: true });
       io.to(r.code).emit("mp:finish", {
         pid: p.id,
         totalMs: p.finishMs,

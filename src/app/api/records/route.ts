@@ -81,7 +81,7 @@ export async function POST(request: NextRequest) {
   }
   const laps = input.laps as number;
 
-  if (!isIntInRange(input.timeMs, MIN_TIME_MS, MAX_TIME_MS)) {
+  if (!isIntInRange(input.timeMs, MIN_TIME_MS * laps, MAX_TIME_MS)) {
     return badRequest(
       `'timeMs' must be an integer between ${MIN_TIME_MS} and ${MAX_TIME_MS}.`
     );
@@ -94,6 +94,9 @@ export async function POST(request: NextRequest) {
     );
   }
   const bestLapMs = input.bestLapMs as number;
+  if (bestLapMs * laps > timeMs + laps) {
+    return badRequest("'bestLapMs' is inconsistent with the total time.");
+  }
 
   if (
     typeof input.topSpeedKmh !== "number" ||
@@ -110,9 +113,9 @@ export async function POST(request: NextRequest) {
   if (
     typeof input.driftScore !== "number" ||
     !Number.isFinite(input.driftScore) ||
-    input.driftScore < 0
+    input.driftScore < 0 || input.driftScore > 10_000_000
   ) {
-    return badRequest("'driftScore' must be a number greater than or equal to 0.");
+    return badRequest("'driftScore' must be between 0 and 10000000.");
   }
   const driftScore = input.driftScore as number;
 

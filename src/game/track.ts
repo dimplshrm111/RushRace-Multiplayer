@@ -1,7 +1,7 @@
 "use client";
 
 import * as THREE from "three";
-import { PALETTE, clamp } from "./types";
+import { PALETTE, clamp, type MapId } from "./types";
 
 /** Smooth 0..1 step. */
 function sstep(a: number, b: number, x: number): number {
@@ -70,6 +70,26 @@ export interface Obstacle {
   r: number;
   top: number; // top y
   lastNear: number;
+  /** City motorcycles can be knocked down; other obstacles remain solid. */
+  bikeIndex?: number;
+  active?: boolean;
+  enabled?: boolean;
+}
+
+interface CityBike {
+  obstacle: Obstacle;
+  origin: THREE.Vector3;
+  velocity: THREE.Vector3;
+  offset: THREE.Vector3;
+  elapsed: number;
+  hardOnly: boolean;
+}
+
+interface CityHazard {
+  idx: number;
+  lat: number;
+  kind: "barricade" | "bike";
+  hardOnly?: boolean;
 }
 
 /** A breakable wooden crate sitting on the racing line. */
@@ -143,6 +163,16 @@ const CONTROL: [number, number, number][] = [
   [-50, 0, 15],
 ];
 
+// A closed, continuous elevated boulevard: broad bends and modest grades keep
+// every section compatible with the same tyre, gravity and collision model.
+const CITY_CONTROL: [number, number, number][] = [
+  [0, 3, 0], [130, 3, 0], [250, 5, -30], [350, 10, -105],
+  [390, 14, -220], [370, 14, -340], [300, 10, -420],
+  [190, 5, -450], [60, 3, -430], [-70, 3, -460],
+  [-200, 7, -450], [-310, 12, -390], [-365, 14, -280],
+  [-350, 10, -160], [-275, 5, -80], [-150, 3, -35],
+];
+
 /** Fixed lateral columns for road mesh (meters from center). */
 const ROAD_COLS = [-34, -28, -22, -17, -12, -8, -4, -2, 0, 2, 4, 8, 12, 17, 22, 28, 34];
 
@@ -170,6 +200,7 @@ export function pitDepthAt(gapT: number): number {
 
 /** The Sunstone Circuit: one spectacular closed loop through a red-rock canyon. */
 export class Track {
+  readonly map: MapId;
   samples: TrackSample[] = [];
   gates: Gate[] = [];
   obstacles: Obstacle[] = [];
@@ -190,11 +221,25 @@ export class Track {
   /** BREAK barricade positions for the minimap */
   wallPts: { x: number; z: number }[] = [];
   private disposables: (THREE.BufferGeometry | THREE.Material | THREE.Texture)[] = [];
+  private cityHazards: CityHazard[] = [];
+  private cityHazardMeshes: THREE.InstancedMesh[] = [];
+  private cityBikes: CityBike[] = [];
+  private cityBikeParts: { mesh: THREE.InstancedMesh; original: THREE.Matrix4[] }[] = [];
+  private cityWarningParts: { mesh: THREE.InstancedMesh; original: THREE.Matrix4[] }[] = [];
+  private cityHardMode = true;
 
-  constructor() {
+  constructor(map: MapId = "canyon") {
+    this.map = map;
     this.buildSpline();
-    this.buildZones();
-    this.buildMeshes();
+    if (map === "city") {
+      this.buildCityZones();
+      this.buildCityMeshes();
+      this.setCityHardMode(false);
+      this.updateScenery(0);
+    } else {
+      this.buildZones();
+      this.buildMeshes();
+    }
   }
 
   // ============================================================
@@ -202,7 +247,8 @@ export class Track {
   // ============================================================
 
   private buildSpline() {
-    const pts = CONTROL.map((p) => new THREE.Vector3(p[0], p[1], p[2]));
+    const scale = this.map === "city" ? 1.25 : 1;
+    const pts = (this.map === "city" ? CITY_CONTROL : CONTROL).map((p) => new THREE.Vector3(p[0] * scale, p[1], p[2] * scale));
     const curve = new THREE.CatmullRomCurve3(pts, true, "catmullrom", 0.5);
     const approxLen = curve.getLength();
     const n = Math.max(600, Math.round(approxLen / this.step));
@@ -449,6 +495,54 @@ export class Track {
     this.addObstacles();
   }
 
+  private buildCityZones() {
+    for (const s of this.samples) {
+      s.hw = 11;
+      s.shoulderL = s.shoulderR = 4;
+      s.wallHL = s.wallHR = 3;
+      s.surface = "asphalt";
+      s.bank = clamp(s.bank, -1.2, 1.2);
+    }
+    for (let k = 1; k <= 8; k++) {
+      const idx = k === 8 ? 0 : Math.round(this.N * k / 8);
+      const s = this.samples[idx];
+      this.gates.push({ idx, pos: new THREE.Vector3(s.x, s.y, s.z), isFinish: k === 8 });
+      this.gatePts.push({ x: s.x, z: s.z, finish: k === 8 });
+    }
+    for (let i = 0; i < this.N; i += 6) this.minimapPts.push({ x: this.samples[i].x, z: this.samples[i].z });
+    // Alternating obstructions leave a clear lane and are kept away from the
+    // grid and checkpoint gantries. They are identical for every client.
+    const locations = [0.08, 0.18, 0.29, 0.39, 0.52, 0.64, 0.77, 0.88];
+    this.cityHazards = locations.map((fraction, i) => ({
+      idx: Math.floor(this.N * fraction),
+      lat: i % 2 === 0 ? 5.5 : -5.5,
+      kind: i % 4 < 2 ? "barricade" : "bike",
+    }));
+    for (const [i, fraction] of [0.14, 0.34, 0.60, 0.81].entries()) {
+      this.cityHazards.push({ idx: Math.floor(this.N * fraction), lat: i % 2 ? 5.5 : -5.5, kind: "bike", hardOnly: true });
+    }
+    for (const hazard of this.cityHazards) {
+      const s = this.sample(hazard.idx);
+      const obstacle: Obstacle = {
+        x: s.x + s.rx * hazard.lat,
+        z: s.z + s.rz * hazard.lat,
+        r: hazard.kind === "barricade" ? 1.8 : 1.1,
+        top: this.heightAt(hazard.idx, hazard.lat) + 2.4,
+        lastNear: -1e9,
+      };
+      if (hazard.kind === "bike") {
+        obstacle.bikeIndex = this.cityBikes.length;
+        obstacle.active = true;
+        this.cityBikes.push({
+          obstacle,
+          origin: new THREE.Vector3(obstacle.x, this.heightAt(hazard.idx, hazard.lat), obstacle.z),
+          velocity: new THREE.Vector3(), offset: new THREE.Vector3(), elapsed: 0, hardOnly: !!hazard.hardOnly,
+        });
+      }
+      this.obstacles.push(obstacle);
+    }
+  }
+
   private addObstacles() {
     const rnd = mulberry32(20240607);
     // riverbed boulders
@@ -570,7 +664,9 @@ export class Track {
     //  - off the road (shoulder) → graded chain gravel → grass → sand
     //    the further off you go, the looser it gets (so grass just past
     //    the edge gives way to sand further out)
-    if (onRoad) {
+    if (this.map === "city") {
+      out.surface = onRoad ? "asphalt" : "concrete";
+    } else if (onRoad) {
       out.surface = s.surface;
     } else {
       const sh = lat > 0 ? s.shoulderR : s.shoulderL;
@@ -719,6 +815,352 @@ export class Track {
     this.buildBreakWall(5, 1_000_000);
     this.buildBreakWall(25, 1_000_001);
     this.buildStacks();
+  }
+
+  private cityClusters = new Map<number, THREE.Group>();
+  private cityGeometry: THREE.BoxGeometry | null = null;
+  private cityMaterial: THREE.MeshLambertMaterial | null = null;
+  private cityNeon: THREE.MeshBasicMaterial | null = null;
+  private cityPillars: THREE.InstancedMesh | null = null;
+  private readonly cityClusterCount = 16;
+  private cityCenter = -1;
+
+  private buildCityMeshes() {
+    this.buildRoad();
+    this.buildRouteMarks();
+    this.buildGates();
+    this.buildCityHazards();
+
+    // Continuous concrete barriers are placed at the same lateral distance as
+    // the physics walls, so the visible road and collision surface agree.
+    const vertices: number[] = [];
+    const indices: number[] = [];
+    for (const side of [-1, 1] as const) {
+      const base = vertices.length / 3;
+      for (let i = 0; i < this.N; i++) {
+        const s = this.samples[i];
+        const lat = side * this.wallDist(i, side);
+        const y = this.heightAt(i, lat);
+        vertices.push(s.x + s.rx * lat, y, s.z + s.rz * lat,
+          s.x + s.rx * lat, y + 2.2, s.z + s.rz * lat);
+      }
+      for (let i = 0; i < this.N; i++) {
+        const a = base + i * 2, b = base + ((i + 1) % this.N) * 2;
+        indices.push(a, a + 1, b, a + 1, b + 1, b);
+      }
+    }
+    const barrier = new THREE.BufferGeometry();
+    barrier.setAttribute("position", new THREE.Float32BufferAttribute(vertices, 3));
+    barrier.setIndex(indices);
+    barrier.computeVertexNormals();
+    const barrierMat = new THREE.MeshLambertMaterial({ color: 0x465668, side: THREE.DoubleSide });
+    this.group.add(new THREE.Mesh(barrier, barrierMat));
+    this.disposables.push(barrier, barrierMat);
+    const railMat = new THREE.LineBasicMaterial({ color: 0x68e9f0 });
+    for (const side of [-1, 1] as const) {
+      const points: THREE.Vector3[] = [];
+      for (let i = 0; i < this.N; i += 2) {
+        const s = this.sample(i);
+        const lat = side * this.wallDist(i, side);
+        points.push(new THREE.Vector3(s.x + s.rx * lat, this.heightAt(i, lat) + 2.23, s.z + s.rz * lat));
+      }
+      const rail = new THREE.BufferGeometry().setFromPoints(points);
+      this.group.add(new THREE.LineLoop(rail, railMat));
+      this.disposables.push(rail);
+    }
+    this.disposables.push(railMat);
+
+    // The elevated roadway and towers sit on visible foundations, rather than
+    // floating scenery. These are decorative; driving remains on the road.
+    const groundGeo = new THREE.PlaneGeometry(2200, 2200);
+    const groundMat = new THREE.MeshLambertMaterial({ color: 0x283644 });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.position.y = -10;
+    this.group.add(ground);
+    const pillarGeo = new THREE.BoxGeometry(1, 1, 1);
+    const pillarMat = new THREE.MeshLambertMaterial({ color: 0x65717b });
+    const pillars = new THREE.InstancedMesh(pillarGeo, pillarMat, Math.ceil(this.N / 35));
+    const pillarTransform = new THREE.Object3D();
+    for (let i = 0; i < pillars.count; i++) {
+      const s = this.sample(i * 35);
+      const h = s.y + 10;
+      pillarTransform.position.set(s.x, -10 + h / 2, s.z);
+      pillarTransform.scale.set(3.5, h, 3.5);
+      pillarTransform.updateMatrix();
+      pillars.setMatrixAt(i, pillarTransform.matrix);
+    }
+    pillars.computeBoundingSphere();
+    this.group.add(pillars);
+    this.cityPillars = pillars;
+    this.disposables.push(groundGeo, groundMat, pillarGeo, pillarMat);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = canvas.height = 128;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#263447";
+    ctx.fillRect(0, 0, 128, 128);
+    const rnd = mulberry32(4127);
+    for (let y = 3; y < 128; y += 10) for (let x = 3; x < 128; x += 10) {
+      ctx.fillStyle = rnd() > 0.42 ? (rnd() > 0.7 ? "#edbd87" : "#77c9d3") : "#172534";
+      ctx.fillRect(x, y, 5, 5);
+    }
+    const windows = new THREE.CanvasTexture(canvas);
+    windows.colorSpace = THREE.SRGBColorSpace;
+    this.cityGeometry = new THREE.BoxGeometry(1, 1, 1);
+    this.cityMaterial = new THREE.MeshLambertMaterial({ map: windows, color: 0xb7c9dc });
+    this.cityNeon = new THREE.MeshBasicMaterial({ color: 0x5ae7f1 });
+    this.disposables.push(windows, this.cityGeometry, this.cityMaterial, this.cityNeon);
+  }
+
+  /** Roadside police equipment is stationary, with collisions matching its
+   *  visible footprint. Every obstruction has an advance warning light. */
+  private buildCityHazards() {
+    const box = new THREE.BoxGeometry(1, 1, 1);
+    const wheel = new THREE.CylinderGeometry(0.5, 0.5, 1, 12);
+    wheel.rotateZ(Math.PI / 2);
+    const white = new THREE.MeshLambertMaterial({ color: 0xdce4e6 });
+    const dark = new THREE.MeshLambertMaterial({ color: 0x162433 });
+    const red = new THREE.MeshBasicMaterial({ color: 0xff584c });
+    const blue = new THREE.MeshBasicMaterial({ color: 0x39bfff });
+    const amber = new THREE.MeshBasicMaterial({ color: 0xffc04a });
+    const canvas = document.createElement("canvas");
+    canvas.width = 256;
+    canvas.height = 64;
+    const ctx = canvas.getContext("2d")!;
+    ctx.fillStyle = "#e7edf0";
+    ctx.fillRect(0, 0, 256, 64);
+    ctx.fillStyle = "#113359";
+    ctx.font = "bold 46px sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("POLICE", 128, 32);
+    const signTexture = new THREE.CanvasTexture(canvas);
+    signTexture.colorSpace = THREE.SRGBColorSpace;
+    const sign = new THREE.MeshLambertMaterial({ map: signTexture });
+    this.disposables.push(box, wheel, white, dark, red, blue, amber, signTexture, sign);
+    const barriers = this.cityHazards.filter((h) => h.kind === "barricade");
+    const bikes = this.cityHazards.filter((h) => h.kind === "bike");
+    const transform = new THREE.Object3D();
+    const addPart = (
+      hazards: CityHazard[], geometry: THREE.BufferGeometry, material: THREE.Material,
+      scale: [number, number, number], lateral: number, forward: number, height: number,
+      advance = 0,
+    ) => {
+      const mesh = new THREE.InstancedMesh(geometry, material, hazards.length);
+      for (let i = 0; i < hazards.length; i++) {
+        const h = hazards[i];
+        const idx = wrapIdx(h.idx - advance, this.N);
+        const s = this.sample(idx);
+        const lat = advance ? Math.sign(h.lat) * 12 : h.lat + lateral;
+        transform.position.set(
+          s.x + s.rx * lat + s.dx * forward,
+          this.heightAt(idx, lat) + height,
+          s.z + s.rz * lat + s.dz * forward,
+        );
+        transform.rotation.set(0, Math.atan2(s.dx, s.dz), 0);
+        transform.scale.set(...scale);
+        transform.updateMatrix();
+        mesh.setMatrixAt(i, transform.matrix);
+      }
+      mesh.computeBoundingSphere();
+      this.group.add(mesh);
+      this.cityHazardMeshes.push(mesh);
+      if (hazards === bikes && advance === 0) {
+        const original = bikes.map((_, i) => {
+          const matrix = new THREE.Matrix4();
+          mesh.getMatrixAt(i, matrix);
+          return matrix;
+        });
+        this.cityBikeParts.push({ mesh, original });
+      }
+      if (hazards === this.cityHazards && advance > 0) {
+        const original = hazards.map((_, i) => {
+          const matrix = new THREE.Matrix4();
+          mesh.getMatrixAt(i, matrix);
+          return matrix;
+        });
+        this.cityWarningParts.push({ mesh, original });
+      }
+    };
+    // Police barricades: two legs, reflective crossbar, and red/blue lamps.
+    addPart(barriers, box, dark, [0.18, 1.45, 0.38], -1.35, 0, 0.72);
+    addPart(barriers, box, dark, [0.18, 1.45, 0.38], 1.35, 0, 0.72);
+    addPart(barriers, box, sign, [3.4, 0.58, 0.25], 0, 0, 1.25);
+    addPart(barriers, box, red, [0.55, 0.25, 0.35], -1.1, 0, 1.72);
+    addPart(barriers, box, blue, [0.55, 0.25, 0.35], 1.1, 0, 1.72);
+    // Parked police bikes: two wheels, a low chassis, seat and beacon.
+    addPart(bikes, wheel, dark, [0.32, 0.85, 0.85], 0, -0.78, 0.45);
+    addPart(bikes, wheel, dark, [0.32, 0.85, 0.85], 0, 0.78, 0.45);
+    addPart(bikes, box, white, [0.65, 0.48, 1.65], 0, 0, 0.85);
+    addPart(bikes, box, dark, [0.55, 0.22, 0.65], 0, -0.2, 1.18);
+    addPart(bikes, box, blue, [0.3, 0.2, 0.3], 0, 0.65, 1.38);
+    // Small warning beacons 56 m before the obstruction, on the shoulder.
+    addPart(this.cityHazards, box, dark, [0.22, 1.8, 0.22], 0, 0, 0.9, 28);
+    addPart(this.cityHazards, box, amber, [0.9, 0.5, 0.25], 0, 0, 1.8, 28);
+  }
+
+  /** Extra motorcycles and their warning beacons are only enabled on Hard. */
+  setCityHardMode(enabled: boolean) {
+    if (this.map !== "city" || this.cityHardMode === enabled) return;
+    this.cityHardMode = enabled;
+    const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (let i = 0; i < this.cityBikes.length; i++) {
+      const bike = this.cityBikes[i];
+      if (!bike.hardOnly) continue;
+      bike.obstacle.enabled = enabled;
+      bike.obstacle.active = enabled;
+      bike.elapsed = 0;
+      bike.offset.set(0, 0, 0);
+      bike.velocity.set(0, 0, 0);
+      for (const part of this.cityBikeParts) part.mesh.setMatrixAt(i, enabled ? part.original[i] : hidden);
+    }
+    for (const part of this.cityBikeParts) part.mesh.instanceMatrix.needsUpdate = true;
+    for (const part of this.cityWarningParts) {
+      for (let i = 0; i < this.cityHazards.length; i++) {
+        if (this.cityHazards[i].hardOnly) part.mesh.setMatrixAt(i, enabled ? part.original[i] : hidden);
+      }
+      part.mesh.instanceMatrix.needsUpdate = true;
+    }
+  }
+
+  /** Transfer momentum to a parked bike without treating it as an immovable wall. */
+  hitCityBike(obstacle: Obstacle, vx: number, vz: number, impact: number): boolean {
+    if (obstacle.bikeIndex == null || obstacle.active === false || obstacle.enabled === false) return false;
+    const bike = this.cityBikes[obstacle.bikeIndex];
+    if (!bike) return false;
+    obstacle.active = false;
+    bike.elapsed = 0;
+    bike.offset.set(0, 0, 0);
+    const speed = Math.hypot(vx, vz);
+    const impulseSpeed = Math.min(16, Math.max(0.5, impact * 0.4));
+    bike.velocity.set(speed > 0.01 ? vx / speed * impulseSpeed : 0, 0, speed > 0.01 ? vz / speed * impulseSpeed : 0);
+    return true;
+  }
+
+  /** Slide and tip struck bikes; after the cooldown restore their original pose. */
+  updateCityBikes(dt: number) {
+    if (dt <= 0 || !this.cityBikeParts.length || !this.cityBikes.some((bike) => bike.obstacle.enabled !== false && bike.obstacle.active === false)) return;
+    let changed = false;
+    for (let i = 0; i < this.cityBikes.length; i++) {
+      const bike = this.cityBikes[i];
+      if (bike.obstacle.enabled === false || bike.obstacle.active !== false) continue;
+      const settled = bike.elapsed >= 0.4 && bike.velocity.lengthSq() === 0;
+      bike.elapsed += dt;
+      if (bike.elapsed >= 15) {
+        bike.obstacle.active = true;
+        bike.velocity.set(0, 0, 0);
+        bike.offset.set(0, 0, 0);
+        for (const part of this.cityBikeParts) part.mesh.setMatrixAt(i, part.original[i]);
+      } else if (!settled) {
+        bike.offset.addScaledVector(bike.velocity, dt);
+        const speed = bike.velocity.length();
+        if (speed > 0) bike.velocity.multiplyScalar(Math.max(0, speed - 8 * dt) / speed);
+        const tilt = Math.min(1, bike.elapsed * 2.5) * Math.PI * 0.47;
+        const pivot = new THREE.Matrix4().makeTranslation(bike.origin.x + bike.offset.x, bike.origin.y, bike.origin.z + bike.offset.z);
+        const rotation = new THREE.Matrix4().makeRotationZ(tilt);
+        const inverse = new THREE.Matrix4().makeTranslation(-bike.origin.x, -bike.origin.y, -bike.origin.z);
+        const matrix = new THREE.Matrix4();
+        const posed = new THREE.Matrix4();
+        matrix.multiplyMatrices(pivot, rotation).multiply(inverse);
+        for (const part of this.cityBikeParts) {
+          posed.multiplyMatrices(matrix, part.original[i]);
+          part.mesh.setMatrixAt(i, posed);
+        }
+      } else continue;
+      changed = true;
+    }
+    if (changed) for (const part of this.cityBikeParts) part.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  resetCityBikes() {
+    const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
+    for (let i = 0; i < this.cityBikes.length; i++) {
+      const bike = this.cityBikes[i];
+      bike.obstacle.active = bike.obstacle.enabled !== false;
+      bike.elapsed = 0;
+      bike.offset.set(0, 0, 0);
+      bike.velocity.set(0, 0, 0);
+      for (const part of this.cityBikeParts) part.mesh.setMatrixAt(i, bike.obstacle.enabled === false ? hidden : part.original[i]);
+    }
+    for (const part of this.cityBikeParts) part.mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /** Recycle five districts as the car moves, keeping GPU buffers resident. */
+  updateScenery(sampleIndex: number) {
+    if (this.map !== "city" || !this.cityGeometry || !this.cityMaterial || !this.cityNeon) return;
+    const center = Math.floor(wrapIdx(sampleIndex, this.N) / this.N * this.cityClusterCount);
+    if (center === this.cityCenter) return;
+    this.cityCenter = center;
+    const desired = new Set<number>();
+    for (let offset = -2; offset <= 2; offset++) desired.add(wrapIdx(center + offset, this.cityClusterCount));
+    const pool: THREE.Group[] = [];
+    for (const [id, group] of this.cityClusters) {
+      if (desired.has(id)) continue;
+      this.cityClusters.delete(id);
+      pool.push(group);
+    }
+    for (const id of desired) {
+      if (this.cityClusters.has(id)) continue;
+      const count = 16;
+      let group = pool.pop();
+      if (!group) {
+        group = new THREE.Group();
+        group.add(
+          new THREE.InstancedMesh(this.cityGeometry, this.cityMaterial, count),
+          new THREE.InstancedMesh(this.cityGeometry, this.cityNeon, count),
+          new THREE.InstancedMesh(this.cityGeometry, this.cityMaterial, count),
+          new THREE.InstancedMesh(this.cityGeometry, this.cityMaterial, 8),
+          new THREE.InstancedMesh(this.cityGeometry, this.cityNeon, 8),
+        );
+        this.group.add(group);
+      }
+      const [towers, lights, foundations, lampPosts, lampHeads] = group.children as THREE.InstancedMesh[];
+      const transform = new THREE.Object3D();
+      const random = mulberry32(8001 + id);
+      for (let i = 0; i < count; i++) {
+        const idx = Math.floor((id + (Math.floor(i / 2) + 0.5) / (count / 2)) * this.N / this.cityClusterCount);
+        const s = this.sample(idx);
+        const side = i % 2 ? 1 : -1;
+        const width = 20 + random() * 16;
+        const depth = 17 + random() * 18;
+        const height = 28 + random() * 90;
+        const lat = side * (35 + depth * 0.5 + random() * 15);
+        transform.position.set(s.x + s.rx * lat, s.y - 4 + height / 2, s.z + s.rz * lat);
+        transform.rotation.set(0, Math.atan2(s.rx, s.rz), 0);
+        transform.scale.set(width, height, depth);
+        transform.updateMatrix();
+        towers.setMatrixAt(i, transform.matrix);
+        const foundationHeight = s.y + 6;
+        transform.position.y = -10 + foundationHeight / 2;
+        transform.scale.set(width, foundationHeight, depth);
+        transform.updateMatrix();
+        foundations.setMatrixAt(i, transform.matrix);
+        transform.position.y = s.y - 4 + height + 0.15;
+        transform.scale.set(width * 0.96, 0.3, depth * 0.96);
+        transform.updateMatrix();
+        lights.setMatrixAt(i, transform.matrix);
+      }
+      for (let i = 0; i < 8; i++) {
+        const idx = Math.floor((id + (Math.floor(i / 2) + 0.5) / 4) * this.N / this.cityClusterCount);
+        const s = this.sample(idx);
+        const lat = (i % 2 ? 1 : -1) * 14;
+        transform.rotation.set(0, 0, 0);
+        transform.position.set(s.x + s.rx * lat, s.y + 3.7, s.z + s.rz * lat);
+        transform.scale.set(0.3, 7.4, 0.3);
+        transform.updateMatrix();
+        lampPosts.setMatrixAt(i, transform.matrix);
+        transform.position.y = s.y + 7.4;
+        transform.scale.set(1.3, 0.25, 1.3);
+        transform.updateMatrix();
+        lampHeads.setMatrixAt(i, transform.matrix);
+      }
+      for (const mesh of [towers, lights, foundations, lampPosts, lampHeads]) {
+        mesh.instanceMatrix.needsUpdate = true;
+        mesh.computeBoundingSphere();
+      }
+      this.cityClusters.set(id, group);
+    }
   }
 
   private buildWalls() {
@@ -870,6 +1312,7 @@ export class Track {
               break;
           }
         }
+        if (this.map === "city") c = Math.abs(l) <= s.hw ? new THREE.Color(0x526374) : new THREE.Color(0x8a9ba4);
         pos.push(s.x + s.rx * l, gi.h, s.z + s.rz * l);
         col.push(c.r, c.g, c.b);
         uv.push(l / 12, (i * this.step) / 7);
@@ -891,12 +1334,13 @@ export class Track {
     g.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
     g.setIndex(idx);
     g.computeVertexNormals();
-    const tex = makeSandNoiseTexture();
+    const tex = this.map === "city" ? null : makeSandNoiseTexture();
     const m = new THREE.MeshLambertMaterial({ vertexColors: true, map: tex, flatShading: true });
     const mesh = new THREE.Mesh(g, m);
     mesh.receiveShadow = true;
     this.group.add(mesh);
-    this.disposables.push(g, m, tex);
+    this.disposables.push(g, m);
+    if (tex) this.disposables.push(tex);
   }
 
   /** Painted route markings — edge lines + forward chevrons so the line is always readable. */
@@ -1687,6 +2131,13 @@ export class Track {
   }
 
   dispose() {
+    this.cityPillars?.dispose();
+    for (const mesh of this.cityHazardMeshes) mesh.dispose();
+    this.cityHazardMeshes.length = 0;
+    for (const group of this.cityClusters.values()) {
+      group.traverse((object) => { if (object instanceof THREE.InstancedMesh) object.dispose(); });
+    }
+    this.cityClusters.clear();
     for (const d of this.disposables) d.dispose();
   }
 }

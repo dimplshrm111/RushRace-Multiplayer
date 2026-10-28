@@ -92,7 +92,11 @@ interface GameStore {
 function loadSettings(): GameSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<GameSettings>) };
+    if (raw) {
+      const settings = { ...DEFAULT_SETTINGS, ...(JSON.parse(raw) as Partial<GameSettings>) };
+      if (settings.map !== "city") settings.map = "canyon";
+      return settings;
+    }
   } catch {
     /* ignore */
   }
@@ -162,7 +166,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
   loadBest: (laps) => {
     try {
-      const raw = localStorage.getItem(BEST_KEY);
+      const raw = localStorage.getItem(get().settings.map === "city" ? `${BEST_KEY}.city.v2` : BEST_KEY);
       if (raw) {
         const data = JSON.parse(raw) as BestData;
         if (data.laps === laps) {
@@ -177,7 +181,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
   saveBest: (data) => {
     try {
-      localStorage.setItem(BEST_KEY, JSON.stringify(data));
+      localStorage.setItem(get().settings.map === "city" ? `${BEST_KEY}.city.v2` : BEST_KEY, JSON.stringify(data));
     } catch {
       /* ignore */
     }
@@ -185,7 +189,7 @@ export const useGameStore = create<GameStore>((set, get) => ({
   },
   resetBest: () => {
     try {
-      localStorage.removeItem(BEST_KEY);
+      localStorage.removeItem(get().settings.map === "city" ? `${BEST_KEY}.city.v2` : BEST_KEY);
     } catch {
       /* ignore */
     }

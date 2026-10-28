@@ -6,6 +6,7 @@ import { useGameStore } from "@/game/store";
 import { useMPStore } from "@/game/net-store";
 import {
   DIFFICULTIES,
+  MAP_NAMES,
   formatTime,
   type RaceRecord,
   type ResultsData,
@@ -65,6 +66,7 @@ export function Results({
 
   useEffect(() => {
     let alive = true;
+    if (settings.map === "city") return () => { alive = false; };
     fetch(`/api/records?laps=${data.laps}`)
       .then((r) => r.json())
       .then((d: { records?: RaceRecord[] }) => {
@@ -76,7 +78,7 @@ export function Results({
     return () => {
       alive = false;
     };
-  }, [data.laps]);
+  }, [data.laps, settings.map]);
 
   const isMP = !!mp?.isMultiplayer;
   const finalRows: StandingEntry[] = isMP
@@ -91,7 +93,7 @@ export function Results({
 
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center overflow-y-auto bg-[rgba(43,28,18,0.55)] p-4 backdrop-blur-[2px]">
-      <div className="result-anim my-auto w-full max-w-lg rounded-xl border-[3px] border-[#2b1c12] bg-gradient-to-b from-[#ffb020]/25 to-[#fff6e6] p-5 shadow-2xl">
+      <div className="result-anim my-auto max-h-[92vh] overflow-y-auto settings-scroll w-full max-w-lg rounded-xl border-[3px] border-[#2b1c12] bg-gradient-to-b from-[#ffb020]/25 to-[#fff6e6] p-4 sm:p-5 shadow-2xl">
         <div className="text-center">
           {data.isNewRecord && (
             <div className="mx-auto mb-2 inline-block -rotate-2 rounded bg-[#2f9e63] px-3 py-1 text-xs font-black tracking-[0.25em] text-[#fff6e6] shadow-lg">
@@ -114,7 +116,7 @@ export function Results({
               P{data.position}/{data.totalCars}
             </span>
             <span>
-              {isMP ? "CANYON CLASH" : "SUNSTONE CANYON"} ·{" "}
+              {MAP_NAMES[settings.map]} ·{" "}
               {isMP ? "MULTIPLAYER" : DIFFICULTIES[settings.difficulty].label} · {data.laps} LAP{data.laps > 1 ? "S" : ""}
             </span>
           </div>
@@ -155,9 +157,11 @@ export function Results({
         </div>
 
         <div className="mt-3 rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.82)] p-3 text-[#fff6e6]">
-          <div className="mb-1 text-[10px] font-black tracking-[0.25em] text-[#ffb020]">CANYON RECORDS — {data.laps} LAPS</div>
+          <div className="mb-1 text-[10px] font-black tracking-[0.25em] text-[#ffb020]">CASUAL RECORDS — {data.laps} LAPS</div>
           <div className="max-h-28 overflow-y-auto settings-scroll pr-1">
-            {records == null ? (
+            {settings.map === "city" ? (
+              <div className="py-1 text-xs font-bold text-[#c9a06a]">CITY PERSONAL BESTS ARE SAVED ON THIS DEVICE</div>
+            ) : records == null ? (
               <div className="py-1 text-xs font-bold text-[#c9a06a]">LOADING…</div>
             ) : records.length === 0 ? (
               <div className="py-1 text-xs font-bold text-[#c9a06a]">NO RECORDS</div>

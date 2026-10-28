@@ -24,6 +24,7 @@ import {
   type DriveInput,
   type GamePhase,
   type GameSettings,
+  type MapId,
   type ResultsData,
   type StandingEntry,
   type Telemetry,
@@ -58,7 +59,7 @@ export class GameEngine {
   private audio: AudioSystem;
   private input: InputManager;
   private cbs: EngineCallbacks;
-  private settings: GameSettings = { ...DEFAULT_SETTINGS };
+  settings: GameSettings = { ...DEFAULT_SETTINGS };
 
   phase: GamePhase = "title";
   paused = false;
@@ -101,6 +102,8 @@ export class GameEngine {
 
   // sun
   private sun: THREE.DirectionalLight;
+  private skyMaterial!: THREE.ShaderMaterial;
+  private hemi!: THREE.HemisphereLight;
 
   // AI rivals
   opponents: Opponent[] = [];
@@ -169,6 +172,7 @@ export class GameEngine {
 
     // lights
     const hemi = new THREE.HemisphereLight(0xffe9c9, 0xcaa06a, 0.8);
+    this.hemi = hemi;
     this.scene.add(hemi);
     this.sun = new THREE.DirectionalLight(0xffd9a8, 1.8);
     this.sun.castShadow = !isMobile;
@@ -186,7 +190,8 @@ export class GameEngine {
     this.scene.add(this.sun.target);
 
     // world
-    this.track = new Track();
+    this.track = new Track(gameStore.getState().settings.map);
+    this.setAtmosphere(this.track.map);
     this.scene.add(this.track.group);
     this.scene.add(this.particles.group);
     this.debris = new DebrisSystem(isMobile);
@@ -365,14 +370,20 @@ export class GameEngine {
         }
       `,
     });
+    this.skyMaterial = mat;
     const sky = new THREE.Mesh(geo, mat);
     sky.frustumCulled = false;
     this.scene.add(sky);
   }
 
   private loadBest() {
+    this.bestTotalMs = null;
+    this.bestLapMs = null;
+    this.bestSplits = [];
+    this.ghost = [];
     try {
-      const raw = localStorage.getItem("canyonrush.best.v1");
+      const suffix = this.track.map === "city" ? ".city.v2" : "";
+      const raw = localStorage.getItem("canyonrush.best.v1" + suffix);
       if (raw) {
         const d = JSON.parse(raw) as {
           totalMs: number;
@@ -384,11 +395,43 @@ export class GameEngine {
         this.bestLapMs = d.bestLapMs;
         this.bestSplits = d.splits ?? [];
       }
-      const graw = localStorage.getItem(GHOST_KEY);
+      const graw = localStorage.getItem(GHOST_KEY + suffix);
       if (graw) this.ghost = JSON.parse(graw) as GhostFrame[];
     } catch {
       /* ignore */
     }
+  }
+
+  private setAtmosphere(map: MapId) {
+    const city = map === "city";
+    this.skyMaterial.uniforms.uZen.value.setHex(city ? 0x536d8e : PALETTE.skyZenith);
+    this.skyMaterial.uniforms.uMid.value.setHex(city ? 0x809cb1 : PALETTE.skyMid);
+    this.skyMaterial.uniforms.uHor.value.setHex(city ? 0xe4ad9a : PALETTE.skyHorizon);
+    (this.scene.fog as THREE.Fog).color.setHex(city ? 0x93a8b4 : PALETTE.fog);
+    this.hemi.color.setHex(city ? 0xe0efff : 0xffe9c9);
+    this.hemi.groundColor.setHex(city ? 0x718292 : 0xcaa06a);
+    this.hemi.intensity = city ? 1.15 : 0.8;
+    this.sun.color.setHex(city ? 0xffdfc9 : 0xffd9a8);
+    this.sun.intensity = city ? 1.5 : 1.8;
+  }
+
+  /** Change maps only in the title/lobby, keeping physics and AI on one track. */
+  setTrack(map: MapId) {
+    if (this.track.map === map || this.phase !== "title") return;
+    const old = this.track;
+    const next = new Track(map);
+    this.track = next;
+    this.scene.add(next.group);
+    this.physics.setTrack(next);
+    for (const opponent of this.opponents) opponent.setTrack(next);
+    this.scene.remove(old.group);
+    old.dispose();
+    this.setAtmosphere(map);
+    this.loadBest();
+    this.titleCamS = 0;
+    this.physics.place(next.N - 10, 0, 0);
+    this.scatterOpponentsOnTrack();
+    this.syncCarVisual(0.016);
   }
 
   // ============================================================
@@ -419,6 +462,7 @@ export class GameEngine {
     const diff = this.mpActive
       ? DIFFICULTIES.medium
       : DIFFICULTIES[s.difficulty] ?? DIFFICULTIES.medium;
+    this.track.setCityHardMode(!this.mpActive && s.difficulty === "hard");
     this.track.setActiveStacks(diff.stacks);
     this.physics.boostScale = diff.boostGain;
     for (const op of this.opponents) {
@@ -446,6 +490,7 @@ export class GameEngine {
   }
 
   startRace(laps: number) {
+    this.track.resetCityBikes();
     this.totalLaps = laps;
     this.loadBest();
     this.lapsDone = 0;
@@ -639,6 +684,7 @@ export class GameEngine {
 
   /** Begin a multiplayer race: server-aligned countdown + shared grid slot. */
   startMultiplayerRace(laps: number, gridIndex: number, goInMs: number) {
+    this.track.resetCityBikes();
     this.totalLaps = laps;
     this.loadBest();
     this.lapsDone = 0;
@@ -788,6 +834,7 @@ export class GameEngine {
     if (this.recoverT > 0) this.recoverT -= dt;
 
     this.updateCamera(dt);
+    this.track.updateScenery(this.phase === "title" ? Math.floor(this.titleCamS / this.track.step) : this.physics.idx);
     this.updateSun();
     this.updateRemotes(dt);
     this.particles.update(dt, this.time);
@@ -795,6 +842,7 @@ export class GameEngine {
     this.updateGateGlow();
     this.updateWallFx();
     this.track.updateBoxes(this.time * 1000); // smashed crates come back
+    this.track.updateCityBikes(dt);
     this.emitTelemetry();
 
     // audio
@@ -1023,7 +1071,7 @@ export class GameEngine {
       }
       try {
         localStorage.setItem(
-          "canyonrush.best.v1",
+          "canyonrush.best.v1" + (this.track.map === "city" ? ".city.v2" : ""),
           JSON.stringify({
             totalMs: this.bestTotalMs,
             bestLapMs: this.bestLapMs,
@@ -1032,13 +1080,13 @@ export class GameEngine {
           })
         );
         if (this.ghost.length > 10) {
-          localStorage.setItem(GHOST_KEY, JSON.stringify(this.ghost));
+          localStorage.setItem(GHOST_KEY + (this.track.map === "city" ? ".city.v2" : ""), JSON.stringify(this.ghost));
         }
       } catch {
         /* ignore */
       }
       if (isNewRecord) {
-        store.saveBest({ totalMs, bestLapMs: this.bestLapMs, splits: this.bestSplits, laps: this.totalLaps });
+        store.saveBest({ totalMs, bestLapMs: this.bestLapMs ?? totalMs, splits: this.bestSplits, laps: this.totalLaps });
         store.pushPopup("newrecord", "NEW RECORD!");
       }
       this.audio.finish(isNewRecord);

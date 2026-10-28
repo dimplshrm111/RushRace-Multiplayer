@@ -329,6 +329,8 @@ export class CarPhysics {
   private gi: GroundInfo = { h: 0, onRoad: false, inPitZone: false, surface: "asphalt" };
   private ev: PhysicsEvents;
   private track: Track;
+
+  setTrack(track: Track) { this.track = track; }
   private tmpF = new THREE.Vector3();
   private tmpR = new THREE.Vector3();
 
@@ -610,13 +612,14 @@ export class CarPhysics {
     // Nitro and boost both contribute (nitro is the user-facing system; the
     // boost meter is the drift/near-miss bank that still drains separately).
     const boosting = this.boosting || wantNitro;
-    const cap = boosting ? BOOST_SPEED : MAX_SPEED * this.speedCapScale;
+    const boostCap = BOOST_SPEED * this.speedCapScale;
+    const cap = boosting ? boostCap : MAX_SPEED * this.speedCapScale;
     if (input.throttle > 0.02) {
       let a = ACCEL * (1 - clamp(vf / cap, -1, 1)) * input.throttle;
       // surface reduces acceleration (sand/mud sap engine power)
       a *= surf.accelMul;
       if (!this.grounded) a *= 0.45;
-      if (boosting) a += BOOST_ACCEL * (1 - clamp(vf / BOOST_SPEED, 0, 1));
+      if (boosting) a += BOOST_ACCEL * (1 - clamp(vf / boostCap, 0, 1));
       vf += a * dt;
     } else {
       // coast drag — surface-dependent
@@ -738,6 +741,7 @@ export class CarPhysics {
 
     // ---- obstacles ----
     for (const ob of this.track.obstacles) {
+      if (ob.enabled === false || ob.active === false) continue;
       const dx = this.pos.x - ob.x;
       const dz = this.pos.z - ob.z;
       const d2 = dx * dx + dz * dz;
@@ -753,6 +757,18 @@ export class CarPhysics {
           this.pos.x += nx * push;
           this.pos.z += nz * push;
           const vn = this.vel.x * nx + this.vel.z * nz;
+          if (ob.bikeIndex != null) {
+            // An unmanned motorcycle has much less mass than a car. Transfer
+            // a fraction of the closing speed, tip the bike, and continue
+            // forward; never reflect the car as if it hit a concrete wall.
+            if (vn < -0.25 && this.track.hitCityBike(ob, this.vel.x, this.vel.z, -vn)) {
+              const loss = -vn * 0.18;
+              this.vel.x += nx * loss;
+              this.vel.z += nz * loss;
+              if (-vn > 5) this.ev.onCrash(clamp(-vn / 35, 0.1, 0.8));
+            }
+            continue;
+          }
           if (vn < 0) {
             this.vel.x -= nx * vn * 1.6;
             this.vel.z -= nz * vn * 1.6;

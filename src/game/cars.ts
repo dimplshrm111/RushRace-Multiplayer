@@ -137,7 +137,9 @@ type Bucket =
   | "tow"
   | "head"
   | "amber"
-  | "tail";
+  | "tail"
+  | "rim"
+  | "tire";
 
 const UNIT_BOX = new THREE.BoxGeometry(1, 1, 1);
 const UNIT_CYL = new THREE.CylinderGeometry(1, 1, 1, 14);

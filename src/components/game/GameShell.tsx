@@ -30,6 +30,15 @@ export default function GameShell() {
   /** false until the world is built + shaders prewarmed — drives the loading overlay */
   const [ready, setReady] = useState(false);
 
+  // PWA service worker registration
+  useEffect(() => {
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker
+        .register("/sw.js", { scope: "/" })
+        .catch(() => { /* SW registration failed silently */ });
+    }
+  }, []);
+
   const phase = useGameStore((s) => s.phase);
   const paused = useGameStore((s) => s.paused);
   const results = useGameStore((s) => s.results);
@@ -146,6 +155,8 @@ export default function GameShell() {
             if (r.dnf) return; // DNF (server-ended race) — nothing to report
             // multiplayer: report the validated finish to the room server
             net.sendFinish(r);
+            // Existing shared records belong to Sunstone Canyon only.
+            if (engine.track.map !== "canyon") return;
             // persist to the local leaderboard backend (use the MP name when racing online)
             const mpName = useMPStore.getState().room?.players.find(
               (p) => p.id === useMPStore.getState().myId
@@ -184,6 +195,11 @@ export default function GameShell() {
         await sleep(1800); // let first frames render (engine builds behind the loading overlay)
         const eng = engineRef.current;
         if (!eng) return;
+        const sp = new URLSearchParams(window.location.search);
+        const d = sp.get("difficulty");
+        if (d === "easy" || d === "medium" || d === "hard") {
+          eng.applySettings({ ...eng.settings, difficulty: d });
+        }
         eng.debugSelftestActive = true;
         eng.startRace(1);
         eng.debugSkipCountdown();
@@ -246,6 +262,7 @@ export default function GameShell() {
 
   // apply settings when they change
   useEffect(() => {
+    if (!net.inRoom) engineRef.current?.setTrack(settings.map);
     engineRef.current?.applySettings(settings);
   }, [settings]);
 
@@ -277,6 +294,7 @@ export default function GameShell() {
 
   const startRace = () => {
     audioRef.current?.unlock();
+    engineRef.current?.setTrack(settings.map);
     engineRef.current?.startRace(settings.laps);
   };
 
@@ -332,8 +350,10 @@ export default function GameShell() {
             <HUD engineRef={engineRef} countdownActive={phase === "countdown"} />
           )}
 
-          {/* Touch controls while racing on touch devices */}
-          {phase === "racing" && <TouchControls inputRef={inputRef} onPause={() => setPaused(true)} />}
+          {/* Touch controls while countdown/racing on touch devices */}
+          {(phase === "countdown" || phase === "racing") && (
+            <TouchControls inputRef={inputRef} engineRef={engineRef} onPause={() => setPaused(true)} />
+          )}
 
           {/* multiplayer: connection chip + in-race chat */}
           {inMPRace && !paused && (

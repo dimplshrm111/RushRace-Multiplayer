@@ -9,16 +9,20 @@ import { carModelName, paintFor } from "@/game/cars";
 import {
   DIFFICULTIES,
   DIFFICULTY_ORDER,
+  MAP_NAMES,
   formatTime,
   type Difficulty,
+  type MapId,
   type RaceRecord,
 } from "@/game/types";
 import { SettingsPanel } from "./SettingsPanel";
+import { InstallBanner } from "./InstallBanner";
 
-function useRecords(laps: number) {
+function useRecords(laps: number, map: MapId) {
   const [records, setRecords] = useState<RaceRecord[] | null>(null);
   useEffect(() => {
     let alive = true;
+    if (map === "city") return () => { alive = false; };
     fetch(`/api/records?laps=${laps}`)
       .then((r) => r.json())
       .then((d: { records?: RaceRecord[] }) => {
@@ -30,8 +34,8 @@ function useRecords(laps: number) {
     return () => {
       alive = false;
     };
-  }, [laps]);
-  return records;
+  }, [laps, map]);
+  return map === "city" ? [] : records;
 }
 
 export function TitleScreen({
@@ -52,7 +56,7 @@ export function TitleScreen({
   const setGarageOpen = useGameStore((s) => s.setGarageOpen);
   const carModel = useGameStore((s) => s.carModel);
   const carColor = useGameStore((s) => s.carColor);
-  const records = useRecords(settings.laps);
+  const records = useRecords(settings.laps, settings.map);
   const [ready, setReady] = useState(false);
 
   // wait for the engine's title flythrough to have rendered at least one frame
@@ -87,13 +91,22 @@ export function TitleScreen({
             <span className="text-[#fff6e6]">RUSH</span>
           </div>
           <div className="mt-2 inline-block -rotate-1 rounded bg-[#f0641e] px-3 py-1 text-[11px] font-black tracking-[0.3em] text-[#fff6e6] shadow-lg sm:text-xs [@media(max-height:560px)]:mt-1 [@media(max-height:560px)]:text-[9px]">
-            SUNSTONE CANYON · STUNT RACING
+            {MAP_NAMES[settings.map]} · STUNT RACING
           </div>
         </div>
 
         {tab === "main" && (
           <div className="mt-4 flex w-full max-w-3xl flex-1 flex-col items-center gap-4 sm:mt-10 sm:gap-5 [@media(max-height:560px)]:mt-2 [@media(max-height:560px)]:gap-2">
             <div className="flex w-full flex-col items-center gap-3">
+              <div className="flex w-72 gap-2 sm:w-80" role="radiogroup" aria-label="Race track">
+                {(["canyon", "city"] as MapId[]).map((map) => (
+                  <button key={map} type="button" role="radio" aria-checked={settings.map === map}
+                    onClick={() => { setSettings({ map }); useGameStore.getState().loadBest(settings.laps); }}
+                    className={`flex-1 rounded-md border-2 px-2 py-2 text-[10px] font-black tracking-wider ${settings.map === map ? "border-[#ffb020] bg-[#2b1c12] text-[#ffcf70]" : "border-[#fff6e6]/40 bg-[#2b1c12]/70 text-[#fff6e6]"}`}>
+                    {MAP_NAMES[map]}
+                  </button>
+                ))}
+              </div>
               <button
                 type="button"
                 disabled={!ready}
@@ -145,22 +158,22 @@ export function TitleScreen({
                 </p>
               </div>
 
-              <div className="flex gap-2 sm:gap-3">
+              <div className="flex flex-wrap justify-center gap-2 sm:gap-3">
                 <button
                   type="button"
                   onClick={onHowToPlay}
-                  className="w-[4.5rem] -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-2 py-2 text-[11px] font-black tracking-wide text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-28 sm:text-sm"
+                  className="w-20 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-2 py-1.5 sm:py-2 text-[10px] sm:text-sm font-black tracking-wide text-[#2b1c12] shadow-[0_3px_0_#2b1c12] sm:shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-28"
                 >
                   <span className="block skew-x-6">HOW TO</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setGarageOpen(true)}
-                  className="flex w-28 -skew-x-6 flex-col items-center rounded-md border-2 border-[#2b1c12] bg-[#8a5a2b] px-2 py-1.5 text-[#fff6e6] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-32"
+                  className="flex w-24 sm:w-32 -skew-x-6 flex-col items-center rounded-md border-2 border-[#2b1c12] bg-[#8a5a2b] px-2 py-1 sm:py-1.5 text-[#fff6e6] shadow-[0_3px_0_#2b1c12] sm:shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
                   aria-label="Open the garage to pick your car"
                 >
-                  <span className="flex skew-x-6 items-center gap-1 text-[11px] font-black tracking-wide sm:text-sm">
-                    <Car className="h-3.5 w-3.5" aria-hidden /> GARAGE
+                  <span className="flex skew-x-6 items-center gap-1 text-[10px] sm:text-sm font-black tracking-wide">
+                    <Car className="h-3 w-3 sm:h-3.5 sm:w-3.5" aria-hidden /> GARAGE
                   </span>
                   <span className="skew-x-6 text-[8px] font-bold tracking-wider text-[#ffd9a0]">
                     {carModelName(carModel)}
@@ -169,20 +182,21 @@ export function TitleScreen({
                 <button
                   type="button"
                   onClick={() => setMPScreen("home")}
-                  className="w-28 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#1f8a70] px-2 py-2 text-[11px] font-black tracking-wide text-[#fff6e6] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-36 sm:text-sm"
+                  className="w-28 sm:w-36 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#1f8a70] px-2 py-1.5 sm:py-2 text-[10px] sm:text-sm font-black tracking-wide text-[#fff6e6] shadow-[0_3px_0_#2b1c12] sm:shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none"
                 >
-                  <span className="flex skew-x-6 items-center justify-center gap-1.5">
-                    <Globe className="h-3.5 w-3.5" aria-hidden /> MULTIPLAYER
+                  <span className="flex skew-x-6 items-center justify-center gap-1">
+                    <Globe className="h-3 w-3 sm:h-3.5 sm:w-3.5" aria-hidden /> MULTIPLAYER
                   </span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setTab("settings")}
-                  className="w-[4.5rem] -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-2 py-2 text-[11px] font-black tracking-wide text-[#2b1c12] shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-28 sm:text-sm"
+                  className="w-20 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#fff6e6] px-2 py-1.5 sm:py-2 text-[10px] sm:text-sm font-black tracking-wide text-[#2b1c12] shadow-[0_3px_0_#2b1c12] sm:shadow-[0_4px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_2px_0_#2b1c12] active:translate-y-1 active:shadow-none sm:w-28"
                 >
                   <span className="block skew-x-6">SETUP</span>
                 </button>
               </div>
+              <InstallBanner />
             </div>
 
             {/* best + records */}
@@ -194,14 +208,14 @@ export function TitleScreen({
               </div>
               <div className="rounded-lg border-2 border-[#2b1c12] bg-[rgba(43,28,18,0.82)] p-3 text-[#fff6e6] shadow-lg">
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="text-[10px] font-black tracking-[0.25em] text-[#ffb020]">CANYON RECORDS</span>
+                  <span className="text-[10px] font-black tracking-[0.25em] text-[#ffb020]">{settings.map === "city" ? "CITY RECORDS" : "CANYON RECORDS"}</span>
                   <span className="text-[10px] font-bold text-[#c9a06a]">{settings.laps} LAPS</span>
                 </div>
                 <div className="max-h-28 overflow-y-auto settings-scroll pr-1">
                   {records == null ? (
                     <div className="py-2 text-xs font-bold text-[#c9a06a]">LOADING…</div>
                   ) : records.length === 0 ? (
-                    <div className="py-2 text-xs font-bold text-[#c9a06a]">NO RECORDS YET — SET THE FIRST ONE!</div>
+                    <div className="py-2 text-xs font-bold text-[#c9a06a]">{settings.map === "city" ? "PERSONAL BESTS ARE SAVED ON THIS DEVICE" : "NO RECORDS YET — SET THE FIRST ONE!"}</div>
                   ) : (
                     records.slice(0, 5).map((r, i) => (
                       <div key={r.id} className="flex items-baseline justify-between gap-2 py-0.5 text-xs font-bold">
