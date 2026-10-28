@@ -28,9 +28,10 @@ export interface RemoteSnapshot {
   recovering?: boolean;
 }
 
-const INTERP_DELAY_MS = 90; // render this far behind the newest sample (lower = less latency, more jitter risk)
-const EXTRAPOLATE_MS = 220; // dead-reckon at most this far ahead (lower = less rubber-banding on packet loss)
-const STALE_MS = 2500; // hold position after this long without data
+const INTERP_BASE_MS = 125; // interpolation buffer for 20Hz snapshots
+const INTERP_MAX_MS = 230; // adapt to packet jitter without adding excessive input lag
+const EXTRAPOLATE_MS = 300; // short dead-reckoning on missing frames
+const STALE_MS = 750; // dim stale cars instead of treating repeated data as fresh
 
 function angLerp(a: number, b: number, t: number): number {
   let d = b - a;
@@ -71,6 +72,7 @@ export class RemotePlayer {
   private vx = 0;
   private vz = 0;
   private lastSnapAt = 0;
+  private jitterMs = 0;
 
   constructor(id: string, name: string, colorCss: string, car?: string, carColorIdx = 0) {
     this.id = id;
@@ -185,11 +187,22 @@ export class RemotePlayer {
     }
     const last = this.buf[this.buf.length - 1];
     if (last) {
-      const dt = Math.max(0.016, (t - last.t) / 1000);
-      this.vx = (s.x - last.x) / dt;
-      this.vz = (s.z - last.z) / dt;
+      const delta = t - last.t;
+      if (delta > 600) {
+        // After a transport pause, old snapshots cannot interpolate cleanly
+        // with fresh data. Reset the interpolation timeline.
+        this.buf = [];
+        this.vx = 0;
+        this.vz = 0;
+      } else {
+        const dt = Math.max(0.016, delta / 1000);
+        this.vx = (s.x - last.x) / dt;
+        this.vz = (s.z - last.z) / dt;
+        this.jitterMs = this.jitterMs * 0.85 + Math.min(150, Math.abs(delta - 50)) * 0.15;
+      }
     }
     this.buf.push({ ...s, t });
+    this.labelMat.opacity = 1;
     if (this.buf.length > 16) this.buf.shift();
     this.lastSnapAt = t;
     this.progressS = s.prog;
@@ -212,43 +225,43 @@ export class RemotePlayer {
     if (!this.active || this.buf.length === 0) return;
     const g = this.visual.group;
 
-    // find snapshots surrounding the render time
-    const renderT = nowMs - INTERP_DELAY_MS;
+    // Render behind receipt time and increase the buffer as real network
+    // jitter rises. Always choose the two snapshots bracketing renderT.
+    const delay = clamp(INTERP_BASE_MS + this.jitterMs * 1.5, INTERP_BASE_MS, INTERP_MAX_MS);
+    const renderT = nowMs - delay;
     let a = this.buf[0];
-    let b = this.buf[this.buf.length - 1];
-    let f = 1;
-    for (let i = this.buf.length - 1; i > 0; i--) {
-      if (this.buf[i - 1].t <= renderT) {
+    let b = a;
+    let f = 0;
+    for (let i = 1; i < this.buf.length; i++) {
+      if (this.buf[i].t >= renderT) {
         a = this.buf[i - 1];
         b = this.buf[i];
-        const span = Math.max(1, b.t - a.t);
-        f = clamp((renderT - a.t) / span, 0, 1);
+        f = clamp((renderT - a.t) / Math.max(1, b.t - a.t), 0, 1);
         break;
       }
       a = b = this.buf[i];
       f = 1;
     }
+    // Keep the most recent history but discard frames that can no longer
+    // participate in interpolation (bounded memory even on long races).
+    while (this.buf.length > 3 && this.buf[1].t < renderT - 200) this.buf.shift();
 
     const newest = this.buf[this.buf.length - 1];
     const age = nowMs - this.lastSnapAt;
-    if (renderT > b.t) {
-      // between samples / beyond the newest — short dead-reckoning
-      const ahead = Math.min(renderT - b.t, EXTRAPOLATE_MS) / 1000;
+    if (renderT > newest.t) {
+      // beyond the newest sample — short dead-reckoning only
+      const ahead = Math.min(renderT - newest.t, EXTRAPOLATE_MS) / 1000;
       this.rx = newest.x + newest.spd * Math.sin(newest.yaw) * ahead;
       this.rz = newest.z + newest.spd * Math.cos(newest.yaw) * ahead;
       this.ry = newest.y;
       this.ryaw = newest.yaw;
-      if (age > STALE_MS) {
-        // connection trouble — freeze in place (car stays, dim the label a bit)
-        this.labelMat.opacity = 0.55;
-      }
     } else {
       this.rx = a.x + (b.x - a.x) * f;
       this.ry = a.y + (b.y - a.y) * f;
       this.rz = a.z + (b.z - a.z) * f;
       this.ryaw = angLerp(a.yaw, b.yaw, f);
-      this.labelMat.opacity = 1;
     }
+    this.labelMat.opacity = age > STALE_MS ? 0.55 : 1;
 
     g.position.set(this.rx, this.ry, this.rz);
     g.rotation.order = "YXZ";
@@ -281,6 +294,7 @@ export class RemotePlayer {
     this.rz = z;
     this.ryaw = yaw;
     this.buf = [];
+    this.jitterMs = 0;
     this.active = false;
     this.visual.group.visible = false;
   }
