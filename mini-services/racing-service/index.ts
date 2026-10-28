@@ -520,7 +520,7 @@ function maybeScheduleCompile(r: Room) {
 // ---------------------------------------------------------------------------
 const httpServer = createServer();
 const io = new Server(httpServer, {
-  path: "/socket.io/",
+  path: process.env.VERCEL ? "/api/racing" : "/socket.io/",
   cors: { origin: "*", methods: ["GET", "POST"] },
   pingTimeout: 60000,
   pingInterval: 25000,
@@ -1217,7 +1217,7 @@ setInterval(() => {
 }, 30000);
 
 // ---------------------------------------------------------------------------
-httpServer.listen(PORT, () => {
+if (!process.env.VERCEL) httpServer.listen(PORT, () => {
   console.log(`Canyon Rush multiplayer service listening on port ${PORT}`);
   console.log(`  max players/room: ${MAX_PLAYERS} · reconnect grace: ${RECONNECT_GRACE_MS}ms`);
 });
@@ -1232,5 +1232,10 @@ function shutdown() {
   httpServer.close(() => process.exit(0));
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+if (!process.env.VERCEL) {
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
+}
+
+// Vercel Functions export the HTTP server instead of listening on a fixed port.
+export default httpServer;
