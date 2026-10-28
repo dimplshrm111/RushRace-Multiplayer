@@ -233,3 +233,12 @@ bun run db:generate
 - **HTTPS Required**: Browsers enforce the Secure Context requirement (`https://` or `localhost`) for PWA installation.
 - When deployed with valid SSL, desktop Chrome/Edge will display the **⊕ Install** button in the omnibox, and the in-game **INSTALL GAME** button will trigger the native installation prompt immediately.
 - On iOS Safari, players can tap **Share (⬆️) ➔ Add to Home Screen** to launch the game full-screen without address bars.
+
+
+## Vercel WebSocket integration (experimental)
+
+The repository includes `api/racing.ts` as a Vercel Function entry point, reusing the existing Socket.IO engine without starting a second port. Set `NEXT_PUBLIC_MP_MODE=vercel` in Vercel Project Settings **before building** to connect the client to the same-origin `/api/racing` endpoint. Keep Framework Preset **Next.js**, Root Directory `./`, Build Command `npm run build`, Output Directory **default**, and Install Command `bun install`. The `ecosystem.config.js` PM2 config remains unchanged for VPS deployment.
+
+**Not production-ready for multiplayer yet:** authoritative rooms, race progression, timers, and player reconnect tokens are currently stored in a process-local Map. Players assigned to different Vercel Function instances cannot share the same room. Function recycling can also discard races. Production deployment requires a shared durable room-state coordinator and cross-instance broadcasts, tested under multiple Function instances; adding the Socket.IO Redis adapter alone does not make authoritative game state durable. Database storage also uses local SQLite and requires a persistent production solution for leaderboards.
+
+Do not assume that the new endpoint provides production multiplayer reliability until these issues are resolved and a live Vercel multi-client test succeeds.
