@@ -32,12 +32,13 @@ const TRACK_LENGTH = 2298;
 const TRACK_LENGTHS = { canyon: TRACK_LENGTH, city: 2524 } as const;
 type MapId = keyof typeof TRACK_LENGTHS;
 const RECONNECT_GRACE_MS =
-  Number.parseInt(process.env.RACING_GRACE_MS ?? "", 10) || 45000;
+  Number.parseInt(process.env.RACING_GRACE_MS ?? "", 10) || 90000;
 const CHAT_MAX_LEN = 200;
 const CHAT_WINDOW_MS = 10000;
 const CHAT_MAX_IN_WINDOW = 8;
 const STATE_MIN_INTERVAL_MS = 40; // accept max 25 state updates / second
-const RELAY_INTERVAL_MS = 100; // 10 Hz aggregated broadcast
+const RELAY_INTERVAL_MS = 50; // 20 Hz snapshots to match client send cadence
+const RELAY_STALE_MS = 650; // do not replay a disconnected/lagged car as a fresh sample
 const RESULTS_COMPILE_DELAY_MS = 10000; // wait for reconnectors after last finish
 const RESULTS_TO_LOBBY_MS = 15000; // auto return-to-lobby after results
 /** hard race timeout per lap (env-tunable for testing) */
@@ -540,7 +541,9 @@ function ctxOf(socket: Socket): { r: Room; p: Player } | null {
   const r = rooms.get(code);
   if (!r) return null;
   const p = r.players.get(pid);
-  if (!p) return null;
+  // An old transport can disconnect after a valid token-based takeover.
+  // Never let that stale socket mutate the new owner's room state.
+  if (!p || p.socketId !== socket.id) return null;
   return { r, p };
 }
 
@@ -672,10 +675,9 @@ io.on("connection", (socket) => {
       if (token) {
         for (const p of room.players.values()) {
           if (p.token === token) {
-            if (p.connected) {
-              ack?.({ ok: false, error: "This player is already active in the room" });
-              return;
-            }
+            // Take over a stale/half-open transport after a mobile handoff or
+            // Function reconnect. Matching the secret UUID token is required.
+            const previousSocketId = p.socketId;
             detachSocket(socket, "left");
             p.connected = true;
             // A pending "everyone disconnected" result must not end a race
@@ -685,6 +687,9 @@ io.on("connection", (socket) => {
             }
             p.socketId = socket.id;
             p.disconnectAt = null;
+            if (previousSocketId && previousSocketId !== socket.id) {
+              io.sockets.sockets.get(previousSocketId)?.disconnect(true);
+            }
             if (p.removeTimer) {
               clearTimeout(p.removeTimer);
               p.removeTimer = null;
@@ -1180,7 +1185,10 @@ setInterval(() => {
     const players: unknown[] = [];
     for (const pid of r.order) {
       const p = r.players.get(pid);
-      if (!p || !p.racing || !p.lastState) continue;
+      if (!p || !p.racing || !p.connected || !p.lastState) continue;
+      // A lost upstream connection must not produce a stream of fake fresh
+      // timestamps, which caused remote clients to hold a frozen car forever.
+      if (now - p.lastStateAt > RELAY_STALE_MS) continue;
       const st = r.phase === "countdown" && p.anchor ? p.anchor : p.lastState;
       players.push({ pid, ...st });
     }
