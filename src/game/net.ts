@@ -4,7 +4,8 @@
  * Multiplayer client: socket lifecycle, room/chat/race API and the glue
  * between the server and the local game engine.
  *
- * Connection goes through the gateway: io("/?XTransformPort=3003").
+ * Dev on :3000 and production talk to the racing service on port 3003.
+ * The Caddy gateway (:81) forwards with /?XTransformPort=3003.
  */
 import { io, type Socket } from "socket.io-client";
 import { gameStore } from "./store";
@@ -55,13 +56,17 @@ export class NetClient {
   private ensureSocket(): Socket {
     if (this.socket) return this.socket;
 
-    // In direct dev mode (e.g. browsing port 3000 directly), connect directly to racing-service on port 3003.
-    // When behind gateway/Caddy (e.g. port 81 or production), route via /?XTransformPort=3003.
-    const isDirectDev = typeof window !== "undefined" && window.location.port === "3000";
-
-    const serverUrl = isDirectDev
-      ? `${window.location.protocol}//${window.location.hostname}:3003`
-      : window.location.port === "81" ? "/?XTransformPort=3003" : "/";
+    // The racing service always listens on port 3003.
+    // Port 81 is the Caddy gateway, which forwards /?XTransformPort=3003.
+    // Everywhere else (including Vercel) dial that port on the page host,
+    // unless NEXT_PUBLIC_MP_URL names the public Socket.IO address.
+    const configured = process.env.NEXT_PUBLIC_MP_URL;
+    const port = typeof window !== "undefined" ? window.location.port : "";
+    const serverUrl = configured
+      ? configured
+      : port === "81"
+        ? "/?XTransformPort=3003"
+        : `${window.location.protocol}//${window.location.hostname}:3003`;
 
     const sock = io(serverUrl, {
       transports: ["websocket", "polling"],
