@@ -41,6 +41,9 @@ export class NetClient {
   /** true once this client has entered the current race round */
   racedThisRound = false;
   private disposed = false;
+  private rejoinTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectGeneration = 0;
+  private rejoinAttempts = 0;
   private reports: { event: string; payload: unknown }[] = [];
   private reporting = false;
   private reportTimer: ReturnType<typeof setTimeout> | null = null;
@@ -84,24 +87,21 @@ export class NetClient {
     mpStore.getState().setConnection("connecting");
 
     sock.on("connect", () => {
-      mpStore.getState().setConnection("online");
+      const generation = ++this.reconnectGeneration;
+      this.clearRejoinTimer();
+      this.rejoinAttempts = 0;
+      this.clockSamples = [];
       this.syncClock(true);
-      // silent rejoin after a transport reconnect
       if (this.code && this.token) {
-        void this.rawJoin(this.code, undefined, this.token).then((ok) => {
-          if (!ok && !this.disposed) {
-            // room is gone (deleted while we were away) — back to the
-            // multiplayer home screen, not the solo title
-            mpStore.getState().showToast("error", "Room no longer exists");
-            this.cleanupLocal();
-            mpStore.getState().setScreen("home");
-          } else if (ok) {
-            void this.flushReports();
-          }
-        });
+        mpStore.getState().setConnection("connecting");
+        void this.rejoinWithRetry(generation);
+      } else {
+        mpStore.getState().setConnection("online");
       }
     });
     sock.on("disconnect", () => {
+      ++this.reconnectGeneration;
+      this.clearRejoinTimer();
       mpStore.getState().setConnection("offline");
     });
     sock.on("connect_error", () => {
@@ -201,6 +201,40 @@ export class NetClient {
     return sock;
   }
 
+  /** Keep the live race while the network or a Function instance is rotating.
+   * A failed acknowledgement is not proof that the room was deleted. */
+  private async rejoinWithRetry(generation: number): Promise<void> {
+    if (this.disposed || generation !== this.reconnectGeneration || !this.socket?.connected) return;
+    const code = this.code;
+    const token = this.token;
+    if (!code || !token) return;
+    const ok = await this.rawJoin(code, undefined, token);
+    if (this.disposed || generation !== this.reconnectGeneration || !this.socket?.connected || this.code !== code) return;
+    if (ok) {
+      this.rejoinAttempts = 0;
+      mpStore.getState().setConnection("online");
+      void this.flushReports();
+      return;
+    }
+    this.rejoinAttempts++;
+    if (this.rejoinAttempts >= 14) {
+      mpStore.getState().showToast("error", "Could not restore this room — it may have expired");
+      this.cleanupLocal();
+      mpStore.getState().setScreen("home");
+      return;
+    }
+    const delay = Math.min(3500, 500 * Math.pow(1.4, this.rejoinAttempts));
+    this.rejoinTimer = setTimeout(() => {
+      this.rejoinTimer = null;
+      void this.rejoinWithRetry(generation);
+    }, delay);
+  }
+
+  private clearRejoinTimer() {
+    if (this.rejoinTimer) clearTimeout(this.rejoinTimer);
+    this.rejoinTimer = null;
+  }
+
   private syncClock(burst: boolean) {
     const sock = this.socket;
     if (!sock || !sock.connected) return;
@@ -290,6 +324,8 @@ export class NetClient {
   }
 
   private cleanupLocal() {
+    ++this.reconnectGeneration;
+    this.clearRejoinTimer();
     this.clearReports();
     this.code = null;
     this.token = null;
@@ -520,7 +556,9 @@ export class NetClient {
     const recovering = jumpDist > 12;
     this.lastSentX = p.pos.x;
     this.lastSentZ = p.pos.z;
-    sock.emit("mp:state", {
+    // Position snapshots are disposable. Never buffer old positions while a
+    // slow mobile/WebSocket transport is congested: only the latest matters.
+    sock.volatile.emit("mp:state", {
       x: +p.pos.x.toFixed(2),
       y: +p.pos.y.toFixed(2),
       z: +p.pos.z.toFixed(2),
@@ -624,6 +662,8 @@ export class NetClient {
 
   dispose() {
     this.disposed = true;
+    ++this.reconnectGeneration;
+    this.clearRejoinTimer();
     this.clearReports();
     this.detachEngine();
     if (this.clockTimer) {
