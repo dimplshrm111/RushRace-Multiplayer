@@ -44,6 +44,11 @@ export class NetClient {
   private rejoinTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectGeneration = 0;
   private rejoinAttempts = 0;
+  private lastUpdateAt = 0;
+  private lastSentAt = 0;
+  private staleSourceCount = 0;
+  private healthTimer: ReturnType<typeof setInterval> | null = null;
+  private lastHealth = "";
   private reports: { event: string; payload: unknown }[] = [];
   private reporting = false;
   private reportTimer: ReturnType<typeof setTimeout> | null = null;
@@ -87,6 +92,7 @@ export class NetClient {
     mpStore.getState().setConnection("connecting");
 
     sock.on("connect", () => {
+      console.info("[mp:network] connected", {socketId: sock.id, room: this.code});
       const generation = ++this.reconnectGeneration;
       this.clearRejoinTimer();
       this.rejoinAttempts = 0;
@@ -99,12 +105,14 @@ export class NetClient {
         mpStore.getState().setConnection("online");
       }
     });
-    sock.on("disconnect", () => {
+    sock.on("disconnect", (reason) => {
+      console.warn("[mp:network] disconnected", {reason, room: this.code});
       ++this.reconnectGeneration;
       this.clearRejoinTimer();
       mpStore.getState().setConnection("offline");
     });
-    sock.on("connect_error", () => {
+    sock.on("connect_error", (err) => {
+      console.error("[mp:network] connect_error", err.message);
       mpStore.getState().setConnection(
         this.socket?.connected ? "online" : "offline"
       );
@@ -139,7 +147,7 @@ export class NetClient {
       // engine countdown was already aligned to the server GO moment; nothing to do
     });
     sock.on("mp:update", (p: { t: number; players: MPRemoteState[] }) => {
-      void p;
+      this.lastUpdateAt = performance.now();
       const eng = this.engine;
       const myId = mpStore.getState().myId;
       if (!eng) return;
@@ -147,6 +155,9 @@ export class NetClient {
         if (st.pid === myId) continue;
         eng.applyRemoteSnapshot(st.pid, st);
       }
+    });
+    sock.on("mp:diag", (p: {sources: {pid: string; connected:boolean; lastInputAgeMs:number}[]}) => {
+      this.staleSourceCount = p.sources.filter((source) => source.pid !== mpStore.getState().myId && source.connected && source.lastInputAgeMs > 1600).length;
     });
     sock.on("mp:lap", (p: { pid: string; lap: number; lapMs: number; name: string }) => {
       const myId = mpStore.getState().myId;
@@ -198,6 +209,7 @@ export class NetClient {
 
     // periodic clock resync
     this.clockTimer = setInterval(() => this.syncClock(false), 30000);
+    this.healthTimer = setInterval(() => this.updateHealth(), 1000);
     return sock;
   }
 
@@ -235,6 +247,27 @@ export class NetClient {
     this.rejoinTimer = null;
   }
 
+  private updateHealth() {
+    const st = mpStore.getState();
+    const now = performance.now();
+    const racing = st.room?.phase === "racing";
+    const remote = st.room?.players.some(p => p.id !== st.myId && p.connected && p.racing);
+    const age = this.lastUpdateAt ? Math.round(now - this.lastUpdateAt) : -1;
+    const sendAge = this.lastSentAt ? Math.round(now - this.lastSentAt) : -1;
+    const health = !this.socket?.connected ? "offline"
+      : st.connection === "connecting" ? "connecting"
+      : racing && remote && this.staleSourceCount > 0 ? "remote-uplink-stale"
+      : racing && remote && (age < 0 || age > 1800) ? "downlink-stale"
+      : racing && this.racedThisRound && sendAge > 1800 ? "uplink-stale"
+      : st.ping > 250 ? "high-latency" : "healthy";
+    st.setNetworkHealth(health, age);
+    if (health !== this.lastHealth) {
+      if (health !== "healthy") console.warn("[mp:network] health", {health, incomingAge:age, sendAge, ping:st.ping, room:this.code});
+      else if (this.lastHealth) console.info("[mp:network] recovered", {room:this.code});
+      this.lastHealth = health;
+    }
+  }
+
   private syncClock(burst: boolean) {
     const sock = this.socket;
     if (!sock || !sock.connected) return;
@@ -255,10 +288,12 @@ export class NetClient {
   private call<T extends Ack>(event: string, payload: unknown): Promise<T> {
     const sock = this.ensureSocket();
     return new Promise<T>((resolve) => {
+      if (!sock.connected) { resolve({ok:false,error:"Connection not ready — try again"} as T); return; }
       let settled = false;
       const t = setTimeout(() => {
         if (!settled) {
           settled = true;
+          console.warn("[mp:network] ack_timeout", {event, room:this.code});
           resolve({ ok: false, error: "Server not responding" } as T);
         }
       }, 8000);
@@ -558,6 +593,7 @@ export class NetClient {
     this.lastSentZ = p.pos.z;
     // Position snapshots are disposable. Never buffer old positions while a
     // slow mobile/WebSocket transport is congested: only the latest matters.
+    this.lastSentAt = performance.now();
     sock.volatile.emit("mp:state", {
       x: +p.pos.x.toFixed(2),
       y: +p.pos.y.toFixed(2),
@@ -674,6 +710,8 @@ export class NetClient {
       clearInterval(this.stateTimer);
       this.stateTimer = null;
     }
+    if (this.healthTimer) clearInterval(this.healthTimer);
+    this.healthTimer = null;
     this.socket?.disconnect();
     this.socket = null;
   }
