@@ -15,10 +15,12 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit --incremental false",
     "test": "node --test tests/multiplayer.test.mjs && bun test tests/track.test.mjs",
-    "db:push": "prisma db push --accept-data-loss",
+    "db:push": "prisma db push",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
-    "db:reset": "prisma migrate reset"
+    "db:reset": "prisma migrate reset",
+    "postinstall": "prisma generate",
+    "vercel-build": "prisma generate && prisma migrate deploy && bun run build"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
@@ -89,8 +91,7 @@
     "vaul": "^1.1.2",
     "z-ai-web-dev-sdk": "^0.0.18",
     "zod": "^4.0.2",
-    "zustand": "^5.0.6",
-    "socket.io": "^4.8.1"
+    "zustand": "^5.0.6"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

@@ -519,7 +519,16 @@ function maybeScheduleCompile(r: Room) {
 // ---------------------------------------------------------------------------
 // socket server
 // ---------------------------------------------------------------------------
-const httpServer = createServer();
+const INSTANCE_ID = randomUUID().slice(0, 8);
+const httpServer = createServer((req, res) => {
+  if (req.url?.split("?")[0] === "/api/racing/health" || req.url?.split("?")[0] === "/health") {
+    res.writeHead(200, {"Content-Type":"application/json", "Cache-Control":"no-store"});
+    res.end(JSON.stringify({ok:true, service:"racing", instance:INSTANCE_ID, localRooms:rooms.size, durableRooms:false}));
+    return;
+  }
+  res.writeHead(404, {"Content-Type":"application/json"});
+  res.end(JSON.stringify({ok:false,error:"Not found"}));
+});
 const io = new Server(httpServer, {
   path: process.env.VERCEL ? "/api/racing" : "/socket.io/",
   cors: { origin: "*", methods: ["GET", "POST"] },
@@ -559,7 +568,7 @@ function detachSocket(socket: Socket, reason: "left" | "timeout") {
 }
 
 io.on("connection", (socket) => {
-  console.log(`socket connected: ${socket.id}`);
+  console.info("[mp:network] socket_connected", {socket:socket.id, instance:INSTANCE_ID});
 
   socket.on("mp:ping", (payload: unknown) => {
     const t0 = (payload as { t0?: number })?.t0;
@@ -646,7 +655,7 @@ io.on("connection", (socket) => {
       (socket.data as SocketData) = { roomCode: code, pid, lastCreateAt: now };
       socket.join(code);
       console.log(`[room ${code}] created by ${name}`);
-      ack?.({ ok: true, code, token: player.token, pid });
+      ack?.({ ok: true, code, token: player.token, pid, room: roomState(room) });
       socket.emit("mp:room", { room: roomState(room) });
       systemChat(room, `${name} created the room`);
     } catch (err) {
@@ -666,7 +675,8 @@ io.on("connection", (socket) => {
       }
       const room = rooms.get(code);
       if (!room) {
-        ack?.({ ok: false, error: "Room not found — check the code" });
+        console.warn("[mp:network] room_lookup_failed", {room:code, instance:INSTANCE_ID});
+        ack?.({ ok: false, error: "Room not found on this server — retry", reason: "INSTANCE_ROOM_MISS", instance: INSTANCE_ID });
         return;
       }
       const token = typeof body.token === "string" ? body.token : "";
@@ -703,7 +713,7 @@ io.on("connection", (socket) => {
               console.log(`[room ${code}] host missing — ${p.name} promoted on rejoin`);
             }
             console.log(`[room ${code}] ${p.name} reconnected`);
-            ack?.({ ok: true, code, token: p.token, pid: p.id });
+            ack?.({ ok: true, code, token: p.token, pid: p.id, room: roomState(room) });
             socket.emit("mp:room", { room: roomState(room) });
             // a reconnector during the results phase missed the broadcast —
             // replay the stored table so they see how the race ended
@@ -763,7 +773,7 @@ io.on("connection", (socket) => {
       (socket.data as SocketData) = { roomCode: code, pid };
       socket.join(code);
       console.log(`[room ${code}] ${name} joined (${room.players.size}/${MAX_PLAYERS})`);
-      ack?.({ ok: true, code, token: player.token, pid });
+      ack?.({ ok: true, code, token: player.token, pid, room: roomState(room) });
       socket.emit("mp:room", { room: roomState(room) });
       systemChat(room, `${name} joined the room`);
       broadcastRoom(room);
@@ -1144,7 +1154,8 @@ io.on("connection", (socket) => {
   });
 
   // ----- disconnect / graceful removal ----------------------------------------
-  socket.on("disconnect", () => {
+  socket.on("disconnect", (reason) => {
+    console.info("[mp:network] disconnect", {socket:socket.id, reason, instance:INSTANCE_ID});
     try {
       const ctx = ctxOf(socket);
       if (!ctx) return;

@@ -150,7 +150,7 @@ export function MPHome() {
         {/* create */}
         <button
           type="button"
-          disabled={!nameOk || !online || busy != null}
+          disabled={!nameOk || busy != null}
           onClick={() => void create()}
           className="group flex w-full -skew-x-6 items-center justify-center gap-2 rounded-lg border-[3px] border-[#2b1c12] bg-[#f0641e] px-6 py-3.5 font-[family-name:var(--font-bungee)] text-xl text-[#fff6e6] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none disabled:opacity-50"
         >
@@ -182,7 +182,7 @@ export function MPHome() {
           />
           <button
             type="button"
-            disabled={!nameOk || !online || busy != null}
+            disabled={!nameOk || busy != null}
             onClick={() => void join()}
             className="flex-1 -skew-x-6 rounded-md border-2 border-[#2b1c12] bg-[#ffb020] px-4 py-2.5 font-[family-name:var(--font-bungee)] text-lg text-[#2b1c12] shadow-[0_5px_0_#2b1c12] transition-all hover:translate-y-0.5 hover:shadow-[0_3px_0_#2b1c12] active:translate-y-1 active:shadow-none disabled:opacity-50"
           >

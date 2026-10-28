@@ -285,29 +285,43 @@ export class NetClient {
   }
 
   // ------------------------------------------------------------------- API
-  private call<T extends Ack>(event: string, payload: unknown): Promise<T> {
+  private waitForConnection(sock: Socket): Promise<boolean> {
+    if (sock.connected) return Promise.resolve(true);
+    if (!sock.active) sock.connect();
+    return new Promise((resolve) => {
+      let done = false;
+      const onConnect = () => finish(true);
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        sock.off("connect", onConnect);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), 12000);
+      sock.on("connect", onConnect);
+      if (sock.connected) finish(true);
+    });
+  }
+
+  private async call<T extends Ack>(event: string, payload: unknown): Promise<T> {
     const sock = this.ensureSocket();
-    return new Promise<T>((resolve) => {
-      if (!sock.connected) { resolve({ok:false,error:"Connection not ready — try again"} as T); return; }
-      let settled = false;
-      const t = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          console.warn("[mp:network] ack_timeout", {event, room:this.code});
-          resolve({ ok: false, error: "Server not responding" } as T);
-        }
-      }, 8000);
-      sock.emit(event, payload, (res: T) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(t);
-        resolve(res);
+    if (!(await this.waitForConnection(sock))) {
+      console.warn("[mp:network] connection_timeout", {event});
+      return {ok:false,error:"Connection could not be established — retry"} as T;
+    }
+    return new Promise((resolve) => {
+      sock.timeout(10000).emit(event, payload, (err: Error | null, res: T) => {
+        if (err) {
+          console.warn("[mp:network] ack_timeout_or_disconnect", {event, room:this.code});
+          resolve({ok:false,error:"Server did not acknowledge the request — retry"} as T);
+        } else resolve(res);
       });
     });
   }
 
   async createRoom(name: string): Promise<boolean> {
-    const res = await this.call<{ ok: boolean; error?: string; code?: string; token?: string; pid?: string }>(
+    const res = await this.call<{ ok: boolean; error?: string; code?: string; token?: string; pid?: string; room?: MPRoomState }>(
       "mp:create",
       { name }
     );
@@ -319,6 +333,7 @@ export class NetClient {
     this.code = res.code;
     this.token = res.token;
     mpStore.getState().setMyId(res.pid);
+    if (res.room) this.onRoom(res.room);
     mpStore.getState().setScreen("room");
     this.syncCarSelection();
     return true;
@@ -336,7 +351,7 @@ export class NetClient {
   }
 
   private async rawJoin(code: string, name?: string, token?: string): Promise<boolean> {
-    const res = await this.call<{ ok: boolean; error?: string; code?: string; token?: string; pid?: string }>(
+    const res = await this.call<{ ok: boolean; error?: string; code?: string; token?: string; pid?: string; room?: MPRoomState }>(
       "mp:join",
       { code: code.toUpperCase(), name, token }
     );
@@ -348,6 +363,7 @@ export class NetClient {
     this.code = res.code;
     this.token = res.token;
     mpStore.getState().setMyId(res.pid);
+    if (res.room) this.onRoom(res.room);
     return true;
   }
 
